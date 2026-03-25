@@ -1,4 +1,8 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn run(cmd: &mut Command) {
     let status = cmd
@@ -7,28 +11,91 @@ fn run(cmd: &mut Command) {
     assert!(status.success(), "command failed: {cmd:?}");
 }
 
+fn write_if_changed(path: &Path, content: &str) {
+    let existing = fs::read_to_string(path).ok();
+    if existing.as_deref() != Some(content) {
+        fs::write(path, content).unwrap_or_else(|_| panic!("failed to write {}", path.display()));
+    }
+}
+
+fn build_vmnet_helper(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
+    let vmnet_dir = manifest_dir.join("vendor/vmnet-helper");
+    let build_dir = out_dir.join("vmnet-helper-build");
+    fs::create_dir_all(&build_dir).expect("create vmnet-helper build dir");
+
+    let config_h = build_dir.join("config.h");
+    let version_h = build_dir.join("version.h");
+    let vmnet_helper_path = build_dir.join("vmnet-helper");
+
+    let config_template =
+        fs::read_to_string(vmnet_dir.join("config.h.in")).expect("read config.h.in");
+    write_if_changed(
+        &config_h,
+        &config_template.replace("@PREFIX@", "/opt/vmnet-helper"),
+    );
+
+    let git_commit = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(manifest_dir)
+            .output()
+            .expect("run git rev-parse HEAD")
+            .stdout,
+    )
+    .expect("git rev-parse HEAD returned invalid UTF-8")
+    .trim()
+    .to_owned();
+    // Use only the commit hash in the generated header so the helper build does
+    // not depend on tag state in the local clone.
+    write_if_changed(
+        &version_h,
+        &format!("#define GIT_VERSION \"{git_commit}\"\n#define GIT_COMMIT  \"{git_commit}\"\n"),
+    );
+
+    let mut clang = Command::new("clang");
+    clang
+        .current_dir(&vmnet_dir)
+        .args(["-target", "arm64-apple-macos14.0", "-arch", "arm64"])
+        .arg("-std=gnu99")
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-fPIE")
+        .arg("-I")
+        .arg(&build_dir)
+        .arg("-I")
+        .arg(&vmnet_dir)
+        .arg("-I")
+        .arg(vmnet_dir.join("vmnet-broker"));
+
+    clang
+        .arg("helper.c")
+        .arg("options.c")
+        .arg("vmnet-broker/client.c")
+        // Suppress a linker-generated Mach-O UUID so identical inputs can
+        // produce identical helper binaries on the same toolchain/SDK.
+        .arg("-Wl,-no_uuid")
+        .args(["-framework", "vmnet"])
+        .args(["-framework", "CoreFoundation"])
+        .arg("-o")
+        .arg(&vmnet_helper_path);
+
+    run(&mut clang);
+
+    vmnet_helper_path
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let host = env::var("HOST").unwrap_or_default();
-    let target = env::var("TARGET").unwrap_or_default();
+    let target = env::var("TARGET").unwrap();
 
     // Build the vmnet-helper. Logic extracted from /vendor/vmnet-helper/build.sh
     // Limit this to Apple hosts; on others, create a stub file so we can still run `cargo check` (e.g., from within Vibe =D)
-    if host.contains("apple-darwin") && target.contains("apple-darwin") {
+    if host.contains("apple-darwin") && target == "aarch64-apple-darwin" {
         let vmnet_dir = manifest_dir.join("vendor/vmnet-helper");
-        let arch_dir = out_dir.join("vmnet-helper-build/arm64");
-        let vmnet_helper_path = arch_dir.join("vmnet-helper");
-
-        if !arch_dir.join("build.ninja").exists() {
-            run(Command::new("meson")
-                .arg("setup")
-                .arg(&arch_dir)
-                .arg("--cross-file")
-                .arg("arm64.ini")
-                .current_dir(&vmnet_dir));
-        }
-        run(Command::new("meson").args(["compile", "-C"]).arg(&arch_dir));
+        let vmnet_helper_path = build_vmnet_helper(&manifest_dir, &out_dir);
 
         run(Command::new("codesign")
             .args(["--force", "--verbose", "--entitlements"])
@@ -49,8 +116,17 @@ fn main() {
         }
         println!(
             "cargo:rerun-if-changed={}",
-            vmnet_dir.join("meson.build").display()
+            vmnet_dir.join("vmnet-broker/client.c").display()
         );
+        println!(
+            "cargo:rerun-if-changed={}",
+            vmnet_dir.join("vmnet-broker/vmnet-broker.h").display()
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            vmnet_dir.join("config.h.in").display()
+        );
+        println!("cargo:rerun-if-env-changed=TARGET");
     } else {
         let stub_path = out_dir.join("stub-vmnet-helper");
         fs::write(&stub_path, []).expect("write stub vmnet-helper");

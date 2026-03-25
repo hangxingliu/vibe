@@ -75,14 +75,12 @@ If you use [mise-en-place](https://mise.jdx.dev/):
 I'm not making formal releases or keeping a change log.
 I recommend reading the commit history and pinning to a specific version.
 
-You can also install via cargo, though you will need ninja and meson to build the [vmnet-helper](https://github.com/lynaghk/vmnet-helper) binary (sorry).
+You can also install via cargo:
 
-    # port install meson ninja
-    # brew install meson ninja
     cargo install --locked --git https://github.com/lynaghk/vibe.git
 
-## Using Vibe
 
+## Using Vibe
 
 ```
 vibe [OPTIONS] [disk-image.raw]

@@ -22,9 +22,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install vmnet-helper requirements
-        run: brew install meson ninja
-
       - name: Build release binary
         run: cargo build --release
 

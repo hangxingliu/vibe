@@ -1,3 +1,22 @@
+The original repository:
+
+<https://github.com/lynaghk/vibe>
+
+This forked version introduces several core improvements to the provisioning environment, focusing on connectivity, tooling, performance, and security:
+
+1. **Proxy Support**: Added native support for network proxy configurations to the provision script, allowing it to run under the correct network proxy settings.
+2. **Extended CLI Suite**: Integrated additional Command Line Interface (CLI) tools to improve developer productivity:
+  - **GitHub Copilot CLI**: AI-assisted command suggestions.
+  - **fzf**: A command-line fuzzy finder for efficient searching.
+  - **tmux**: Terminal multiplexer for managing multiple persistent sessions.
+  - **htop**: Interactive process viewer for real-time system monitoring.
+3. **Improved Caching Mechanisms**: Optimized caching strategies for package managers, specifically `apt` and `cargo`. These changes significantly reduce the execution time of subsequent provisioning scripts by minimizing redundant downloads.
+4. **Environment Secret Masking**: Implemented masking for `.env` files to prevent sensitive credentials and environment variables from being exposed in logs or console output.
+5. **CLI Configuration Isolation**: Separated the configuration directories of various Agent CLIs from the host machine.
+  - This ensures that sensitive host-level data, such as private keys and authentication tokens, remains isolated and cannot be leaked into the Virtual Machine (VM) environment.
+
+---
+
 Vibe is a quick, zero-configuration way to spin up a Linux virtual machine on Mac to sandbox LLM agents:
 
 ```

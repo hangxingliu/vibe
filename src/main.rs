@@ -48,7 +48,14 @@ const DEFAULT_DISK_SIZE: u64 = 10 * 1024 * BYTES_PER_MB;
 
 
 /// Project subfolders masked with tmpfs to prevent host data leaking into the VM.
-const MASKED_SUBFOLDERS: &[&str] = &[".git", ".vibe"];
+const MASKED_SUBFOLDERS: &[&str] = &[".vibe"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitMode {
+    Rw,
+    Ro,
+    No,
+}
 
 /// Project files masked by bind-mounting an empty file over them to prevent host data leaking.
 const MASKED_FILES: &[&str] = &[".env"];
@@ -161,6 +168,11 @@ Options
                                                             Providing an interface (e.g., `en0`) exposes the VM on that interface.
                                                             This is just like plugging it in, so it'll get its own IP address, be able to accept incoming connections, etc.
 
+  --git <rw | ro | no>                                      How the .git directory is treated (default `ro`).
+                                                            rw: share host .git as read-write.
+                                                            ro: share host .git as read-only.
+                                                            no: mask .git with tmpfs.
+
   --cpus <count>                                            Number of virtual CPUs (default 2).
   --ram <megabytes>                                         RAM size in megabytes (default 2048).
   --script <path/to/script.sh>                              Run script in VM.
@@ -255,6 +267,10 @@ Options
             }
         }
 
+        if project_root.join(".git").exists() && args.git_mode == GitMode::No {
+            login_actions.push(Send(" mount -t tmpfs tmpfs .git".to_string()));
+        }
+
         // Mask individual files by bind-mounting an empty file over them to prevent
         // host file contents (e.g. secrets) from being readable inside the VM.
         for filename in MASKED_FILES {
@@ -268,13 +284,24 @@ Options
 
         directory_shares.push(
             DirectoryShare::new(
-                project_root,
-                PathBuf::from("/root/").join(project_name),
+                project_root.clone(),
+                PathBuf::from("/root/").join(&project_name),
                 false,
                 false,
             )
             .expect("Project directory must exist"),
         );
+
+        if project_root.join(".git").exists() && args.git_mode == GitMode::Ro {
+            directory_shares.push(
+                DirectoryShare::new(
+                    project_root.join(".git"),
+                    PathBuf::from("/root/").join(&project_name).join(".git"),
+                    true,
+                    false,
+                )?
+            );
+        }
 
         directory_shares.extend(default_shares);
 
@@ -348,6 +375,7 @@ struct CliArgs {
     cpu_count: usize,
     ram_bytes: u64,
     proxy: Option<String>,
+    git_mode: GitMode,
 }
 
 fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
@@ -369,6 +397,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut cpu_count = DEFAULT_CPU_COUNT;
     let mut ram_bytes = DEFAULT_RAM_BYTES;
     let mut proxy = None;
+    let mut git_mode = GitMode::Ro;
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -395,6 +424,15 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             Long("network") => {
                 let value = os_to_string(parser.value()?, "--network")?;
                 network_mode = NetworkMode::parse(&value);
+            }
+            Long("git") => {
+                let value = os_to_string(parser.value()?, "--git")?;
+                git_mode = match value.as_str() {
+                    "rw" => GitMode::Rw,
+                    "ro" => GitMode::Ro,
+                    "no" => GitMode::No,
+                    _ => return Err("--git must be rw, ro, or no".into()),
+                };
             }
             Long("script") => {
                 login_actions.push(Script {
@@ -438,6 +476,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         cpu_count,
         ram_bytes,
         proxy,
+        git_mode,
     })
 }
 

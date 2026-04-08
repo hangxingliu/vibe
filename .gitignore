@@ -1,1 +1,8 @@
 /target
+.vibe
+
+/.cache
+/*-agent.yml
+
+.DS_Store
+._*

@@ -43,8 +43,17 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 const PROVISION_SCRIPT: &str = include_str!("provision.sh");
+const BASHRC_SCRIPT: &str = include_str!("bashrc.sh");
+const DEFAULT_DISK_SIZE: u64 = 10 * 1024 * BYTES_PER_MB;
 
-#[derive(Clone)]
+
+/// Project subfolders masked with tmpfs to prevent host data leaking into the VM.
+const MASKED_SUBFOLDERS: &[&str] = &[".git", ".vibe"];
+
+/// Project files masked by bind-mounting an empty file over them to prevent host data leaking.
+const MASKED_FILES: &[&str] = &[".env"];
+
+#[derive(Debug, Clone)]
 enum LoginAction {
     Expect { text: String, timeout: Duration },
     Send(String),
@@ -64,9 +73,14 @@ impl DirectoryShare {
         host: PathBuf,
         mut guest: PathBuf,
         read_only: bool,
+        create_host_dir: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         if !host.exists() {
-            return Err(format!("Host path does not exist: {}", host.display()).into());
+            if create_host_dir {
+                fs::create_dir_all(&host)?;
+            } else {
+                return Err(format!("Host path does not exist: {}", host.display()).into());
+            }
         }
         if !guest.is_absolute() {
             guest = PathBuf::from("/root").join(guest);
@@ -100,7 +114,7 @@ impl DirectoryShare {
         } else {
             false
         };
-        DirectoryShare::new(host, guest, read_only)
+        DirectoryShare::new(host, guest, read_only, false)
     }
 
     fn tag(&self) -> String {
@@ -139,7 +153,7 @@ Options
 
   --help                                                    Print this help message.
   --version                                                 Print the version (commit SHA and build date).
-  --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
+  --no-default-mounts                                       Disable all default mounts, including .git/.vibe subfolder masking and .env file masking.
   --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
                                                             Defaults to read-write.
                                                             Errors if host-path does not exist.
@@ -153,6 +167,7 @@ Options
   --send <some-command>                                     Type `some-command` followed by newline into the VM.
   --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
                                                             If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
+  --proxy <url>                                             Set proxy for provisioning. Configures apt and environment variables in the VM.
 ");
         std::process::exit(0);
     }
@@ -175,8 +190,6 @@ Options
     let vmnet_helper_path = cache_dir.join("vmnet-helper");
     let prepare_network_backend = || args.network_mode.prepare(&vmnet_helper_path).unwrap();
 
-    let guest_mise_cache = cache_dir.join(".guest-mise-cache");
-
     let instance_dir = project_root.join(".vibe");
 
     let basename_compressed = DEBIAN_COMPRESSED_DISK_URL.rsplit('/').next().unwrap();
@@ -191,10 +204,22 @@ Options
 
     // Prepare system-wide directories
     fs::create_dir_all(&cache_dir)?;
-    fs::create_dir_all(&guest_mise_cache)?;
 
-    let mise_directory_share =
-        DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
+    let default_shares = vec![
+        DirectoryShare::new(
+            cache_dir.join("mise-cache"),
+            "/root/.local/share/mise".into(),
+            false,
+            true,
+        )?,
+        DirectoryShare::new(
+            cache_dir.join("apt-cache"),
+            "/var/cache/apt".into(),
+            false,
+            true,
+        )?,
+        DirectoryShare::new(cache_dir.join(".cargo"), "/root/.cargo".into(), false, true)?,
+    ];
 
     let disk_path = if let Some(path) = args.disk {
         if !path.exists() {
@@ -206,8 +231,9 @@ Options
             &base_raw,
             &base_compressed,
             &default_raw,
-            std::slice::from_ref(&mise_directory_share),
+            &default_shares,
             prepare_network_backend,
+            &args.proxy,
         )?;
         ensure_instance_disk(&instance_raw, &default_raw)?;
 
@@ -223,9 +249,20 @@ Options
         // Discourage read/write of project dir subfolders within the VM.
         // Note that this isn't secure, since the VM runs as root and could unmount this.
         // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
-        for subfolder in [".git", ".vibe"] {
+        for subfolder in MASKED_SUBFOLDERS {
             if project_root.join(subfolder).exists() {
                 login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {}", subfolder)))
+            }
+        }
+
+        // Mask individual files by bind-mounting an empty file over them to prevent
+        // host file contents (e.g. secrets) from being readable inside the VM.
+        for filename in MASKED_FILES {
+            if project_root.join(filename).exists() {
+                login_actions.push(Send(format!(
+                    r#" [ -n "$__masked_tmp_file" ] || __masked_tmp_file="$(mktemp)"; mount -o bind "$__masked_tmp_file" {}"#,
+                    filename
+                )));
             }
         }
 
@@ -234,23 +271,35 @@ Options
                 project_root,
                 PathBuf::from("/root/").join(project_name),
                 false,
+                false,
             )
             .expect("Project directory must exist"),
         );
 
-        directory_shares.push(mise_directory_share);
+        directory_shares.extend(default_shares);
 
         // Add default shares, if they exist
         for share in [
-            DirectoryShare::new(home.join(".m2"), "/root/.m2".into(), false),
+            DirectoryShare::new(cache_dir.join(".m2"), "/root/.m2".into(), false, true),
+            DirectoryShare::new(cache_dir.join(".codex"), "/root/.codex".into(), false, true),
             DirectoryShare::new(
-                home.join(".cargo/registry"),
-                "/root/.cargo/registry".into(),
+                cache_dir.join(".copilot"),
+                "/root/.copilot".into(),
                 false,
+                true,
             ),
-            DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
-            DirectoryShare::new(home.join(".claude"), "/root/.claude".into(), false),
-            DirectoryShare::new(home.join(".gemini"), "/root/.gemini".into(), false),
+            DirectoryShare::new(
+                cache_dir.join(".claude"),
+                "/root/.claude".into(),
+                false,
+                true,
+            ),
+            DirectoryShare::new(
+                cache_dir.join(".gemini"),
+                "/root/.gemini".into(),
+                false,
+                true,
+            ),
         ]
         .into_iter()
         .flatten()
@@ -298,6 +347,7 @@ struct CliArgs {
     network_mode: NetworkMode,
     cpu_count: usize,
     ram_bytes: u64,
+    proxy: Option<String>,
 }
 
 fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
@@ -318,6 +368,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut script_index = 0;
     let mut cpu_count = DEFAULT_CPU_COUNT;
     let mut ram_bytes = DEFAULT_RAM_BYTES;
+    let mut proxy = None;
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -363,6 +414,9 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 };
                 login_actions.push(Expect { text, timeout });
             }
+            Long("proxy") => {
+                proxy = Some(os_to_string(parser.value()?, "--proxy")?);
+            }
             Value(value) => {
                 if disk.is_some() {
                     return Err("Only one disk path may be provided".into());
@@ -383,6 +437,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         network_mode,
         cpu_count,
         ram_bytes,
+        proxy,
     })
 }
 
@@ -409,6 +464,19 @@ fn script_command_from_content(
     if script.contains(marker) {
         return Err(
             format!("Script '{label}' contains marker '{marker}', cannot safely upload").into(),
+        );
+    }
+    Ok(command)
+}
+
+fn write_bashrc(script: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let marker = "VIBE_SCRIPT_EOF";
+    let guest_path = "/root/.profile";
+    let command =
+        format!(" cat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}");
+    if script.contains(marker) {
+        return Err(
+            format!("Bashrc script contains marker '{marker}', cannot safely upload").into(),
         );
     }
     Ok(command)
@@ -601,23 +669,63 @@ fn ensure_default_image(
     default_raw: &Path,
     directory_shares: &[DirectoryShare],
     prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
+    proxy: &Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if default_raw.exists() {
+        println!(
+            "The default image {} has been initialized, `provision.sh` will not be run again",
+            default_raw.display()
+        );
         return Ok(());
     }
 
     ensure_base_image(base_raw, base_compressed)?;
 
-    println!("Configuring base image...");
+    println!(
+        "Configuring base image from {} to {} ...",
+        base_raw.display(),
+        default_raw.display()
+    );
     fs::copy(base_raw, default_raw)?;
 
     fs::OpenOptions::new()
         .write(true)
         .open(default_raw)?
-        // resize to 20GiB
-        .set_len(20 * 1024 * BYTES_PER_MB)?;
+        .set_len(DEFAULT_DISK_SIZE)?;
 
-    let provision_command = script_command_from_content("provision.sh", PROVISION_SCRIPT)?;
+    let provision_script = if let Some(proxy_url) = proxy {
+        let proxy_code = format!(
+            concat!(
+                "echo 'Acquire::http::Proxy \"{url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n",
+                "echo 'Acquire::https::Proxy \"{url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n",
+                "\n",
+                "export http_proxy=\"{url}\"\n",
+                "export HTTP_PROXY=\"{url}\"\n",
+                "export https_proxy=\"{url}\"\n",
+                "export HTTPS_PROXY=\"{url}\"\n",
+                "export no_proxy='127.0.0.1,localhost,192.168.*'\n",
+                "export NO_PROXY='127.0.0.1,localhost,192.168.*'\n",
+            ),
+            url = proxy_url,
+        );
+
+        {
+            let re = regex::Regex::new(
+                r"(?m)^#\s+region\s+INJECT_PROXY_CODE\n(?:.*\n)*?#\s+endregion\s+INJECT_PROXY_CODE",
+            )
+            .expect("valid INJECT_PROXY_CODE region regex");
+
+            re.replace(
+                PROVISION_SCRIPT,
+                format!("# region INJECT_PROXY_CODE\n{proxy_code}\n# endregion INJECT_PROXY_CODE"),
+            )
+            .into_owned()
+        }
+    } else {
+        PROVISION_SCRIPT.to_string()
+    };
+
+    let provision_command = script_command_from_content("provision.sh", &provision_script)?;
     run_vm(
         default_raw,
         &[Send(provision_command)],
@@ -635,6 +743,10 @@ fn ensure_instance_disk(
     template_raw: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if instance_raw.exists() {
+        println!(
+            "The instance disk {} has been copied already",
+            instance_raw.display()
+        );
         return Ok(());
     }
 
@@ -1174,6 +1286,9 @@ fn run_vm(
             const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
             S.to_string()
         }),
+        Send(write_bashrc(BASHRC_SCRIPT)?),
+        Send(" eval \"$(\"${HOME}/.local/bin/mise\" activate bash)\"".to_string()),
+        Send(" eval \"$(fzf --bash)\"".to_string()),
     ];
 
     if !directory_shares.is_empty() {

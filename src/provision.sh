@@ -56,8 +56,10 @@ cd /root/
 # Shutdown the VM when you logout
 cat > .bash_logout <<EOF
 history -w # Write bash history. Otherwise bash would be killed by poweroff without having written history
+if [ -z "$TMUX" ]; then
 systemctl poweroff
 sleep 100 # sleep here so that we don't see the login screen flash up before the shutdown.
+fi
 EOF
 
 export PATH="${HOME}/.cargo/bin:${HOME}/.local/bin:${PATH}";

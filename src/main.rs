@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine, engine::general_purpose};
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use lexopt::prelude::*;
@@ -45,7 +46,6 @@ const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 const PROVISION_SCRIPT: &str = include_str!("provision.sh");
 const BASHRC_SCRIPT: &str = include_str!("bashrc.sh");
 const DEFAULT_DISK_SIZE: u64 = 10 * 1024 * BYTES_PER_MB;
-
 
 /// Project subfolders masked with tmpfs to prevent host data leaking into the VM.
 const MASKED_SUBFOLDERS: &[&str] = &[".vibe"];
@@ -293,14 +293,12 @@ Options
         );
 
         if project_root.join(".git").exists() && args.git_mode == GitMode::Ro {
-            directory_shares.push(
-                DirectoryShare::new(
-                    project_root.join(".git"),
-                    PathBuf::from("/root/").join(&project_name).join(".git"),
-                    true,
-                    false,
-                )?
-            );
+            directory_shares.push(DirectoryShare::new(
+                project_root.join(".git"),
+                PathBuf::from("/root/").join(&project_name).join(".git"),
+                true,
+                false,
+            )?);
         }
 
         directory_shares.extend(default_shares);
@@ -327,12 +325,24 @@ Options
                 false,
                 true,
             ),
+            DirectoryShare::new(home.join(".tmux"), "/root/.tmux".into(), true, false),
         ]
         .into_iter()
         .flatten()
         {
             directory_shares.push(share)
         }
+
+        // Provision ~/.tmux.conf
+        let tmux_conf = home.join(".tmux.conf");
+        if tmux_conf.exists() {
+            let content = fs::read_to_string(&tmux_conf)?;
+            let b64 = general_purpose::STANDARD.encode(content);
+            login_actions.push(Send(format!(
+                " echo '{b64}' | base64 --decode > /root/.tmux.conf"
+            )));
+        }
+
         // Bind-mount linux ripgrep over shared macos binary to ensure compatibility
         login_actions.push(Send(
             " if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
@@ -494,30 +504,19 @@ fn script_command_from_content(
     label: &str,
     script: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let marker = "VIBE_SCRIPT_EOF";
     let guest_dir = "/tmp/vibe-scripts";
     let guest_path = format!("{guest_dir}/{label}.sh");
+    let b64 = general_purpose::STANDARD.encode(script);
     let command = format!(
-        " mkdir -p {guest_dir}\ncat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}\n {guest_path}"
+        " mkdir -p {guest_dir}\necho '{b64}' | base64 --decode > {guest_path}\nchmod +x {guest_path}\n {guest_path}"
     );
-    if script.contains(marker) {
-        return Err(
-            format!("Script '{label}' contains marker '{marker}', cannot safely upload").into(),
-        );
-    }
     Ok(command)
 }
 
 fn write_bashrc(script: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let marker = "VIBE_SCRIPT_EOF";
     let guest_path = "/root/.profile";
-    let command =
-        format!(" cat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}");
-    if script.contains(marker) {
-        return Err(
-            format!("Bashrc script contains marker '{marker}', cannot safely upload").into(),
-        );
-    }
+    let b64 = general_purpose::STANDARD.encode(script);
+    let command = format!(" echo '{b64}' | base64 --decode > {guest_path}\nchmod +x {guest_path}");
     Ok(command)
 }
 

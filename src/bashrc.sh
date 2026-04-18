@@ -26,7 +26,7 @@ export HISTFILESIZE=
 export HISTSIZE=
 
 export PATH="${HOME}/.cargo/bin:${HOME}/.local/bin:${PATH}";
-[ -f "${HOME}/.local/bin/mise" ] && 
+[ -f "${HOME}/.local/bin/mise" ] &&
     eval "$("${HOME}/.local/bin/mise" activate bash)";
 
 # stty -ixon

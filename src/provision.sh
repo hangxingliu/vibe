@@ -39,8 +39,14 @@ apt install -y --no-install-recommends   \
     ripgrep                              \
     vim                                  \
     htop                                 \
-    tmux
+    tmux                                 \
+    openssh-server
 done
+
+echo 'PasswordAuthentication no
+PermitRootLogin  yes' | tee /etc/ssh/sshd_config.d/99_custom.conf
+
+systemctl disable ssh
 
 # Expand disk partition
 growpart /dev/vda 1
@@ -53,14 +59,18 @@ hostnamectl set-hostname vibe
 
 cd /root/
 
+mkdir -p .ssh
+
 # Shutdown the VM when you logout
-cat > .bash_logout <<EOF
+# shellcheck disable=SC2016
+echo '
 history -w # Write bash history. Otherwise bash would be killed by poweroff without having written history
-if [ -z "$TMUX" ]; then
-systemctl poweroff
-sleep 100 # sleep here so that we don't see the login screen flash up before the shutdown.
+set +o nounset;
+if [ -z "$SSH_CLIENT" ] && [ -z "$SSH_TTY" ] && [ -z "$TMUX" ]; then
+  systemctl poweroff
+  sleep 100 # sleep here so that we don not see the login screen flash up before the shutdown.
 fi
-EOF
+' > .bash_logout;
 
 export PATH="${HOME}/.cargo/bin:${HOME}/.local/bin:${PATH}";
 
@@ -86,6 +96,7 @@ experimental = true
 idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
+usage = "latest"
 uv = "0.11.3"
 node = "24"
 fzf = "latest"

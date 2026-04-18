@@ -179,7 +179,8 @@ Options
   --send <some-command>                                     Type `some-command` followed by newline into the VM.
   --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
                                                             If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
-  --proxy <url>                                             Set proxy for provisioning. Configures apt and environment variables in the VM.
+  --ssh-key <public-key-file>                               Install SSH public key into VM and start SSH server.
+  --proxy <url>                                             Set proxy. Configures apt during provisioning and exports proxy environment variables at login.
 ");
         std::process::exit(0);
     }
@@ -361,6 +362,32 @@ Options
         login_actions.push(motd_action);
     }
 
+    // Set proxy environment variables for interactive use
+    if let Some(url) = &args.proxy {
+        login_actions.push(Send(format!(" export http_proxy=\"{url}\"")));
+        login_actions.push(Send(format!(" export HTTP_PROXY=\"{url}\"")));
+        login_actions.push(Send(format!(" export https_proxy=\"{url}\"")));
+        login_actions.push(Send(format!(" export HTTPS_PROXY=\"{url}\"")));
+        login_actions.push(Send(
+            " export no_proxy='127.0.0.1,localhost,192.168.*'".to_string(),
+        ));
+        login_actions.push(Send(
+            " export NO_PROXY='127.0.0.1,localhost,192.168.*'".to_string(),
+        ));
+    }
+
+    // Install SSH public key and start SSH server
+    if let Some(ssh_key_path) = &args.ssh_key {
+        let key_content = fs::read_to_string(ssh_key_path)
+            .map_err(|err| format!("Failed to read SSH key {}: {err}", ssh_key_path.display()))?;
+        let b64 = general_purpose::STANDARD.encode(key_content.trim());
+        login_actions.push(Send(format!(
+            " mkdir -p /root/.ssh && echo '{b64}' | base64 --decode > /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys"
+        )));
+        login_actions.push(Send(" systemctl start ssh".to_string()));
+        login_actions.push(Send(" ip -4 -br addr".to_string()));
+    }
+
     // Any user-provided login actions must come after our system ones
     login_actions.extend(args.login_actions);
 
@@ -386,6 +413,7 @@ struct CliArgs {
     ram_bytes: u64,
     proxy: Option<String>,
     git_mode: GitMode,
+    ssh_key: Option<PathBuf>,
 }
 
 fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
@@ -408,6 +436,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut ram_bytes = DEFAULT_RAM_BYTES;
     let mut proxy = None;
     let mut git_mode = GitMode::Ro;
+    let mut ssh_key = None;
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -465,6 +494,9 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             Long("proxy") => {
                 proxy = Some(os_to_string(parser.value()?, "--proxy")?);
             }
+            Long("ssh-key") => {
+                ssh_key = Some(PathBuf::from(parser.value()?));
+            }
             Value(value) => {
                 if disk.is_some() {
                     return Err("Only one disk path may be provided".into());
@@ -487,6 +519,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         ram_bytes,
         proxy,
         git_mode,
+        ssh_key,
     })
 }
 

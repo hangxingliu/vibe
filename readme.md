@@ -102,13 +102,15 @@ You can also install via cargo:
 ## Using Vibe
 
 ```
+Vibe is a quick way to spin up a Linux virtual machine on Mac to sandbox LLM agents.
+
 vibe [OPTIONS] [disk-image.raw]
 
 Options
 
   --help                                                    Print this help message.
   --version                                                 Print the version (commit SHA and build date).
-  --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
+  --no-default-mounts                                       Disable all default mounts, including .git/.vibe subfolder masking and .env file masking.
   --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
                                                             Defaults to read-write.
                                                             Errors if host-path does not exist.
@@ -116,12 +118,20 @@ Options
                                                             Providing an interface (e.g., `en0`) exposes the VM on that interface.
                                                             This is just like plugging it in, so it'll get its own IP address, be able to accept incoming connections, etc.
 
+  --git <rw | ro | no>                                      How the .git directory is treated (default `ro`).
+                                                            rw: share host .git as read-write.
+                                                            ro: share host .git as read-only.
+                                                            no: mask .git with tmpfs.
+
   --cpus <count>                                            Number of virtual CPUs (default 2).
   --ram <megabytes>                                         RAM size in megabytes (default 2048).
   --script <path/to/script.sh>                              Run script in VM.
   --send <some-command>                                     Type `some-command` followed by newline into the VM.
   --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
                                                             If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
+  --ssh-key <public-key-file>                               Install SSH public key into VM and start SSH server.
+  --proxy <url>                                             Set proxy. Configures apt during provisioning and exports proxy environment variables at login.
+
 ```
 
 Invoking vibe without a disk image:

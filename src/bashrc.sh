@@ -51,3 +51,5 @@ function http-proxy-export() {
         done
     fi
 }
+
+function gemini-yolo() { gemini --approval-mode=yolo "$@"; }

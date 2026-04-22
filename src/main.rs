@@ -50,15 +50,15 @@ const DEFAULT_DISK_SIZE: u64 = 10 * 1024 * BYTES_PER_MB;
 /// Project subfolders masked with tmpfs to prevent host data leaking into the VM.
 const MASKED_SUBFOLDERS: &[&str] = &[".vibe"];
 
+/// Project files masked by bind-mounting an empty file over them to prevent host data leaking.
+const MASKED_FILES: &[&str] = &[".env"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GitMode {
     Rw,
     Ro,
     No,
 }
-
-/// Project files masked by bind-mounting an empty file over them to prevent host data leaking.
-const MASKED_FILES: &[&str] = &[".env"];
 
 #[derive(Debug, Clone)]
 enum LoginAction {
@@ -73,6 +73,7 @@ struct DirectoryShare {
     host: PathBuf,
     guest: PathBuf,
     read_only: bool,
+    is_project_dir: bool,
 }
 
 impl DirectoryShare {
@@ -81,6 +82,7 @@ impl DirectoryShare {
         mut guest: PathBuf,
         read_only: bool,
         create_host_dir: bool,
+        is_project_dir: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         if !host.exists() {
             if create_host_dir {
@@ -96,6 +98,7 @@ impl DirectoryShare {
             host,
             guest,
             read_only,
+            is_project_dir,
         })
     }
 
@@ -121,7 +124,7 @@ impl DirectoryShare {
         } else {
             false
         };
-        DirectoryShare::new(host, guest, read_only, false)
+        DirectoryShare::new(host, guest, read_only, false, true)
     }
 
     fn tag(&self) -> String {
@@ -224,14 +227,22 @@ Options
             "/root/.local/share/mise".into(),
             false,
             true,
+            false,
         )?,
         DirectoryShare::new(
             cache_dir.join("apt-cache"),
             "/var/cache/apt".into(),
             false,
             true,
+            false,
         )?,
-        DirectoryShare::new(cache_dir.join(".cargo"), "/root/.cargo".into(), false, true)?,
+        DirectoryShare::new(
+            cache_dir.join(".cargo"),
+            "/root/.cargo".into(),
+            false,
+            true,
+            false,
+        )?,
     ];
 
     let disk_path = if let Some(path) = args.disk {
@@ -259,74 +270,126 @@ Options
     if !args.no_default_mounts {
         login_actions.push(Send(format!(" cd {project_name}")));
 
-        // Discourage read/write of project dir subfolders within the VM.
-        // Note that this isn't secure, since the VM runs as root and could unmount this.
-        // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
-        for subfolder in MASKED_SUBFOLDERS {
-            if project_root.join(subfolder).exists() {
-                login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {}", subfolder)))
-            }
-        }
-
-        if project_root.join(".git").exists() && args.git_mode == GitMode::No {
-            login_actions.push(Send(" mount -t tmpfs tmpfs .git".to_string()));
-        }
-
-        // Mask individual files by bind-mounting an empty file over them to prevent
-        // host file contents (e.g. secrets) from being readable inside the VM.
-        for filename in MASKED_FILES {
-            if project_root.join(filename).exists() {
-                login_actions.push(Send(format!(
-                    r#" [ -n "$__masked_tmp_file" ] || __masked_tmp_file="$(mktemp)"; mount -o bind "$__masked_tmp_file" {}"#,
-                    filename
-                )));
-            }
-        }
-
         directory_shares.push(
             DirectoryShare::new(
                 project_root.clone(),
                 PathBuf::from("/root/").join(&project_name),
                 false,
                 false,
+                true,
             )
             .expect("Project directory must exist"),
         );
+    }
 
-        if project_root.join(".git").exists() && args.git_mode == GitMode::Ro {
-            directory_shares.push(DirectoryShare::new(
-                project_root.join(".git"),
-                PathBuf::from("/root/").join(&project_name).join(".git"),
-                true,
-                false,
-            )?);
+    for spec in &args.mounts {
+        directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
+    }
+
+    if !args.no_default_mounts {
+        let mut extra_git_shares = Vec::new();
+        // Collect project dirs to mask. We use a separate vector to avoid borrow checker issues
+        // and because we want to add .git shares at the end of the list to ensure they are
+        // mounted after their parent directories.
+        let project_shares: Vec<DirectoryShare> = directory_shares
+            .iter()
+            .filter(|s| s.is_project_dir)
+            .cloned()
+            .collect();
+
+        for share in project_shares {
+            // Discourage read/write of project dir subfolders within the VM.
+            for subfolder in MASKED_SUBFOLDERS {
+                if share.host.join(subfolder).exists() {
+                    login_actions.push(Send(format!(
+                        " mount -t tmpfs tmpfs {}",
+                        share.guest.join(subfolder).display()
+                    )));
+                }
+            }
+
+            // Handle .git directory masking or read-only sharing
+            if share.host.join(".git").exists() {
+                match args.git_mode {
+                    GitMode::No => {
+                        login_actions.push(Send(format!(
+                            " mount -t tmpfs tmpfs {}",
+                            share.guest.join(".git").display()
+                        )));
+                    }
+                    GitMode::Ro => {
+                        extra_git_shares.push(DirectoryShare::new(
+                            share.host.join(".git"),
+                            share.guest.join(".git"),
+                            true,
+                            false,
+                            false,
+                        )?);
+                    }
+                    GitMode::Rw => {}
+                }
+            }
+
+            // Mask individual files by bind-mounting an empty file over them to prevent
+            // host file contents (e.g. secrets) from being readable inside the VM.
+            for filename in MASKED_FILES {
+                if share.host.join(filename).exists() {
+                    login_actions.push(Send(format!(
+                        r#" [ -n "$__masked_tmp_file" ] || __masked_tmp_file="$(mktemp)"; mount -o bind "$__masked_tmp_file" {}"#,
+                        share.guest.join(filename).display()
+                    )));
+                }
+            }
         }
+        directory_shares.extend(extra_git_shares);
 
         directory_shares.extend(default_shares);
 
         // Add default shares, if they exist
         for share in [
-            DirectoryShare::new(cache_dir.join(".m2"), "/root/.m2".into(), false, true),
-            DirectoryShare::new(cache_dir.join(".codex"), "/root/.codex".into(), false, true),
+            DirectoryShare::new(
+                cache_dir.join(".m2"),
+                "/root/.m2".into(),
+                false,
+                true,
+                false,
+            ),
+            DirectoryShare::new(
+                cache_dir.join(".codex"),
+                "/root/.codex".into(),
+                false,
+                true,
+                false,
+            ),
             DirectoryShare::new(
                 cache_dir.join(".copilot"),
                 "/root/.copilot".into(),
                 false,
                 true,
+                false,
             ),
             DirectoryShare::new(
                 cache_dir.join(".claude"),
                 "/root/.claude".into(),
                 false,
                 true,
+                false,
             ),
             DirectoryShare::new(
                 cache_dir.join(".gemini"),
                 "/root/.gemini".into(),
                 false,
                 true,
+                false,
             ),
-            DirectoryShare::new(home.join(".tmux"), "/root/.tmux".into(), true, false),
+            DirectoryShare::new(
+                cache_dir.join(".yarn"),
+                "/root/.yarn".into(),
+                false,
+                true,
+                false,
+            ),
+            DirectoryShare::new(home.join(".tmux"), "/root/.tmux".into(), true, false, false),
         ]
         .into_iter()
         .flatten()
@@ -349,10 +412,6 @@ Options
             " if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
                 .to_string()
         ));
-    }
-
-    for spec in &args.mounts {
-        directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
     }
 
     // Enable bash history
@@ -1372,8 +1431,18 @@ fn run_vm(
         for share in directory_shares {
             let staging = format!("/mnt/shared/{}", share.tag());
             let guest = share.guest.to_string_lossy();
-            all_login_actions.push(Send(format!(" mkdir -p {}", guest)));
-            all_login_actions.push(Send(format!(" mount --bind {} {}", staging, guest)));
+            all_login_actions.push(Send(format!(" mkdir -p {guest}")));
+            all_login_actions.push(Send(format!(" mount --bind {staging} {guest}")));
+
+            if share.is_project_dir && share.host.join("node_modules").is_dir() {
+                let tag = share.tag();
+                all_login_actions.push(Send(format!(
+                    " mkdir -p \"/tmp/isolated_node_modules/{tag}\""
+                )));
+                all_login_actions.push(Send(format!(
+                    " mount --bind \"/tmp/isolated_node_modules/{tag}\" \"{guest}/node_modules\""
+                )));
+            }
         }
     }
 

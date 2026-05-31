@@ -309,7 +309,8 @@ Options
             }
 
             // Handle .git directory masking or read-only sharing
-            if share.host.join(".git").exists() {
+            let git_path = share.host.join(".git");
+            if git_path.exists() {
                 match args.git_mode {
                     GitMode::No => {
                         login_actions.push(Send(format!(
@@ -318,13 +319,17 @@ Options
                         )));
                     }
                     GitMode::Ro => {
-                        extra_git_shares.push(DirectoryShare::new(
-                            share.host.join(".git"),
-                            share.guest.join(".git"),
-                            true,
-                            false,
-                            false,
-                        )?);
+                        // VirtioFS can only share directories; skip if .git is a file
+                        // (e.g. git submodules store a gitdir pointer file, not a directory).
+                        if git_path.is_dir() {
+                            extra_git_shares.push(DirectoryShare::new(
+                                git_path,
+                                share.guest.join(".git"),
+                                true,
+                                false,
+                                false,
+                            )?);
+                        }
                     }
                     GitMode::Rw => {}
                 }

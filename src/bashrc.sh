@@ -53,3 +53,12 @@ function http-proxy-export() {
 }
 
 function gemini-yolo() { gemini --approval-mode=yolo "$@"; }
+function copilot-yolo() { copilot --yolo "$@"; }
+function agy-yolo() { agy --dangerously-skip-permissions "$@"; }
+
+function update-all-ai-tools() {
+  command -v copilot && printf "$ %s\n" "copilot update" && copilot update;
+  command -v agy && printf "$ %s\n" "agy update" && agy update;
+  command -v mise && printf "$ %s\n" "mise install node bun" && mise install node bun;
+  # mise install "npm:@google/gemini-cli"  "npm:@github/copilot"
+}

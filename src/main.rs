@@ -243,6 +243,13 @@ Options
             true,
             false,
         )?,
+        DirectoryShare::new(
+            cache_dir.join(".yarn"),
+            "/root/.yarn".into(),
+            false,
+            true,
+            false,
+        )?,
     ];
 
     let disk_path = if let Some(path) = args.disk {
@@ -353,6 +360,13 @@ Options
         // Add default shares, if they exist
         for share in [
             DirectoryShare::new(
+                cache_dir.join("guest_node_modules"),
+                "/var/cache/guest_node_modules".into(),
+                false,
+                true,
+                false,
+            ),
+            DirectoryShare::new(
                 cache_dir.join(".m2"),
                 "/root/.m2".into(),
                 false,
@@ -383,13 +397,6 @@ Options
             DirectoryShare::new(
                 cache_dir.join(".gemini"),
                 "/root/.gemini".into(),
-                false,
-                true,
-                false,
-            ),
-            DirectoryShare::new(
-                cache_dir.join(".yarn"),
-                "/root/.yarn".into(),
                 false,
                 true,
                 false,
@@ -1442,10 +1449,10 @@ fn run_vm(
             if share.is_project_dir && share.host.join("node_modules").is_dir() {
                 let tag = share.tag();
                 all_login_actions.push(Send(format!(
-                    " mkdir -p \"/tmp/isolated_node_modules/{tag}\""
+                    " mkdir -p \"/var/cache/guest_node_modules/{tag}\""
                 )));
                 all_login_actions.push(Send(format!(
-                    " mount --bind \"/tmp/isolated_node_modules/{tag}\" \"{guest}/node_modules\""
+                    " mount --bind \"/var/cache/guest_node_modules/{tag}\" \"{guest}/node_modules\""
                 )));
             }
         }

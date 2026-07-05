@@ -23,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine, engine::general_purpose};
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use lexopt::prelude::*;
@@ -41,7 +42,7 @@ const BYTES_PER_MB: u64 = 1024 * 1024;
 const DEFAULT_CPU_COUNT: usize = 2;
 const DEFAULT_RAM_MB: u64 = 2048;
 const DEFAULT_RAM_BYTES: u64 = DEFAULT_RAM_MB * BYTES_PER_MB;
-const DEFAULT_DISK_GB: u64 = 100;
+const DEFAULT_DISK_GB: u64 = 12;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -52,9 +53,15 @@ const PROVISION_SUCCESS_MARKER: &str = "VIBE_PROVISION_SUCCESS";
 const DEFAULT_IMAGE_NAME: &str = "default";
 const INSTANCE_DIR_NAME: &str = ".vibe";
 const INSTANCE_DISK_IMAGE_NAME: &str = "instance.raw";
+
+/// #region scripts for the guest vm
+const BASHRC_SCRIPT: &str = include_str!("bashrc.sh");
+const BASH_LOGOUT_SCRIPT: &str = include_str!("bash_logout.sh");
+/// #endregion
+const DEFAULT_DISK_SIZE: u64 = DEFAULT_DISK_GB * 1024 * BYTES_PER_MB;
 include!(concat!(env!("OUT_DIR"), "/provisioning.rs"));
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum LoginAction {
     Expect { text: String, timeout: Duration },
     Send(String),
@@ -348,15 +355,15 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                 {
                     directory_shares.push(share);
                 }
-                // Bind-mount linux ripgrep over shared macos binary to ensure compatibility
-                login_actions.push(Send(
-                    " if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
-                        .to_string()
-                ));
-            }
 
-            for spec in &args.mounts {
-                directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
+                // Provision ~/.tmux.conf
+                let tmux_conf = home.join(".tmux.conf");
+                if tmux_conf.exists() {
+                    login_actions.push(Send(write_file_into_vm(
+                        "/root/.tmux.conf",
+                        &fs::read_to_string(&tmux_conf)?,
+                    )?));
+                }
             }
 
             login_actions.extend(env_login_actions(&args.env));
@@ -624,8 +631,18 @@ fn shell_single_quote(value: &str) -> String {
     value.replace('\'', r"'\''")
 }
 
+fn write_file_into_vm(
+    vm_path: &str,
+    file_content: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let b64 = general_purpose::STANDARD.encode(file_content);
+    let quoted_path = shell_single_quote(vm_path);
+    let command =
+        format!(" echo '{b64}' | base64 --decode > '{quoted_path}'\nchmod +x '{quoted_path}'");
+    Ok(command)
+}
 fn script_command_and_status_marker(id: &str, script: &str) -> (String, String) {
-    let marker = "VIBE_SCRIPT_EOF";
+    let b64 = general_purpose::STANDARD.encode(script);
     let guest_dir = "/tmp/vibe-scripts";
     let guest_path = format!("{guest_dir}/{id}.sh");
     let status_marker = format!("VIBE_SCRIPT_STATUS_{id}");
@@ -638,9 +655,7 @@ fn script_command_and_status_marker(id: &str, script: &str) -> (String, String) 
     // successful script so later scripts can use newly installed commands.
     let command = format!(
         " mkdir -p {guest_dir}\n\
-cat >{guest_path} <<'{marker}'\n\
-{script}\n\
-{marker}\n\
+echo '{b64}' | base64 --decode >{guest_path}\n\
 chmod +x {guest_path}\n\
 {guest_path} </dev/null\n\
 status=$?\n\
@@ -951,13 +966,12 @@ fn provision_image(
 
         fs::copy(base_raw, &tmp_raw)?;
 
-        let desired_size = DEFAULT_DISK_GB * 1024 * BYTES_PER_MB;
         let current_size = fs::metadata(&tmp_raw)?.len();
-        if current_size < desired_size {
+        if current_size < DEFAULT_DISK_SIZE {
             fs::OpenOptions::new()
                 .write(true)
                 .open(&tmp_raw)?
-                .set_len(desired_size)?;
+                .set_len(DEFAULT_DISK_SIZE)?;
         }
 
         let scripts: Vec<&ProvisionScript> = std::iter::once(
@@ -1030,6 +1044,10 @@ fn ensure_instance_disk(
     template_raw: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if instance_raw.exists() {
+        println!(
+            "The instance disk {} has been copied already",
+            instance_raw.display()
+        );
         return Ok(());
     }
 
@@ -1603,6 +1621,15 @@ fn run_vm(
             const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
             S.to_string()
         }),
+        //
+        Send(write_file_into_vm("/root/.profile", BASHRC_SCRIPT)?),
+        Send(write_file_into_vm(
+            "/root/.bash_logout",
+            BASH_LOGOUT_SCRIPT,
+        )?),
+        //
+        Send(" [ -x \"$HOME/.local/bin/mise\" ] && eval \"$(\"${HOME}/.local/bin/mise\" activate bash)\"".to_string()),
+        Send(" eval \"$(fzf --bash)\"".to_string()),
     ];
 
     if !directory_shares.is_empty() {

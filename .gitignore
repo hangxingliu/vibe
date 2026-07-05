@@ -1,1 +1,10 @@
+.vibe
+
 /target
+/helpers/vibe-usernet/vibe-usernet
+
+/.cache
+/*-agent.yml
+
+.DS_Store
+._*

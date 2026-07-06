@@ -1,0 +1,17 @@
+bindAddr = "127.0.0.1"
+bindPort = 9903
+kcpBindPort = 9903
+
+transport.tls.force = true
+
+# console or real logFile path like ./frps.log
+log.to = "console"
+# trace, debug, info, warn, error
+log.level = "info"
+
+auth.method = "token"
+auth.token = "19a4a6e3-0c14-4e49-9d3f-32f1d621b13d"
+
+allowPorts = [
+  {start = 9904, end = 9909},
+]

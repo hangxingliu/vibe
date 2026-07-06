@@ -1,3 +1,31 @@
+The original repository:
+
+<https://github.com/lynaghk/vibe>
+
+This forked version introduces several core improvements, focusing on custom environment provisioning, host-guest connectivity, hardware resource customization, and advanced security isolation:
+
+1. **Port Forwarding Support**:
+    - Added the `-p` / `--publish` option to forward VM (guest) TCP/UDP ports to the host machine.
+    - Example usage: `-p 127.0.0.1:8080:80 -p udp:127.0.0.1:9002:9002`
+2. **Native Proxy Configuration**:
+    - Added the `--proxy` option to ensure network connections within the VM are routed through the specified SOCKS5/HTTP proxy.
+    - Added the `--proxy-udp` option (used in conjunction with `--proxy`) to ensure that outgoing UDP connections from within the VM are also routed through the specified SOCKS5 proxy.
+    - For `--network nat` (default network type), these proxies are implemented via code in helpers/vibe-usernet and are transparent to the VM.
+    - For other `--network` types, the proxy is implemented via environment variables and `apt` configuration files within the VM.
+    - Example usage: `--proxy "socks5://127.0.0.1:1080" --proxy-udp`
+3. **SSH Access Support**:
+    - Added the `--ssh-key <PUBLIC_KEY_FILE>` option to automatically inject the host's public key and start the SSH server inside the guest, facilitating direct connection from external tools and SSH clients.
+4. **Advanced Directory Isolation & Safety**:
+    - **Configurable Git Sharing**: Added the `--git <rw | ro | no>` flag to control access to the host's `.git` folder (defaults to read-only `ro` to prevent agents from corrupting repository history; `no` masks `.git` entirely via tmpfs).
+    - **`node_modules` Sandboxing**: Automatically mounts `node_modules` to a dedicated guest cache directory, improving disk I/O performance (bypassing slow VirtioFS translation) and keeping the host project clean.
+    - **Sensitive Data Masking**: Securely masks `.env` files and `.vibe` subfolders inside the VM via tmpfs mounts.
+    - **CLI Config Isolation**: Separates critical host configuration directories (for Claude, Codex, Gemini, etc.) from the guest VM to prevent credential leakage.
+5. **Custom Provisioning for Base System Images**:
+    - Use `vibe provision --repl` to provision the base image via commands inside the VM after the provisioning script finishes.
+6. **Guest Environment & I/O Optimizations**:
+    - Automatically syncs host configurations (like `~/.tmux.conf`) to the guest VM on boot, and provisions clean `.profile` and `.bash_logout` setups.
+---
+
 Vibe is a quick, zero-configuration way to spin up a Linux virtual machine on Mac to sandbox LLM agents:
 
 ```

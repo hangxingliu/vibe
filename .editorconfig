@@ -5,6 +5,9 @@ charset = utf-8
 end_of_line = lf
 
 [*.{md,markdown}]
+tab_width = 4
+indent_size = 4
+indent_style = space
 trim_trailing_whitespace = false
 
 [*.sh]

@@ -60,7 +60,33 @@ const BASHRC_SCRIPT: &str = include_str!("bashrc.sh");
 const BASH_LOGOUT_SCRIPT: &str = include_str!("bash_logout.sh");
 /// #endregion
 const DEFAULT_DISK_SIZE: u64 = DEFAULT_DISK_GB * 1024 * BYTES_PER_MB;
+
+/// CACHE_NAME:GUEST_VM_PATH
+/// these shares will be mounted in provision stage and vm runtime stage
+const DEFAULT_CACHE_SHARES: &[&str] = &[
+    "mise-cache:/root/.local/share/mise",
+    "apt:/var/cache/apt",
+    "cargo:/root/.cargo",
+    "yarn:/root/.yarn",
+    "m2:/root/.m2",
+    "go:/root/go",
+    "guest_node_modules:/var/cache/guest_node_modules",
+];
+
+/// Project subfolders masked with tmpfs to prevent host data leaking into the VM.
+const MASKED_SUBFOLDERS: &[&str] = &[".vibe"];
+
+/// Project files masked by bind-mounting an empty file over them to prevent host data leaking.
+const MASKED_FILES: &[&str] = &[".env"];
+
 include!(concat!(env!("OUT_DIR"), "/provisioning.rs"));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitMode {
+    Rw,
+    Ro,
+    No,
+}
 
 #[derive(Debug, Clone)]
 enum LoginAction {
@@ -75,6 +101,7 @@ struct DirectoryShare {
     host: PathBuf,
     guest: PathBuf,
     read_only: bool,
+    is_project_dir: bool,
 }
 
 impl DirectoryShare {
@@ -82,9 +109,15 @@ impl DirectoryShare {
         host: PathBuf,
         mut guest: PathBuf,
         read_only: bool,
+        create_host_dir: bool,
+        is_project_dir: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         if !host.exists() {
-            return Err(format!("Host path does not exist: {}", host.display()).into());
+            if create_host_dir {
+                fs::create_dir_all(&host)?;
+            } else {
+                return Err(format!("Host path does not exist: {}", host.display()).into());
+            }
         }
         if !guest.is_absolute() {
             guest = PathBuf::from("/root").join(guest);
@@ -93,6 +126,7 @@ impl DirectoryShare {
             host,
             guest,
             read_only,
+            is_project_dir,
         })
     }
 
@@ -118,7 +152,7 @@ impl DirectoryShare {
         } else {
             false
         };
-        DirectoryShare::new(host, guest, read_only)
+        DirectoryShare::new(host, guest, read_only, false, true)
     }
 
     fn tag(&self) -> String {
@@ -153,6 +187,10 @@ fn provisioning_scripts_banner() -> String {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_cli()?;
 
+    let home = env::var("HOME").map(PathBuf::from)?;
+    let cache_home = env::var("XDG_CACHE_HOME").map_or_else(|_| home.join(".cache"), PathBuf::from);
+    let cache_dir = cache_home.join("vibe");
+
     if args.version {
         println!("Vibe");
         println!("https://github.com/lynaghk/vibe/");
@@ -185,6 +223,11 @@ Options:
                                                             Example: -p 127.0.0.1:8022:22 -p udp:8080:80
   --proxy <URL>                                             Set proxy. Configures apt during provisioning and exports proxy environment variables at login.
   
+  --git <rw | ro | no>                                      How the .git directory is treated (default `ro`).
+                                                            rw: share host .git as read-write.
+                                                            ro: share host .git as read-only.
+                                                            no: mask .git with tmpfs.
+							    
 
 Login actions (executed in order after root login, repeatable):
 
@@ -202,16 +245,18 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
   --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
   --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 2048).
 
-{}",
-                 provisioning_scripts_banner()
+{}
+  
+Cache directory:
+
+  {}
+",
+                 provisioning_scripts_banner(),
+                 cache_dir.to_string_lossy().into_owned(),
         );
         std::process::exit(0);
     }
 
-    let home = env::var("HOME").map(PathBuf::from)?;
-    let cache_home = env::var("XDG_CACHE_HOME").map_or_else(|_| home.join(".cache"), PathBuf::from);
-    let cache_dir = cache_home.join("vibe");
-    let guest_mise_cache = cache_dir.join(".guest-mise-cache");
     let basename_compressed = DEBIAN_COMPRESSED_DISK_URL.rsplit('/').next().unwrap();
     let base_compressed = cache_dir.join(basename_compressed);
     let base_raw = cache_dir.join(format!(
@@ -221,7 +266,11 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
 
     // Prepare system-wide directories
     fs::create_dir_all(&cache_dir)?;
-    fs::create_dir_all(&guest_mise_cache)?;
+
+    let default_shares = DEFAULT_CACHE_SHARES
+        .iter()
+        .map(|share| create_cache_share(&cache_dir, share))
+        .collect::<Result<Vec<_>, _>>()?;
 
     ensure_signed();
 
@@ -261,7 +310,7 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                 &image_path(&cache_dir, &image),
                 replace,
                 &scripts,
-                std::slice::from_ref(&mise_directory_share),
+                &default_shares,
                 prepare_network_backend,
                 &args.proxy,
                 cpu_count,
@@ -296,7 +345,7 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                         &base_raw,
                         &base_compressed,
                         &template_raw,
-                        std::slice::from_ref(&mise_directory_share),
+                        &default_shares,
                         prepare_network_backend,
                         &args.proxy,
                     )?;
@@ -318,44 +367,102 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
             if !args.no_default_mounts {
                 login_actions.push(Send(format!(" cd {project_name}")));
 
-                // Discourage read/write of project dir subfolders within the VM.
-                // Note that this isn't secure, since the VM runs as root and could unmount this.
-                // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
-                for subfolder in [".git", INSTANCE_DIR_NAME] {
-                    if project_root.join(subfolder).exists() {
-                        login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {subfolder}")));
-                    }
-                }
-
                 directory_shares.push(
                     DirectoryShare::new(
-                        project_root,
-                        PathBuf::from("/root/").join(project_name),
+                        project_root.clone(),
+                        PathBuf::from("/root/").join(&project_name),
                         false,
+                        false,
+                        true,
                     )
                     .expect("Project directory must exist"),
                 );
+            }
 
-                directory_shares.push(mise_directory_share);
-                // Activate mise if applicable.
-                // This is in addition to the .bashrc, since mise activation must occur after the shared tool cache is mounted.
-                login_actions.push(Send(
-                    " if [ -x \"$HOME/.local/bin/mise\" ]; then eval \"$(\"$HOME/.local/bin/mise\" activate bash)\"; fi"
-                        .to_string(),
-                ));
+            for spec in &args.mounts {
+                directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
+            }
+
+            if !args.no_default_mounts {
+                let mut extra_git_shares = Vec::new();
+
+                // Collect project dirs to mask. We use a separate vector to avoid borrow checker issues
+                // and because we want to add .git shares at the end of the list to ensure they are
+                // mounted after their parent directories.
+                let project_shares: Vec<DirectoryShare> = directory_shares
+                    .iter()
+                    .filter(|s| s.is_project_dir)
+                    .cloned()
+                    .collect();
+
+                for share in project_shares {
+                    // Discourage read/write of project dir subfolders within the VM.
+                    for subfolder in MASKED_SUBFOLDERS {
+                        if share.host.join(subfolder).exists() {
+                            login_actions.push(Send(format!(
+                                " mount -t tmpfs tmpfs {}",
+                                share.guest.join(subfolder).display()
+                            )));
+                        }
+                    }
+
+                    // Handle .git directory masking or read-only sharing
+                    let git_path = share.host.join(".git");
+                    if git_path.exists() {
+                        match args.git_mode {
+                            GitMode::No => {
+                                login_actions.push(Send(format!(
+                                    " mount -t tmpfs tmpfs {}",
+                                    share.guest.join(".git").display()
+                                )));
+                            }
+                            GitMode::Ro => {
+                                // VirtioFS can only share directories; skip if .git is a file
+                                // (e.g. git submodules store a gitdir pointer file, not a directory).
+                                if git_path.is_dir() {
+                                    extra_git_shares.push(DirectoryShare::new(
+                                        git_path,
+                                        share.guest.join(".git"),
+                                        true,
+                                        false,
+                                        false,
+                                    )?);
+                                }
+                            }
+                            GitMode::Rw => {}
+                        }
+                    }
+
+                    // Mask individual files by bind-mounting an empty file over them to prevent
+                    // host file contents (e.g. secrets) from being readable inside the VM.
+                    for filename in MASKED_FILES {
+                        if share.host.join(filename).exists() {
+                            login_actions.push(Send(format!(
+                        r#" [ -n "$__masked_tmp_file" ] || __masked_tmp_file="$(mktemp)"; mount -o bind "$__masked_tmp_file" {}"#,
+                        share.guest.join(filename).display()
+                    )));
+                        }
+                    }
+                }
+                directory_shares.extend(extra_git_shares);
+
+                directory_shares.extend(default_shares);
 
                 // Add default shares, if they exist
                 for share in [
-                    DirectoryShare::new(home.join(".m2"), "/root/.m2".into(), false),
+                    create_cache_share(&cache_dir, "codex:/root/.codex"),
+                    create_cache_share(&cache_dir, "copilot:/root/.copilot"),
+                    create_cache_share(&cache_dir, "claude:/root/.claude"),
+                    create_cache_share(&cache_dir, "gemini:/root/.gemini"),
+                    create_cache_share(&cache_dir, "pi:/root/.pi"),
+                    //
                     DirectoryShare::new(
-                        home.join(".cargo/registry"),
-                        "/root/.cargo/registry".into(),
+                        home.join(".tmux"),
+                        "/root/.tmux".into(),
+                        true,
+                        false,
                         false,
                     ),
-                    DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
-                    DirectoryShare::new(home.join(".claude"), "/root/.claude".into(), false),
-                    DirectoryShare::new(home.join(".gemini"), "/root/.gemini".into(), false),
-                    DirectoryShare::new(home.join(".pi"), "/root/.pi".into(), false),
                 ]
                 .into_iter()
                 .flatten()
@@ -434,6 +541,7 @@ struct CliArgs {
     proxy: Option<String>,
     ssh_key: Option<PathBuf>,
     publish: Vec<String>,
+    git_mode: GitMode,
 }
 
 enum CliCommand {
@@ -564,6 +672,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut proxy = None;
     let mut ssh_key = None;
     let mut publish = Vec::new();
+    let mut git_mode = GitMode::Ro;
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -600,6 +709,15 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             }
             Long("ssh-key") => {
                 ssh_key = Some(PathBuf::from(parser.value()?));
+            }
+            Long("git") => {
+                let value = os_to_string(parser.value()?, "--git")?;
+                git_mode = match value.as_str() {
+                    "rw" => GitMode::Rw,
+                    "ro" => GitMode::Ro,
+                    "no" => GitMode::No,
+                    _ => return Err("Invalid --git mode".into()),
+                };
             }
             Long("publish") | Short('p') => {
                 publish.push(os_to_string(parser.value()?, "-p/--publish")?);
@@ -663,6 +781,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         proxy,
         ssh_key,
         publish,
+        git_mode,
     })
 }
 
@@ -675,6 +794,15 @@ fn env_login_actions(env: &HashMap<String, String>) -> Vec<LoginAction> {
 
 fn shell_single_quote(value: &str) -> String {
     value.replace('\'', r"'\''")
+}
+
+
+fn create_cache_share(
+    cache_dir: &Path,
+    share: &str,
+) -> Result<DirectoryShare, Box<dyn std::error::Error>> {
+    let (name, guest_path) = share.split_once(':').unwrap();
+    DirectoryShare::new(cache_dir.join(name), guest_path.into(), false, true, false)
 }
 
 fn write_file_into_vm(
@@ -1744,6 +1872,16 @@ fn run_vm(
             let guest = share.guest.to_string_lossy();
             all_login_actions.push(Send(format!(" mkdir -p {guest}")));
             all_login_actions.push(Send(format!(" mount --bind {staging} {guest}")));
+
+            if share.is_project_dir && share.host.join("node_modules").is_dir() {
+                let tag = share.tag();
+                all_login_actions.push(Send(format!(
+                    " mkdir -p \"/var/cache/guest_node_modules/{tag}\""
+                )));
+                all_login_actions.push(Send(format!(
+                    " mount --bind \"/var/cache/guest_node_modules/{tag}\" \"{guest}/node_modules\""
+                )));
+            }
         }
     }
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install Anthropic's Claude.
+# Install Go language.
 set -euxo pipefail
 
 retry_error=
@@ -20,10 +20,4 @@ exec_retry() {
   while retryable "$?"; do "${@}"; done
 }
 
-# Set this env var so claude doesn't complain about running as root.
-echo "export IS_SANDBOX=1" >> .bashrc
-
-tool='    claude = "latest"'
-echo "$tool" >> .config/mise/config.toml
-
-exec_retry mise install
+exec_retry mise use -g go@latest

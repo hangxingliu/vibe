@@ -1,15 +1,14 @@
-#!/bin/bash
-# Base provisioning script that installs mise-en-place and sets up VM disk.
+#!/usr/bin/env bash
 set -euxo pipefail
 
 image_history=/root/vibe-image-history.txt
 base_first_run=false
-if [[ ! -e "${image_history}" ]]; then
+if [[ ! -s "${image_history}" ]]; then
   base_first_run=true
 fi
 
 {
-  if [[ -s "${image_history}" ]]; then
+  if ! "$base_first_run"; then
     echo
   fi
   echo '===== vibe provision ====='
@@ -33,18 +32,50 @@ fi
 # Don't wait too long for slow mirrors.
 echo 'Acquire::http::Timeout "2";' | tee /etc/apt/apt.conf.d/99timeout
 echo 'Acquire::https::Timeout "2";' | tee -a /etc/apt/apt.conf.d/99timeout
-echo 'Acquire::Retries "2";' | tee -a /etc/apt/apt.conf.d/99timeout
+echo 'Acquire::Retries "3";' | tee -a /etc/apt/apt.conf.d/99timeout
 
-apt update
+# region INJECT_PROXY_CODE
+# endregion INJECT_PROXY_CODE
+
+retry_error=
+retryable() {
+  if [ -z "$retry_error" ]; then retry_error=0; return 0; fi
+  if [ "$1" == "0" ]; then retry_error=; return 1; fi
+
+  retry_error="$((retry_error+1))";
+  if [[ "$retry_error" -le 3 ]]; then
+    echo "Warn:  waiting 10s and try again (error=${retry_error}) ..." >&2;
+    sleep 10;
+    return 0;
+  fi
+  echo "Error: too many errors and retry attempts, exiting ..." >&2;
+  exit 1;
+}
+exec_retry() {
+  while retryable "$?"; do "${@}"; done
+}
+
+
+ip addr;
+pwd;
+
+exec_retry \
+apt update;
 
 ##########################################################
 # Use debian fast-forward so we get newer package versions
+# https://wiki.debian.org/Fastforward
+# https://fastforward.debian.net/doc/installation/
+# region
 
+exec_retry \
 apt install --no-install-recommends --update --yes ca-certificates gnupg debian-keyring wget
 
 mkdir -p /usr/share/debian-fastforward/pgp-keys
 
+exec_retry \
 wget https://deb.fastforward.debian.net/debian-fastforward/project/pgp/fastforward-debian-13-trixie-signing-key.pub -O /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg
+exec_retry \
 wget https://deb.fastforward.debian.net/debian-fastforward/project/pgp/fastforward-debian-13-trixie-signing-key.pub.sig -O /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg.sig
 
 gpg --keyring /usr/share/keyrings/debian-keyring.gpg --keyring /usr/share/keyrings/debian-maintainers.gpg --verify /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg.sig
@@ -85,22 +116,37 @@ Pin: release n=trixie-fastforward-backports
 Pin-Priority: 990
 EOF'
 
+exec_retry \
 apt full-upgrade --update --yes
 
 ##########################################################
 # End of debian fast forward
+# endregion
 
-
-
-apt install --no-install-recommends --yes \
-  cloud-guest-utils                       \
-  build-essential                         \
-  pkg-config                              \
-  libssl-dev                              \
-  curl                                    \
-  git                                     \
-  tmux                                    \
+apt_packages=(
+  cloud-guest-utils
+  build-essential
+  pkg-config
+  libssl-dev
+  curl
+  git
   ripgrep
+  vim
+  wget
+  htop
+  tmux
+  openssh-server
+  unzip
+);
+
+exec_retry \
+apt install --no-install-recommends --yes "${apt_packages[@]}"
+
+
+echo 'PasswordAuthentication no
+PermitRootLogin  yes' | tee /etc/ssh/sshd_config.d/99_custom.conf
+
+systemctl disable ssh
 
 
 # Expand disk partition
@@ -112,52 +158,50 @@ resize2fs /dev/vda1
 # Set hostname to "vibe" so it's clear that you're inside the VM.
 hostnamectl set-hostname vibe
 
-# Enable true color support in the terminal
-echo "export COLORTERM=truecolor" >> .bashrc
+cd /root
+mkdir -p .ssh
 
-# Hide commands beginning with space from the history
-echo "export HISTCONTROL=ignorespace" >> .bashrc
 
-# Unlimited bash history
-echo "export HISTFILESIZE=" >> .bashrc
-echo "export HISTSIZE=" >> .bashrc
-
-# Shutdown the VM when you logout
-cat > .bash_logout <<EOF
-history -w # Write bash history. Otherwise bash would be killed by poweroff without having written history
-
-# Only shutdown if tmux isn't running
-if ! tmux list-sessions &> /dev/null; then
-    systemctl poweroff
-    sleep 100 # sleep here so that we don't see the login screen flash up before the shutdown.
-fi
-EOF
+export PATH="${HOME}/.cargo/bin:${HOME}/.local/bin:${PATH}";
 
 
 # Install Mise
+while retryable "$?"; do
 curl https://mise.run | sh
-echo 'eval "$(~/.local/bin/mise activate bash)"' >> .bashrc
+done
 
-export PATH="$HOME/.local/bin:$PATH"
 eval "$(mise activate bash)"
 
 mkdir -p .config/mise/
 
 cat > .config/mise/config.toml <<MISE
-    [settings]
-    # Always use the venv created by uv, if available in directory
-    python.uv_venv_auto = true
+[settings]
+# Always use the venv created by uv, if available in directory
+python.uv_venv_auto = true
 
-    # Trust everything by default, since we're already in a VM sandbox
-    trusted_config_paths = ["/"]
+# Trust everything by default, since we're already in a VM sandbox
+trusted_config_paths = ["/root"]
 
-    experimental = true
+# Trust everything by default, since we're already in a VM sandbox
+experimental = true
 
-    [tools]
-    uv = "latest"
-    node = "latest"
+# idiomatic_version_file_enable_tools = ["rust"]
 
+[tools]
+usage = "latest"
+uv = "0.11.3"
+fzf = "latest"
+node = "24"
 MISE
+# "npm:@github/copilot" = "latest"
+# "npm:@google/gemini-cli" = "latest"
+# "npm:@openai/codex" = "latest"
+# "npm:@anthropic-ai/claude-code" = "latest"
+# "npm:@earendil-works/pi-coding-agent" = "latest"
 
 touch .config/mise/mise.lock
+
+exec_retry \
 mise install
+
+true;

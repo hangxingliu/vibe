@@ -43,6 +43,7 @@ const DEFAULT_CPU_COUNT: usize = 2;
 const DEFAULT_RAM_MB: u64 = 2048;
 const DEFAULT_RAM_BYTES: u64 = DEFAULT_RAM_MB * BYTES_PER_MB;
 const DEFAULT_DISK_GB: u64 = 12;
+const DEFAULT_PROVISION_RAM_BYTES: u64 = 4096 * BYTES_PER_MB;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -180,8 +181,10 @@ Options:
   --network <nat|vznat>                                     Guest networking mode (default `nat`).
                                                             `nat` uses Vibe's bundled user-mode network stack.
                                                             `vznat` uses Apple's VZNATNetworkDeviceAttachment.
-  --cpus COUNT                                              Number of virtual CPUs (default 2).
-  --ram MEGABYTES                                           RAM size in megabytes (default 2048).
+  -p, --publish [udp:][HOST_ADDR:]HOST_PORT:GUEST_PORT      Forward a guest port to the host (repeatable).
+                                                            Example: -p 127.0.0.1:8022:22 -p udp:8080:80
+  --proxy <URL>                                             Set proxy. Configures apt during provisioning and exports proxy environment variables at login.
+  
 
 Login actions (executed in order after root login, repeatable):
 
@@ -189,6 +192,7 @@ Login actions (executed in order after root login, repeatable):
   --send SOME_COMMAND                                       Type SOME_COMMAND followed by newline into the VM.
   --expect STRING [timeout-seconds]                         Wait for STRING to appear in console output before executing next login action.
                                                             If STRING does not appear within timeout (default 30 seconds), shutdown VM with error.
+  --ssh-key <PUBLIC_KEY_FILE>                               Install SSH public key into VM and start SSH server.
 
 Provisioning creates a new named image by running (built-in) scripts. Options:
 
@@ -222,6 +226,7 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
     ensure_signed();
 
     let usernet_helper_path = cache_dir.join("vibe-usernet");
+    let publish = args.publish.clone();
     let prepare_network_backend = |log_dir: Option<&Path>| {
         args.network_mode
             .prepare(&usernet_helper_path, log_dir)
@@ -258,6 +263,7 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                 &scripts,
                 std::slice::from_ref(&mise_directory_share),
                 prepare_network_backend,
+                &args.proxy,
                 cpu_count,
                 ram_bytes,
             )
@@ -292,6 +298,7 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                         &template_raw,
                         std::slice::from_ref(&mise_directory_share),
                         prepare_network_backend,
+                        &args.proxy,
                     )?;
                 } else if !template_raw.exists() {
                     return Err(format!(
@@ -375,6 +382,27 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                 login_actions.push(motd_action);
             }
 
+            // Set proxy environment variables for interactive use
+            if let Some(url) = &args.proxy {
+                login_actions.push(Send(format!(
+                    " {}",
+                    generate_http_proxy_env_export_cmds(url)
+                )));
+            }
+
+            // Install SSH public key and start SSH server
+            if let Some(ssh_key_path) = &args.ssh_key {
+                let key_content = fs::read_to_string(ssh_key_path).map_err(|err| {
+                    format!("Failed to read SSH key {}: {err}", ssh_key_path.display())
+                })?;
+                let b64 = general_purpose::STANDARD.encode(key_content.trim());
+                login_actions.push(Send(format!(
+                    " mkdir -p /root/.ssh && echo '{b64}' | base64 --decode > /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys"
+                )));
+                login_actions.push(Send(" systemctl start ssh".to_string()));
+                login_actions.push(Send(" ip -4 -br addr".to_string()));
+            }
+
             // Any user-provided login actions must come after our system ones
             login_actions.extend(args.login_actions);
 
@@ -403,6 +431,9 @@ struct CliArgs {
     network_mode: NetworkMode,
     cpu_count: usize,
     ram_bytes: u64,
+    proxy: Option<String>,
+    ssh_key: Option<PathBuf>,
+    publish: Vec<String>,
 }
 
 enum CliCommand {
@@ -456,7 +487,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         let mut replace = false;
         let mut scripts = Vec::new();
         let mut cpu_count = DEFAULT_CPU_COUNT;
-        let mut ram_bytes = DEFAULT_RAM_BYTES;
+        let mut ram_bytes = DEFAULT_PROVISION_RAM_BYTES;
 
         while let Some(arg) = parser.next()? {
             match arg {
@@ -530,6 +561,9 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut network_mode = NetworkMode::Nat;
     let mut cpu_count = DEFAULT_CPU_COUNT;
     let mut ram_bytes = DEFAULT_RAM_BYTES;
+    let mut proxy = None;
+    let mut ssh_key = None;
+    let mut publish = Vec::new();
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -561,6 +595,15 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             }
             Long("cpus") => cpu_count = parse_cpu_count(&mut parser)?,
             Long("ram") => ram_bytes = parse_ram_size(&mut parser)?,
+            Long("proxy") => {
+                proxy = Some(os_to_string(parser.value()?, "--proxy")?);
+            }
+            Long("ssh-key") => {
+                ssh_key = Some(PathBuf::from(parser.value()?));
+            }
+            Long("publish") | Short('p') => {
+                publish.push(os_to_string(parser.value()?, "-p/--publish")?);
+            }
             Long("mount") => {
                 mounts.push(os_to_string(parser.value()?, "--mount")?);
             }
@@ -617,6 +660,9 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         network_mode,
         cpu_count,
         ram_bytes,
+        proxy,
+        ssh_key,
+        publish,
     })
 }
 
@@ -641,11 +687,21 @@ fn write_file_into_vm(
         format!(" echo '{b64}' | base64 --decode > '{quoted_path}'\nchmod +x '{quoted_path}'");
     Ok(command)
 }
+
+fn generate_http_proxy_env_export_cmds(proxy_url: &str) -> String {
+    let url = shell_single_quote(proxy_url);
+    format!(
+        "export http_proxy='{url}'; export HTTP_PROXY='{url}'; export https_proxy='{url}'; export HTTPS_PROXY='{url}'; export no_proxy='127.0.0.1,localhost,192.168.*'; export NO_PROXY='127.0.0.1,localhost,192.168.*';"
+    )
+}
+
 fn script_command_and_status_marker(id: &str, script: &str) -> (String, String) {
     let b64 = general_purpose::STANDARD.encode(script);
     let guest_dir = "/tmp/vibe-scripts";
     let guest_path = format!("{guest_dir}/{id}.sh");
-    let status_marker = format!("VIBE_SCRIPT_STATUS_{id}");
+
+    const STATUS_MARKER_PREFIX: &str = "VIBE_SCRIPT_STATUS_";
+    let status_marker = format!("{STATUS_MARKER_PREFIX}{id}");
 
     // Run the script with stdin from /dev/null so long-running tools spawned by
     // the script cannot consume queued wrapper lines before the parent shell
@@ -654,7 +710,8 @@ fn script_command_and_status_marker(id: &str, script: &str) -> (String, String) 
     // line that wait_for_line_after expects. Reactivate mise after each
     // successful script so later scripts can use newly installed commands.
     let command = format!(
-        " mkdir -p {guest_dir}\n\
+        " free -h; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory;\n\
+mkdir -p {guest_dir}\n\
 echo '{b64}' | base64 --decode >{guest_path}\n\
 chmod +x {guest_path}\n\
 {guest_path} </dev/null\n\
@@ -662,7 +719,7 @@ status=$?\n\
 if [ \"$status\" -eq 0 ] && [ -x \"$HOME/.local/bin/mise\" ]; then\n\
 eval \"$(\"$HOME/.local/bin/mise\" activate bash)\"\n\
 fi\n\
-printf '\\n%s\\n%s\\n' '{status_marker}' \"$status\""
+printf '\\n%s%s\\n%s\\n' '{STATUS_MARKER_PREFIX}' '{id}' \"$status\""
     );
 
     (command, status_marker)
@@ -898,8 +955,13 @@ fn ensure_default_image(
     default_raw: &Path,
     directory_shares: &[DirectoryShare],
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
+    proxy: &Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if default_raw.exists() {
+        println!(
+            "The default image {} has been initialized, `provision.sh` will not be run again",
+            default_raw.display()
+        );
         return Ok(());
     }
 
@@ -925,9 +987,44 @@ fn ensure_default_image(
         &default_provisioning_scripts[..],
         directory_shares,
         prepare_network_backend,
+        proxy,
         DEFAULT_CPU_COUNT,
-        DEFAULT_RAM_BYTES,
+        DEFAULT_PROVISION_RAM_BYTES,
     )
+}
+
+fn build_provision_script(script: &ProvisionScript, proxy: &Option<String>) -> LoginAction {
+    let mut content = script.content.to_string();
+    if script.name == "base" {
+        if let Some(proxy_url) = proxy {
+            let proxy_code = format!(
+                "echo 'Acquire::http::Proxy \"{proxy_url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n\
+                 echo 'Acquire::https::Proxy \"{proxy_url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n\
+                 \n\
+                 {exports}\n",
+                exports = generate_http_proxy_env_export_cmds(proxy_url)
+            );
+
+            let re = regex::Regex::new(
+                r"(?m)^#\s+region\s+INJECT_PROXY_CODE\n(?:.*\n)*?#\s+endregion\s+INJECT_PROXY_CODE",
+            )
+            .expect("valid INJECT_PROXY_CODE region regex");
+
+            content = re
+                .replace(
+                    &content,
+                    format!(
+                        "# region INJECT_PROXY_CODE\n{proxy_code}\n# endregion INJECT_PROXY_CODE"
+                    ),
+                )
+                .into_owned();
+        }
+    }
+
+    Script {
+        name: script.name.to_string(),
+        content,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -938,6 +1035,7 @@ fn provision_image(
     extra_scripts: &[ProvisionScript],
     directory_shares: &[DirectoryShare],
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
+    proxy: &Option<String>,
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -961,8 +1059,10 @@ fn provision_image(
     let tmp_raw = image_dir.join(format!("{image_name}.tmp.{}", std::process::id()));
     let _ = fs::remove_file(&tmp_raw);
 
+    let image_path_str = image_raw.to_string_lossy();
+    let tmp_file_str = tmp_raw.to_string_lossy();
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        println!("Provisioning image '{image_name}'");
+        println!("Provisioning image '{image_name}' (path: {image_path_str}; tmp: {tmp_file_str})");
 
         fs::copy(base_raw, &tmp_raw)?;
 
@@ -1005,10 +1105,7 @@ export VIBE_PROVISION_SCRIPTS='{}'",
         )));
 
         for script in scripts {
-            login_actions.push(Script {
-                name: script.name.to_string(),
-                content: script.content.to_string(),
-            });
+            login_actions.push(build_provision_script(script, proxy));
         }
 
         login_actions.push(Send(format!(" echo {PROVISION_SUCCESS_MARKER}")));
@@ -1529,6 +1626,10 @@ fn run_vm(
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let disk_path_str = disk_path.to_string_lossy();
+    let ram_mib = ram_bytes / 1024 / 1024;
+    println!("Run VM (disk: {disk_path_str}; cpu: {cpu_count}; ram: {ram_mib} MiB) ...");
+
     let (vm_reads_from, we_write_to) = create_pipe();
     let (we_read_from, vm_writes_to) = create_pipe();
     let (resize_reads_from, we_write_resize_to) = create_pipe();

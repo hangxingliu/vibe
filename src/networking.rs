@@ -52,6 +52,7 @@ impl NetworkMode {
         &self,
         usernet_helper_path: &Path,
         log_path: Option<&Path>,
+        publish: &[String],
     ) -> Result<PreparedNetworkBackend, Box<dyn std::error::Error>> {
         match self {
             NetworkMode::VzNat => Ok(PreparedNetworkBackend::VzNat),
@@ -65,7 +66,13 @@ impl NetworkMode {
                     .arg("--parent-liveness-fd")
                     .arg(USERNET_PARENT_LIVENESS_FD.to_string())
                     .arg("--mac")
-                    .arg(USERNET_MAC_ADDRESS)
+                    .arg(USERNET_MAC_ADDRESS);
+
+                for spec in publish {
+                    command.arg("-p").arg(spec);
+                }
+
+                command
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());

@@ -32,6 +32,14 @@ const (
 	readyMessage = "ready"
 )
 
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ", ") }
+func (s *stringSlice) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "vibe-usernet: %v\n", err)
@@ -43,6 +51,8 @@ func run() error {
 	fd := flag.Int("fd", defaultFD, "connected VZ datagram file descriptor")
 	parentLivenessFD := flag.Int("parent-liveness-fd", defaultParentLivenessFD, "parent liveness file descriptor")
 	guestMAC := flag.String("mac", "", "guest MAC address")
+	var publish stringSlice
+	flag.Var(&publish, "p", "publish port: [udp:][host_addr:]host_port:guest_port")
 	flag.Parse()
 
 	if flag.NArg() != 0 {
@@ -50,6 +60,18 @@ func run() error {
 	}
 	if _, err := net.ParseMAC(*guestMAC); err != nil {
 		return fmt.Errorf("invalid --mac: %w", err)
+	}
+
+	forwards := make(map[string]string)
+	for _, spec := range publish {
+		local, remote, err := parsePublish(spec)
+		if err != nil {
+			return err
+		}
+		if _, exists := forwards[local]; exists {
+			return fmt.Errorf("duplicate publish for %s", local)
+		}
+		forwards[local] = remote
 	}
 
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -77,7 +99,7 @@ func run() error {
 			gatewayIP: gatewayMAC,
 			guestIP:   *guestMAC,
 		},
-		Forwards:          map[string]string{},
+		Forwards:          forwards,
 		DNS:               []types.Zone{},
 		DNSSearchDomains:  searchDomains(),
 		NAT:               map[string]string{gatewayIP: "127.0.0.1"},
@@ -103,6 +125,45 @@ func run() error {
 		}
 		return err
 	}
+}
+
+// parsePublish parses a publish spec of the form [udp:][host_addr:]host_port:guest_port
+// and returns the local (host) listen address and the remote (guest) target address.
+// If the spec starts with "udp:", the local address will be prefixed with "udp:".
+func parsePublish(spec string) (local, remote string, err error) {
+	isUDP := false
+	if strings.HasPrefix(spec, "udp:") {
+		isUDP = true
+		spec = strings.TrimPrefix(spec, "udp:")
+	}
+
+	parts := strings.Split(spec, ":")
+	switch len(parts) {
+	case 2:
+		// host_port:guest_port
+		local = "0.0.0.0:" + parts[0]
+		remote = guestIP + ":" + parts[1]
+	case 3:
+		// host_addr:host_port:guest_port
+		local = parts[0] + ":" + parts[1]
+		remote = guestIP + ":" + parts[2]
+	default:
+		return "", "", fmt.Errorf("invalid publish spec %q: expected [udp:][host_addr:]host_port:guest_port", spec)
+	}
+
+	// Validate ports
+	if _, _, err := net.SplitHostPort(local); err != nil {
+		return "", "", fmt.Errorf("invalid publish spec %q: %w", spec, err)
+	}
+	if _, _, err := net.SplitHostPort(remote); err != nil {
+		return "", "", fmt.Errorf("invalid publish spec %q: %w", spec, err)
+	}
+
+	if isUDP {
+		local = "udp:" + local
+	}
+
+	return local, remote, nil
 }
 
 func fileConn(fd int, name string) (net.Conn, error) {

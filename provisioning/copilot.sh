@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install Earendil's Pi.
+# Install Github Copilot.
 set -euxo pipefail
 
 retry_error=
@@ -20,4 +20,6 @@ exec_retry() {
   while retryable "$?"; do "${@}"; done
 }
 
-exec_retry mise use -g "npm:@earendil-works/pi-coding-agent@latest";
+while retryable "$?"; do
+curl -fsSL https://gh.io/copilot-install | bash
+done

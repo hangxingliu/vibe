@@ -53,6 +53,8 @@ func run() error {
 	guestMAC := flag.String("mac", "", "guest MAC address")
 	var publish stringSlice
 	flag.Var(&publish, "p", "publish port: [udp:][host_addr:]host_port:guest_port")
+	proxy := flag.String("proxy", "", "Proxy URL (e.g., http://127.0.0.1:1080 or socks5://127.0.0.1:1080)")
+	proxyUDP := flag.Bool("proxy-udp", false, "Proxy UDP requests (only supported for socks5://)")
 	flag.Parse()
 
 	if flag.NArg() != 0 {
@@ -60,6 +62,14 @@ func run() error {
 	}
 	if _, err := net.ParseMAC(*guestMAC); err != nil {
 		return fmt.Errorf("invalid --mac: %w", err)
+	}
+	if *proxyUDP && *proxy == "" {
+		return fmt.Errorf("--proxy-udp requires --proxy to be set")
+	}
+	if *proxyUDP && *proxy != "" {
+		if !strings.HasPrefix(strings.ToLower(*proxy), "socks5://") {
+			return fmt.Errorf("--proxy-udp is only supported with socks5:// proxies; got %q", *proxy)
+		}
 	}
 
 	forwards := make(map[string]string)
@@ -104,6 +114,8 @@ func run() error {
 		DNSSearchDomains:  searchDomains(),
 		NAT:               map[string]string{gatewayIP: "127.0.0.1"},
 		GatewayVirtualIPs: []string{gatewayIP},
+		Proxy:             *proxy,
+		ProxyUDP:          *proxyUDP,
 	})
 	if err != nil {
 		return err

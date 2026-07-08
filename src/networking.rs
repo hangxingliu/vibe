@@ -53,6 +53,8 @@ impl NetworkMode {
         usernet_helper_path: &Path,
         log_path: Option<&Path>,
         publish: &[String],
+        proxy: Option<&str>,
+        proxy_udp: bool,
     ) -> Result<PreparedNetworkBackend, Box<dyn std::error::Error>> {
         match self {
             NetworkMode::VzNat => Ok(PreparedNetworkBackend::VzNat),
@@ -70,6 +72,13 @@ impl NetworkMode {
 
                 for spec in publish {
                     command.arg("-p").arg(spec);
+                }
+
+                if let Some(proxy_url) = proxy {
+                    command.arg("--proxy").arg(proxy_url);
+                }
+                if proxy_udp {
+                    command.arg("--proxy-udp");
                 }
 
                 command

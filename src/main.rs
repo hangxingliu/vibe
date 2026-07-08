@@ -222,6 +222,10 @@ Options:
   -p, --publish [udp:][HOST_ADDR:]HOST_PORT:GUEST_PORT      Forward a guest port to the host (repeatable).
                                                             Example: -p 127.0.0.1:8022:22 -p udp:8080:80
   --proxy <URL>                                             Set proxy. Configures apt during provisioning and exports proxy environment variables at login.
+                                                            When using the `nat` network mode, all outbound TCP connections from the VM are also
+                                                            routed through this proxy (HTTP CONNECT or SOCKS5).
+  --proxy-udp                                               Also route outbound UDP through the SOCKS5 proxy set via --proxy.
+                                                            Requires --proxy to be a socks5:// URL. Has no effect with http:// proxies.
   
   --git <rw | ro | no>                                      How the .git directory is treated (default `ro`).
                                                             rw: share host .git as read-write.
@@ -242,6 +246,11 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
   --base NAME_OR_PATH                                       Use this existing image or path/to/image.raw as base for new image (default Debian Stable).
   --image NAME                                              Name for new image (default `default`).
   --replace                                                 Replace existing image with NAME, if one exists.
+  --repl                                                    After provisioning (or when image already exists), drop into an interactive shell.
+                                                            If the image does not exist or --replace is given: runs all scripts, then leaves
+                                                            the shell open so you can customise further before the image is saved.
+                                                            If the image already exists (and --replace is not given): boots the existing image
+                                                            directly for interactive use without re-running any scripts.
   --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
   --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 2048).
 
@@ -276,9 +285,20 @@ Cache directory:
 
     let usernet_helper_path = cache_dir.join("vibe-usernet");
     let publish = args.publish.clone();
+    let proxy = args.proxy.clone();
+    let proxy_udp = args.proxy_udp;
+
+    // Do not inject proxy settings into the VM guest if we are using Nat mode,
+    // because the usernet helper handles proxying transparently for the VM.
+    let guest_proxy = if args.network_mode == NetworkMode::Nat {
+        None
+    } else {
+        args.proxy.clone()
+    };
+
     let prepare_network_backend = |log_dir: Option<&Path>| {
         args.network_mode
-            .prepare(&usernet_helper_path, log_dir)
+            .prepare(&usernet_helper_path, log_dir, &publish, proxy.as_deref(), proxy_udp)
             .unwrap()
     };
 
@@ -290,10 +310,31 @@ Cache directory:
             base,
             image,
             replace,
+            repl,
             scripts,
             cpu_count,
             ram_bytes,
         } => {
+            let target_image_raw = image_path(&cache_dir, &image);
+
+            // --repl with an existing image and no --replace: boot the image interactively
+            // without re-running any provisioning scripts.
+            if repl && target_image_raw.exists() && !replace {
+                println!(
+                    "Image '{}' already exists; booting it for interactive use (--repl).",
+                    image
+                );
+                return run_vm(
+                    &target_image_raw,
+                    &[],
+                    &default_shares,
+                    prepare_network_backend,
+                    cpu_count,
+                    ram_bytes,
+                )
+                .map(|_| ());
+            }
+
             let base_raw = match base {
                 Some(base) if base.contains('/') => PathBuf::from(base),
                 Some(base) => image_path(&cache_dir, &base),
@@ -307,12 +348,13 @@ Cache directory:
             }
             provision_image(
                 &base_raw,
-                &image_path(&cache_dir, &image),
+                &target_image_raw,
                 replace,
+                repl,
                 &scripts,
                 &default_shares,
                 prepare_network_backend,
-                &args.proxy,
+                &guest_proxy,
                 cpu_count,
                 ram_bytes,
             )
@@ -347,7 +389,7 @@ Cache directory:
                         &template_raw,
                         &default_shares,
                         prepare_network_backend,
-                        &args.proxy,
+                        &guest_proxy,
                     )?;
                 } else if !template_raw.exists() {
                     return Err(format!(
@@ -490,7 +532,7 @@ Cache directory:
             }
 
             // Set proxy environment variables for interactive use
-            if let Some(url) = &args.proxy {
+            if let Some(url) = &guest_proxy {
                 login_actions.push(Send(format!(
                     " {}",
                     generate_http_proxy_env_export_cmds(url)
@@ -539,6 +581,7 @@ struct CliArgs {
     cpu_count: usize,
     ram_bytes: u64,
     proxy: Option<String>,
+    proxy_udp: bool,
     ssh_key: Option<PathBuf>,
     publish: Vec<String>,
     git_mode: GitMode,
@@ -553,6 +596,7 @@ enum CliCommand {
         base: Option<String>,
         image: String,
         replace: bool,
+        repl: bool,
         scripts: Vec<ProvisionScript>,
         cpu_count: usize,
         ram_bytes: u64,
@@ -593,6 +637,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         let mut image = DEFAULT_IMAGE_NAME.to_string();
         let mut image_seen = false;
         let mut replace = false;
+        let mut repl = false;
         let mut scripts = Vec::new();
         let mut cpu_count = DEFAULT_CPU_COUNT;
         let mut ram_bytes = DEFAULT_PROVISION_RAM_BYTES;
@@ -614,6 +659,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                     assert_valid_image_name(&image);
                 }
                 Long("replace") => replace = true,
+                Long("repl") => repl = true,
                 Long("cpus") => cpu_count = parse_cpu_count(parser)?,
                 Long("ram") => ram_bytes = parse_ram_size(parser)?,
                 Value(value) => {
@@ -649,6 +695,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             base,
             image,
             replace,
+            repl,
             scripts,
             cpu_count,
             ram_bytes,
@@ -670,6 +717,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut cpu_count = DEFAULT_CPU_COUNT;
     let mut ram_bytes = DEFAULT_RAM_BYTES;
     let mut proxy = None;
+    let mut proxy_udp = false;
     let mut ssh_key = None;
     let mut publish = Vec::new();
     let mut git_mode = GitMode::Ro;
@@ -706,6 +754,9 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             Long("ram") => ram_bytes = parse_ram_size(&mut parser)?,
             Long("proxy") => {
                 proxy = Some(os_to_string(parser.value()?, "--proxy")?);
+            }
+            Long("proxy-udp") => {
+                proxy_udp = true;
             }
             Long("ssh-key") => {
                 ssh_key = Some(PathBuf::from(parser.value()?));
@@ -764,6 +815,20 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         }
     }
 
+    // Validate proxy_udp requires a socks5 proxy
+    if proxy_udp {
+        match &proxy {
+            None => return Err("--proxy-udp requires --proxy to be set".into()),
+            Some(url) if !url.to_lowercase().starts_with("socks5://") => {
+                return Err(format!(
+                    "--proxy-udp is only supported with socks5:// proxies; got {url:?}"
+                )
+                .into());
+            }
+            _ => {}
+        }
+    }
+
     Ok(CliArgs {
         command: match command {
             Some(command) => command,
@@ -779,6 +844,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         cpu_count,
         ram_bytes,
         proxy,
+        proxy_udp,
         ssh_key,
         publish,
         git_mode,
@@ -795,7 +861,6 @@ fn env_login_actions(env: &HashMap<String, String>) -> Vec<LoginAction> {
 fn shell_single_quote(value: &str) -> String {
     value.replace('\'', r"'\''")
 }
-
 
 fn create_cache_share(
     cache_dir: &Path,
@@ -1112,6 +1177,7 @@ fn ensure_default_image(
         base_raw,
         default_raw,
         false,
+        false,
         &default_provisioning_scripts[..],
         directory_shares,
         prepare_network_backend,
@@ -1160,6 +1226,7 @@ fn provision_image(
     base_raw: &Path,
     image_raw: &Path,
     replace: bool,
+    repl: bool,
     extra_scripts: &[ProvisionScript],
     directory_shares: &[DirectoryShare],
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
@@ -1241,7 +1308,15 @@ export VIBE_PROVISION_SCRIPTS='{}'",
             text: PROVISION_SUCCESS_MARKER.to_string(),
             timeout: DEFAULT_EXPECT_TIMEOUT,
         });
-        login_actions.push(Send(" systemctl poweroff; sleep 100".to_string()));
+
+        if repl {
+            // Leave the shell open for interactive customisation.
+            // The VM will shut down when the user types `exit` or runs a shutdown command.
+            println!("Provisioning complete. Dropping into interactive shell (--repl).");
+            println!("Type `exit` or run `systemctl poweroff` when you are done.");
+        } else {
+            login_actions.push(Send(" systemctl poweroff; sleep 100".to_string()));
+        }
 
         run_vm(
             &tmp_raw,
@@ -1856,9 +1931,6 @@ fn run_vm(
             "/root/.bash_logout",
             BASH_LOGOUT_SCRIPT,
         )?),
-        //
-        Send(" [ -x \"$HOME/.local/bin/mise\" ] && eval \"$(\"${HOME}/.local/bin/mise\" activate bash)\"".to_string()),
-        Send(" eval \"$(fzf --bash)\"".to_string()),
     ];
 
     if !directory_shares.is_empty() {
@@ -1888,6 +1960,10 @@ fn run_vm(
     for a in login_actions {
         all_login_actions.push(a.clone());
     }
+    all_login_actions.push(
+        Send(" [ -x \"${HOME}/.local/bin/mise\" ] && eval \"$(\"${HOME}/.local/bin/mise\" activate bash)\"".to_string()),
+    );
+    all_login_actions.push(Send(" command -v fzf >/dev/null && eval \"$(fzf --bash)\"".to_string()));
 
     let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
     let login_actions_thread = spawn_login_actions_thread(

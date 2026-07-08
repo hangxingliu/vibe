@@ -1,0 +1,4 @@
+[submodule "helpers/gvisor-tap-vsock"]
+	path = helpers/gvisor-tap-vsock
+	url = https://github.com/hangxingliu/gvisor-tap-vsock.git
+	branch = main

@@ -157,8 +157,22 @@ Options:
   --network <nat|vznat>                                     Guest networking mode (default `nat`).
                                                             `nat` uses Vibe's bundled user-mode network stack.
                                                             `vznat` uses Apple's VZNATNetworkDeviceAttachment.
-  --cpus COUNT                                              Number of virtual CPUs (default 2).
-  --ram MEGABYTES                                           RAM size in megabytes (default 2048).
+  -p, --publish [udp:][HOST_ADDR:]HOST_PORT:GUEST_PORT      Forward a guest port to the host (repeatable).
+                                                            Example: -p 127.0.0.1:8022:22 -p udp:8080:80
+  --proxy <URL>                                             Set proxy. Configures apt during provisioning and exports proxy environment variables at login.
+                                                            When using the `nat` network mode, all outbound TCP connections from the VM are also
+                                                            routed through this proxy (HTTP CONNECT or SOCKS5).
+  --proxy-udp                                               Also route outbound UDP through the SOCKS5 proxy set via --proxy.
+                                                            Requires --proxy to be a socks5:// URL. Has no effect with http:// proxies.
+  --dns <ADDR>                                              Custom upstream DNS server for the VM (repeatable; e.g. --dns 8.8.8.8 --dns 1.1.1.1).
+                                                            Overrides the system resolver. When --proxy is a socks5:// URL, DNS queries are
+                                                            tunnelled through the proxy as well.
+  
+  --git <rw | ro | no>                                      How the .git directory is treated (default `ro`).
+                                                            rw: share host .git as read-write.
+                                                            ro: share host .git as read-only.
+                                                            no: mask .git with tmpfs.
+							    
 
 Login actions (executed in order after root login, repeatable):
 

@@ -226,6 +226,9 @@ Options:
                                                             routed through this proxy (HTTP CONNECT or SOCKS5).
   --proxy-udp                                               Also route outbound UDP through the SOCKS5 proxy set via --proxy.
                                                             Requires --proxy to be a socks5:// URL. Has no effect with http:// proxies.
+  --dns <ADDR>                                              Custom upstream DNS server for the VM (repeatable; e.g. --dns 8.8.8.8 --dns 1.1.1.1).
+                                                            Overrides the system resolver. When --proxy is a socks5:// URL, DNS queries are
+                                                            tunnelled through the proxy as well.
   
   --git <rw | ro | no>                                      How the .git directory is treated (default `ro`).
                                                             rw: share host .git as read-write.
@@ -298,7 +301,13 @@ Cache directory:
 
     let prepare_network_backend = |log_dir: Option<&Path>| {
         args.network_mode
-            .prepare(&usernet_helper_path, log_dir, &publish, proxy.as_deref(), proxy_udp)
+            .prepare(
+                &usernet_helper_path,
+                log_dir,
+                &publish,
+                proxy.as_deref(),
+                proxy_udp,
+            )
             .unwrap()
     };
 
@@ -582,6 +591,7 @@ struct CliArgs {
     ram_bytes: u64,
     proxy: Option<String>,
     proxy_udp: bool,
+    dns: Vec<String>,
     ssh_key: Option<PathBuf>,
     publish: Vec<String>,
     git_mode: GitMode,
@@ -718,6 +728,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut ram_bytes = DEFAULT_RAM_BYTES;
     let mut proxy = None;
     let mut proxy_udp = false;
+    let mut dns: Vec<String> = Vec::new();
     let mut ssh_key = None;
     let mut publish = Vec::new();
     let mut git_mode = GitMode::Ro;
@@ -757,6 +768,9 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             }
             Long("proxy-udp") => {
                 proxy_udp = true;
+            }
+            Long("dns") => {
+                dns.push(os_to_string(parser.value()?, "--dns")?);
             }
             Long("ssh-key") => {
                 ssh_key = Some(PathBuf::from(parser.value()?));
@@ -845,6 +859,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         ram_bytes,
         proxy,
         proxy_udp,
+        dns,
         ssh_key,
         publish,
         git_mode,
@@ -1963,7 +1978,9 @@ fn run_vm(
     all_login_actions.push(
         Send(" [ -x \"${HOME}/.local/bin/mise\" ] && eval \"$(\"${HOME}/.local/bin/mise\" activate bash)\"".to_string()),
     );
-    all_login_actions.push(Send(" command -v fzf >/dev/null && eval \"$(fzf --bash)\"".to_string()));
+    all_login_actions.push(Send(
+        " command -v fzf >/dev/null && eval \"$(fzf --bash)\"".to_string(),
+    ));
 
     let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
     let login_actions_thread = spawn_login_actions_thread(

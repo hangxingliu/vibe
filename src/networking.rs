@@ -55,6 +55,7 @@ impl NetworkMode {
         publish: &[String],
         proxy: Option<&str>,
         proxy_udp: bool,
+        dns: &[String],
     ) -> Result<PreparedNetworkBackend, Box<dyn std::error::Error>> {
         match self {
             NetworkMode::VzNat => Ok(PreparedNetworkBackend::VzNat),
@@ -79,6 +80,9 @@ impl NetworkMode {
                 }
                 if proxy_udp {
                     command.arg("--proxy-udp");
+                }
+                for addr in dns {
+                    command.arg("--dns").arg(addr);
                 }
 
                 command

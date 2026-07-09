@@ -70,7 +70,6 @@ const DEFAULT_CACHE_SHARES: &[&str] = &[
     "yarn:/root/.yarn",
     "m2:/root/.m2",
     "go:/root/go",
-    "guest_node_modules:/var/cache/guest_node_modules",
 ];
 
 /// Project subfolders masked with tmpfs to prevent host data leaking into the VM.
@@ -435,7 +434,7 @@ Cache directory:
             }
 
             if !args.no_default_mounts {
-                let mut extra_git_shares = Vec::new();
+                let mut extra_shares = Vec::new();
 
                 // Collect project dirs to mask. We use a separate vector to avoid borrow checker issues
                 // and because we want to add .git shares at the end of the list to ensure they are
@@ -457,6 +456,18 @@ Cache directory:
                         }
                     }
 
+                    if share.host.join("node_modules").is_dir() {
+                        let share_tag = share.tag();
+                        let node_modules_share = DirectoryShare::new(
+                            cache_dir.join(format!("guest_node_modules/{share_tag}")),
+                            share.guest.join("node_modules"),
+                            false,
+                            true,
+                            false,
+                        );
+                        extra_shares.push(node_modules_share?);
+                    }
+
                     // Handle .git directory masking or read-only sharing
                     let git_path = share.host.join(".git");
                     if git_path.exists() {
@@ -471,7 +482,7 @@ Cache directory:
                                 // VirtioFS can only share directories; skip if .git is a file
                                 // (e.g. git submodules store a gitdir pointer file, not a directory).
                                 if git_path.is_dir() {
-                                    extra_git_shares.push(DirectoryShare::new(
+                                    extra_shares.push(DirectoryShare::new(
                                         git_path,
                                         share.guest.join(".git"),
                                         true,
@@ -495,7 +506,7 @@ Cache directory:
                         }
                     }
                 }
-                directory_shares.extend(extra_git_shares);
+                directory_shares.extend(extra_shares);
 
                 directory_shares.extend(default_shares);
 
@@ -506,6 +517,8 @@ Cache directory:
                     create_cache_share(&cache_dir, "claude:/root/.claude"),
                     create_cache_share(&cache_dir, "gemini:/root/.gemini"),
                     create_cache_share(&cache_dir, "pi:/root/.pi"),
+                    create_cache_share(&cache_dir, "grok:/root/.grok"),
+                    create_cache_share(&cache_dir, "opencode:/root/.config/opencode"),
                     //
                     DirectoryShare::new(
                         home.join(".tmux"),
@@ -1959,16 +1972,6 @@ fn run_vm(
             let guest = share.guest.to_string_lossy();
             all_login_actions.push(Send(format!(" mkdir -p {guest}")));
             all_login_actions.push(Send(format!(" mount --bind {staging} {guest}")));
-
-            if share.is_project_dir && share.host.join("node_modules").is_dir() {
-                let tag = share.tag();
-                all_login_actions.push(Send(format!(
-                    " mkdir -p \"/var/cache/guest_node_modules/{tag}\""
-                )));
-                all_login_actions.push(Send(format!(
-                    " mount --bind \"/var/cache/guest_node_modules/{tag}\" \"{guest}/node_modules\""
-                )));
-            }
         }
     }
 

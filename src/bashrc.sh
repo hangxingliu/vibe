@@ -15,6 +15,8 @@ export GEMINI_SANDBOX=false
 
 export COPILOT_ALLOW_ALL=true
 
+export FIREBASE_CLI_TELEMETRY=0
+
 # Enable true color support in the terminal
 export COLORTERM=truecolor
 

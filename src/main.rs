@@ -306,12 +306,10 @@ Cache directory:
                 &publish,
                 proxy.as_deref(),
                 proxy_udp,
+                &args.dns,
             )
             .unwrap()
     };
-
-    let mise_directory_share =
-        DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
 
     match args.command {
         CliCommand::Provision {
@@ -334,6 +332,7 @@ Cache directory:
                 );
                 return run_vm(
                     &target_image_raw,
+                    None,
                     &[],
                     &default_shares,
                     prepare_network_backend,

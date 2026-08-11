@@ -53,7 +53,7 @@ func run() error {
 	guestMAC := flag.String("mac", "", "guest MAC address")
 	var publish stringSlice
 	flag.Var(&publish, "p", "publish port: [udp:][host_addr:]host_port:guest_port")
-	proxy := flag.String("proxy", "", "Proxy URL (e.g., http://127.0.0.1:1080 or socks5://127.0.0.1:1080)")
+	proxy := flag.String("proxy", "", "Proxy URL (e.g., http://127.0.0.1:1080 or socks5://127.0.0.1:1080). Loopback and private (RFC1918) destinations always bypass the proxy.")
 	proxyUDP := flag.Bool("proxy-udp", false, "Proxy UDP requests (only supported for socks5://)")
 	var dnsUpstreams stringSlice
 	flag.Var(&dnsUpstreams, "dns", "Upstream DNS server address (e.g. 8.8.8.8 or 1.1.1.1:53); repeatable. Overrides system resolver. DNS queries are routed through --proxy when set.")

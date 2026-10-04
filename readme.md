@@ -10,7 +10,7 @@ This forked version introduces several core improvements, focusing on custom env
 2. **Native Proxy Configuration**:
     - Added the `--proxy` option to ensure network connections within the VM are routed through the specified SOCKS5/HTTP proxy.
     - Added the `--proxy-udp` option (used in conjunction with `--proxy`) to ensure that outgoing UDP connections from within the VM are also routed through the specified SOCKS5 proxy.
-    - For `--network nat` (default network type), these proxies are implemented via code in helpers/vibe-usernet and are transparent to the VM.
+    - For `--network nat` (default network type), these proxies are implemented via code in helpers/vibe-usernet and are transparent to the VM. Loopback, link-local, and private destinations are dialed directly.
     - For other `--network` types, the proxy is implemented via environment variables and `apt` configuration files within the VM.
     - Example usage: `--proxy "socks5://127.0.0.1:1080" --proxy-udp`
 3. **SSH Access Support**:
@@ -141,6 +141,8 @@ If you don't want this, you can make your own `.raw` disk images and copy them i
 
 
 ```
+Vibe is a quick way to spin up a Linux virtual machine on Mac to sandbox LLM agents.
+
 vibe [OPTIONS] [LOGIN-ACTIONS ...] [path/to/disk.raw]
 vibe provision [PROVISIONING_OPTIONS] [@built-in | path/to/script.sh ...]
 
@@ -162,11 +164,13 @@ Options:
   --proxy <URL>                                             Set proxy. Configures apt during provisioning and exports proxy environment variables at login.
                                                             When using the `nat` network mode, all outbound TCP connections from the VM are also
                                                             routed through this proxy (HTTP CONNECT or SOCKS5).
+                                                            Loopback, link-local, and private destinations are dialed directly.
   --proxy-udp                                               Also route outbound UDP through the SOCKS5 proxy set via --proxy.
                                                             Requires --proxy to be a socks5:// URL. Has no effect with http:// proxies.
   --dns <ADDR>                                              Custom upstream DNS server for the VM (repeatable; e.g. --dns 8.8.8.8 --dns 1.1.1.1).
-                                                            Overrides the system resolver. When --proxy is a socks5:// URL, DNS queries are
-                                                            tunnelled through the proxy as well.
+                                                            Overrides the system resolver. When --proxy is a socks5:// URL, DNS queries
+                                                            to non-local upstreams are tunnelled through the proxy. Local upstreams are
+                                                            queried directly. http:// proxies do not carry DNS.
   
   --git <rw | ro | no>                                      How the .git directory is treated (default `ro`).
                                                             rw: share host .git as read-write.
@@ -180,14 +184,32 @@ Login actions (executed in order after root login, repeatable):
   --send SOME_COMMAND                                       Type SOME_COMMAND followed by newline into the VM.
   --expect STRING [timeout-seconds]                         Wait for STRING to appear in console output before executing next login action.
                                                             If STRING does not appear within timeout (default 30 seconds), shutdown VM with error.
+  --ssh-key <PUBLIC_KEY_FILE>                               Install SSH public key into VM and start SSH server.
 
 Provisioning creates a new named image by running (built-in) scripts. Options:
 
   --base NAME_OR_PATH                                       Use this existing image or path/to/image.raw as base for new image (default Debian Stable).
   --image NAME                                              Name for new image (default `default`).
   --replace                                                 Replace existing image with NAME, if one exists.
+  --repl                                                    After provisioning (or when image already exists), drop into an interactive shell.
+                                                            If the image does not exist or --replace is given: runs all scripts, then leaves
+                                                            the shell open so you can customise further before the image is saved.
+                                                            If the image already exists (and --replace is not given): boots the existing image
+                                                            directly for interactive use without re-running any scripts.
   --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
   --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 2048).
+
+Built-in provisioning scripts:
+
+  @claude     Install Anthropic's Claude.
+  @codex      Install OpenAI's Codex.
+  @copilot    Install Github Copilot.
+  @gemini     Install Google's Gemini (antigravity).
+  @golang     Install Go language.
+  @grok       Install Grok Build
+  @pi         Install Earendil's Pi.
+  @rust       Install Rust with sccache.
+  
 ```
 
 ## Other notes

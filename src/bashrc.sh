@@ -15,6 +15,13 @@ export GEMINI_SANDBOX=false
 
 export COPILOT_ALLOW_ALL=true
 
+export FIREBASE_CLI_TELEMETRY=0
+
+# https://docs.x.ai/build/settings/reference#toml-values
+export GROK_TELEMETRY_ENABLED=0
+export GROK_WEB_FETCH=1
+export GROK_SUBAGENTS=1
+
 # Enable true color support in the terminal
 export COLORTERM=truecolor
 
@@ -52,12 +59,15 @@ function http-proxy-export() {
     fi
 }
 
-function copilot-yolo() { copilot --yolo "$@"; }
+function copilot-yolo() { copilot --yolo "$@" --disable-builtin-mcps --autopilot; }
+function copilot-yolo-github-mcp() { copilot --yolo "$@"; }
 function agy-yolo() { agy --dangerously-skip-permissions "$@"; }
+function grok-yolo() { grok --always-approve "$@"; }
 
 function update-all-ai-tools() {
   command -v copilot && printf "$ %s\n" "copilot update" && copilot update;
   command -v agy && printf "$ %s\n" "agy update" && agy update;
+  command -v grok && printf "$ %s\n" "grok update" && grok update;
   command -v mise && printf "$ %s\n" "mise install node bun" && mise install node bun;
   # mise install "npm:@google/gemini-cli"  "npm:@github/copilot"
 }

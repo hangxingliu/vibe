@@ -223,11 +223,13 @@ Options:
   --proxy <URL>                                             Set proxy. Configures apt during provisioning and exports proxy environment variables at login.
                                                             When using the `nat` network mode, all outbound TCP connections from the VM are also
                                                             routed through this proxy (HTTP CONNECT or SOCKS5).
+                                                            Loopback, link-local, and private destinations are dialed directly.
   --proxy-udp                                               Also route outbound UDP through the SOCKS5 proxy set via --proxy.
                                                             Requires --proxy to be a socks5:// URL. Has no effect with http:// proxies.
   --dns <ADDR>                                              Custom upstream DNS server for the VM (repeatable; e.g. --dns 8.8.8.8 --dns 1.1.1.1).
-                                                            Overrides the system resolver. When --proxy is a socks5:// URL, DNS queries are
-                                                            tunnelled through the proxy as well.
+                                                            Overrides the system resolver. When --proxy is a socks5:// URL, DNS queries
+                                                            to non-local upstreams are tunnelled through the proxy. Local upstreams are
+                                                            queried directly. http:// proxies do not carry DNS.
   
   --git <rw | ro | no>                                      How the .git directory is treated (default `ro`).
                                                             rw: share host .git as read-write.
@@ -306,6 +308,7 @@ Cache directory:
                 &publish,
                 proxy.as_deref(),
                 proxy_udp,
+                &args.dns,
             )
             .unwrap()
     };

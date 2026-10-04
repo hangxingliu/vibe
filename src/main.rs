@@ -1939,7 +1939,7 @@ fn run_vm(
         },
         Send("root".to_string()),
         Expect {
-            text: "~#".to_string(),
+            text: "Debian GNU/Linux".to_string(),
             timeout: LOGIN_EXPECT_TIMEOUT,
         },
         // Temporarily disable bash history and set commands starting with space to be ignored

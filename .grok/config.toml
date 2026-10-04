@@ -1,0 +1,22 @@
+# https://docs.x.ai/build/settings/reference#toml-values
+
+[features]
+telemetry = false
+web_fetch = true
+
+[subagents]
+enabled	= true
+
+[compat.cursor]
+skills = false
+rules = false
+agents = false
+mcps = false
+hooks = false
+
+[compat.claude]
+skills = false
+rules = false
+agents = false
+mcps = false
+hooks = false

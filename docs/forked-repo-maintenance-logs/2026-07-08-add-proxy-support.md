@@ -1,5 +1,7 @@
 # Development Plan for Adding Proxy Support (Socks5/HTTP)
 
+The implementation now lives in the `helpers/gvisor-tap-vsock` submodule, on top of current upstream `main`. For the next upstream update, follow [docs/how-to-rebase-onto-gvisor-tap-vsock-latest-code.md](../docs/how-to-rebase-onto-gvisor-tap-vsock-latest-code.md). This note is the original plan and is not a patch that still applies.
+
 This document outlines how to add proxy support to `virtualnetwork` (provided by `gvisor-tap-vsock`) in `helpers/vibe-usernet`, allowing all TCP/UDP requests from the virtual machine (VM) to be forwarded through a specified HTTP or Socks5 proxy server.
 
 ## 1. Introduce `gvisor-tap-vsock` via Git Submodule

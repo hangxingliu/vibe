@@ -3,6 +3,9 @@
 /target
 /helpers/vibe-usernet/vibe-usernet
 
+/docs/ai-chats
+/docs/ai-plans-local
+
 /.cache
 /*-agent.yml
 

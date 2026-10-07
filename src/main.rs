@@ -33,9 +33,11 @@ use objc2_virtualization::*;
 
 mod networking;
 use networking::*;
-const DEBIAN_COMPRESSED_DISK_URL: &str = "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
-const DEBIAN_COMPRESSED_SHA: &str = "6ab9be9e6834adc975268367f2f0235251671184345c34ee13031749fdfbf66fe4c3aafd949a2d98550426090e9ac645e79009c51eb0eefc984c15786570bb38";
-const DEBIAN_COMPRESSED_SIZE_BYTES: u64 = 280901576;
+
+const DEBIAN_COMPRESSED_DISK_URL: &str = "https://cdimage.debian.org/cdimage/cloud/trixie/20261001-2618/debian-13-nocloud-arm64-20261001-2618.tar.xz";
+const DEBIAN_COMPRESSED_SHA: &str = "c049582fe2d13d9e0c1a4767ade3a32bed217774bd6e39ac8fc60ca78534bfc258a8c52363ddfad639d5db7eacc2550688d5393f16aaf62bc5d19ecd4a7e6170";
+const DEBIAN_COMPRESSED_FILE_NAME: &str = "disk.raw";
+const DEBIAN_COMPRESSED_SIZE_BYTES: u64 = 280000000; // 280901576, 284558188
 const SHARED_DIRECTORIES_TAG: &str = "shared";
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
@@ -46,6 +48,7 @@ const DEFAULT_DISK_GB: u64 = 12;
 const DEFAULT_PROVISION_RAM_BYTES: u64 = 4096 * BYTES_PER_MB;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
+const PASSWORD_EXPECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 const SCRIPT_ACTION_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const LOGIN_ACTION_INPUT_CHUNK_BYTES: usize = 256;
@@ -1160,7 +1163,11 @@ fn ensure_base_image(
 
     println!("Decompressing base image...");
     let status = Command::new("tar")
-        .args(["-xOf", &base_compressed.to_string_lossy(), "disk.raw"])
+        .args([
+            "-xOf",
+            &base_compressed.to_string_lossy(),
+            DEBIAN_COMPRESSED_FILE_NAME,
+        ])
         .stdout(std::fs::File::create(base_raw)?)
         .status()?;
 
@@ -1177,7 +1184,7 @@ fn ensure_default_image(
     default_raw: &Path,
     directory_shares: &[DirectoryShare],
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
-    proxy: &Option<String>,
+    guest_proxy: &Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if default_raw.exists() {
         println!(
@@ -1210,16 +1217,16 @@ fn ensure_default_image(
         &default_provisioning_scripts[..],
         directory_shares,
         prepare_network_backend,
-        proxy,
+        guest_proxy,
         DEFAULT_CPU_COUNT,
         DEFAULT_PROVISION_RAM_BYTES,
     )
 }
 
-fn build_provision_script(script: &ProvisionScript, proxy: &Option<String>) -> LoginAction {
+fn build_provision_script(script: &ProvisionScript, guest_proxy: &Option<String>) -> LoginAction {
     let mut content = script.content.to_string();
     if script.name == "base" {
-        if let Some(proxy_url) = proxy {
+        if let Some(proxy_url) = guest_proxy {
             let proxy_code = format!(
                 "echo 'Acquire::http::Proxy \"{proxy_url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n\
                  echo 'Acquire::https::Proxy \"{proxy_url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n\
@@ -1259,7 +1266,7 @@ fn provision_image(
     extra_scripts: &[ProvisionScript],
     directory_shares: &[DirectoryShare],
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
-    proxy: &Option<String>,
+    guest_proxy: &Option<String>,
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1329,7 +1336,7 @@ export VIBE_PROVISION_SCRIPTS='{}'",
         )));
 
         for script in scripts {
-            login_actions.push(build_provision_script(script, proxy));
+            login_actions.push(build_provision_script(script, guest_proxy));
         }
 
         login_actions.push(Send(format!(" echo {PROVISION_SUCCESS_MARKER}")));

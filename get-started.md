@@ -15,6 +15,10 @@ cargo build --release;
 ./target/release/vibe # --proxy http://192.168.105.1:1080
 ```
 
+## How to Update OS Image
+
+<https://cdimage.debian.org/cdimage/>
+
 ## Init Guest VM
 
 ``` bash

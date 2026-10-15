@@ -24,7 +24,13 @@ Vibe is a lightweight, zero-configuration tool designed to spin up Linux virtual
 - `src/session.rs`: `LoginAction`, the login actions thread, `legacy_login_prefix()` (root login, `Password:` detection, readiness probe, internal setup), `LoginFailure` diagnostics, `DiskSource` and `needs_provision_hint()`, and helpers that build guest shell commands.
 - `src/images.rs`: Base image download and verification, image names/paths, and instance disks.
 - `src/provision.rs`: Provisioning flow (`ensure_default_image`, `provision_image`).
+- `src/gpt.rs`: Read-only GPT parser (`read_gpt`, `select_layout`, `scan_labels`) and filesystem label probes for ext4, FAT, and ISO9660. Not called from the boot path yet (`TODO(T18)`, `TODO(T21)`, `TODO(T28)`).
+- `src/ext4ro.rs`: Bounded read-only ext4 reader (`Ext4Ro::open`, `read_file`) using `pread`. Symlinks are returned and not followed. Not called from the boot path yet (`TODO(T28)`).
+- `src/control.rs`: Maintenance control frames (`PREP-READY`, `PREP-STEP`, `PREP-RESULT`), incremental `FrameReader`, and `new_nonce`. Not called from the boot path yet (`TODO(T21)`).
+- `src/cache.rs`: `FileLock` (`flock`), exclusive temp files, `clonefile` with a copy fallback, same-directory `replace`, and `sweep_stale`. Not called from the boot path yet (`TODO(T18)`, `TODO(T28)`).
+- `src/image_probe.rs`: `probe_disk`, pure `classify`, and `verify_processed`. Shadow plaintext is not stored. Not called from the boot path yet (`TODO(T21)`, `TODO(T28)`).
 - `src/tests.rs`: Unit tests for CLI parsing. Declared from `main.rs` as `#[cfg(test)] mod tests`, so the file is part of the binary crate (and can call private parsers) and is compiled only for `cargo test`.
+- `tests/fixtures/make-ext4.sh`: Rebuilds the small gzip ext4 images used by the `ext4ro` and `image_probe` tests.
 - `src/networking.rs`: Logic for setting up NAT, bridged, and `vmnet-helper` networking backends.
 - `provisioning/base.sh`: Shell script used to initialize the default Debian image with essential tools (gcc, rust, mise, etc.).
 - `src/bashrc.sh`: Guest-side bash configuration.
@@ -42,7 +48,7 @@ Vibe is a lightweight, zero-configuration tool designed to spin up Linux virtual
 ### Commands
 - **Build:** `cargo build --release`
 - **Run:** `cargo run -- [OPTIONS] [disk-image.raw]`
-- **Test:** `cargo test` (CLI parsing is covered by unit tests in `src/tests.rs`; `OutputMonitor` and the login/actions logic have `#[cfg(test)] mod tests` in `src/vm_io.rs` and `src/session.rs`. Booting VMs is integration-heavy and requires a Mac host).
+- **Test:** `cargo test` (CLI parsing is covered by unit tests in `src/tests.rs`; `OutputMonitor` and the login/actions logic have `#[cfg(test)] mod tests` in `src/vm_io.rs` and `src/session.rs`; GPT, ext4, control frames, cache helpers, and image classification have `#[cfg(test)] mod tests` in `src/gpt.rs`, `src/ext4ro.rs`, `src/control.rs`, `src/cache.rs`, and `src/image_probe.rs`. Real disk images are `#[ignore]` and need `VIBE_TEST_DEBIAN_NEW_RAW`, `VIBE_TEST_DEBIAN_OLD_RAW`, and `VIBE_TEST_ALPINE_RAW`. Booting VMs is integration-heavy and requires a Mac host).
 
 ## Development Conventions
 

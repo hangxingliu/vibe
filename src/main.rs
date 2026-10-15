@@ -27,6 +27,11 @@ use vm_io::*;
 mod vm_lifecycle;
 mod vm_run;
 use vm_run::*;
+mod cache;
+mod control;
+mod ext4ro;
+mod gpt;
+mod image_probe;
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
 const DEFAULT_CPU_COUNT: usize = 2;

@@ -15,7 +15,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub enum VmInput {
@@ -23,73 +23,143 @@ pub enum VmInput {
     Shutdown,
 }
 
+/// Result of waiting for console output.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WaitResult<T> {
+    Found(T),
+    Timeout,
+    /// The monitor was closed (the VM stopped) before a match appeared.
+    Closed,
+}
+
+#[derive(Default)]
+struct MonitorState {
+    buffer: String,
+    bytes_received: usize,
+    closed: bool,
+}
+
+/// Buffers VM console output so login actions can wait for text. Matched
+/// output is consumed; anything after the match stays for the next wait.
 #[derive(Default)]
 pub struct OutputMonitor {
-    buffer: Mutex<String>,
+    state: Mutex<MonitorState>,
     condvar: Condvar,
 }
 
 impl OutputMonitor {
-    fn push(&self, bytes: &[u8]) {
-        self.buffer
-            .lock()
-            .unwrap()
-            .push_str(&String::from_utf8_lossy(bytes));
+    pub(crate) fn push(&self, bytes: &[u8]) {
+        let mut state = self.state.lock().unwrap();
+        state.buffer.push_str(&String::from_utf8_lossy(bytes));
+        state.bytes_received += bytes.len();
         self.condvar.notify_all();
     }
 
-    pub(crate) fn wait_for_text(&self, needle: &str, timeout: Duration) -> bool {
-        let mut found = false;
-        let (_unused, _timeout_result) = self
-            .condvar
-            .wait_timeout_while(self.buffer.lock().unwrap(), timeout, |buf| {
-                if let Some((_, remaining)) = buf.split_once(needle) {
-                    *buf = remaining.to_string();
-                    found = true;
-                    false
-                } else {
-                    true
-                }
-            })
-            .unwrap();
-
-        found
+    /// Marks the output as finished and wakes every waiter. Text already in
+    /// the buffer can still be matched; waits that need more output return
+    /// `WaitResult::Closed` immediately.
+    pub(crate) fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.condvar.notify_all();
     }
 
-    pub(crate) fn wait_for_line_after(&self, marker: &str, timeout: Duration) -> Option<String> {
-        let mut line = None;
-        let (_unused, _timeout_result) = self
-            .condvar
-            .wait_timeout_while(self.buffer.lock().unwrap(), timeout, |buf| {
-                let mut line_start = 0;
-                let mut marker_seen = false;
+    /// Total number of bytes received from the VM so far.
+    pub(crate) fn bytes_received(&self) -> usize {
+        self.state.lock().unwrap().bytes_received
+    }
 
-                while let Some(line_end_offset) = buf[line_start..].find('\n') {
-                    let line_end = line_start + line_end_offset;
-                    let current_line = buf[line_start..line_end]
-                        .strip_suffix('\r')
-                        .unwrap_or(&buf[line_start..line_end]);
-
-                    if marker_seen {
-                        line = Some(current_line.to_string());
-                        let remaining = buf[line_end + 1..].to_string();
-                        *buf = remaining;
-                        return false;
+    fn wait_until<T>(
+        &self,
+        timeout: Duration,
+        mut try_match: impl FnMut(&mut String) -> Option<T>,
+    ) -> WaitResult<T> {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(found) = try_match(&mut state.buffer) {
+                return WaitResult::Found(found);
+            }
+            if state.closed {
+                return WaitResult::Closed;
+            }
+            state = match deadline {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return WaitResult::Timeout;
                     }
+                    self.condvar.wait_timeout(state, deadline - now).unwrap().0
+                }
+                None => self.condvar.wait(state).unwrap(),
+            };
+        }
+    }
 
-                    marker_seen = current_line == marker;
-                    line_start = line_end + 1;
+    /// Waits for `needle` and consumes the output up to the end of it.
+    pub(crate) fn wait_for_text(&self, needle: &str, timeout: Duration) -> WaitResult<()> {
+        self.wait_for_any(&[needle], timeout).map(|_| ())
+    }
+
+    /// Waits for whichever needle appears first in the output, consumes the
+    /// output up to the end of that match, and returns the needle's index.
+    /// When several needles start at the same position the earlier one in
+    /// `needles` wins.
+    pub(crate) fn wait_for_any(&self, needles: &[&str], timeout: Duration) -> WaitResult<usize> {
+        self.wait_until(timeout, |buf| {
+            let (index, start) = needles
+                .iter()
+                .enumerate()
+                .filter_map(|(index, needle)| buf.find(needle).map(|start| (index, start)))
+                .min_by_key(|&(index, start)| (start, index))?;
+            buf.drain(..start + needles[index].len());
+            Some(index)
+        })
+    }
+
+    /// Waits for a complete line equal to `marker` (CRLF or LF terminated)
+    /// followed by another complete line, consumes both, and returns the
+    /// second line without its line ending.
+    pub(crate) fn wait_for_line_after(
+        &self,
+        marker: &str,
+        timeout: Duration,
+    ) -> WaitResult<String> {
+        self.wait_until(timeout, |buf| {
+            let mut line_start = 0;
+            let mut marker_seen = false;
+
+            while let Some(line_end_offset) = buf[line_start..].find('\n') {
+                let line_end = line_start + line_end_offset;
+                let current_line = buf[line_start..line_end]
+                    .strip_suffix('\r')
+                    .unwrap_or(&buf[line_start..line_end]);
+
+                if marker_seen {
+                    let line = current_line.to_string();
+                    buf.drain(..=line_end);
+                    return Some(line);
                 }
 
-                true
-            })
-            .unwrap();
+                marker_seen = current_line == marker;
+                line_start = line_end + 1;
+            }
 
-        line
+            None
+        })
     }
 
     pub(crate) fn snapshot(&self) -> String {
-        self.buffer.lock().unwrap().clone()
+        self.state.lock().unwrap().buffer.clone()
+    }
+}
+
+impl<T> WaitResult<T> {
+    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> WaitResult<U> {
+        match self {
+            WaitResult::Found(value) => WaitResult::Found(f(value)),
+            WaitResult::Timeout => WaitResult::Timeout,
+            WaitResult::Closed => WaitResult::Closed,
+        }
     }
 }
 
@@ -340,5 +410,121 @@ impl Drop for RawModeGuard {
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.original);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    const SHORT: Duration = Duration::from_millis(50);
+    const LONG: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn wait_for_text_matches_text_split_across_chunks() {
+        let monitor = Arc::new(OutputMonitor::default());
+        let waiter = thread::spawn({
+            let monitor = monitor.clone();
+            move || monitor.wait_for_text("login: ", LONG)
+        });
+        for chunk in ["debian lo", "gi", "n: rest"] {
+            thread::sleep(Duration::from_millis(10));
+            monitor.push(chunk.as_bytes());
+        }
+        assert_eq!(waiter.join().unwrap(), WaitResult::Found(()));
+        assert_eq!(monitor.snapshot(), "rest");
+        assert_eq!(monitor.bytes_received(), "debian login: rest".len());
+    }
+
+    #[test]
+    fn wait_for_any_picks_the_earliest_match_and_keeps_the_rest() {
+        let monitor = OutputMonitor::default();
+        monitor.push(b"Linux 6.12\r\nDebian GNU/Linux banner\r\nPassword: login: ");
+        let needles = ["Password:", "Debian GNU/Linux", "login: "];
+        assert_eq!(monitor.wait_for_any(&needles, SHORT), WaitResult::Found(1));
+        assert_eq!(monitor.snapshot(), " banner\r\nPassword: login: ");
+        assert_eq!(monitor.wait_for_any(&needles, SHORT), WaitResult::Found(0));
+        assert_eq!(monitor.wait_for_any(&needles, SHORT), WaitResult::Found(2));
+        assert_eq!(monitor.snapshot(), "");
+    }
+
+    #[test]
+    fn wait_for_any_prefers_the_earlier_needle_on_ties() {
+        let monitor = OutputMonitor::default();
+        monitor.push(b"abcd");
+        assert_eq!(
+            monitor.wait_for_any(&["abc", "ab"], SHORT),
+            WaitResult::Found(0)
+        );
+        assert_eq!(monitor.snapshot(), "d");
+    }
+
+    #[test]
+    fn wait_for_line_after_handles_crlf_and_keeps_the_rest() {
+        let monitor = OutputMonitor::default();
+        monitor.push(b"$ printf 'MAR' 'KER'\r\n\r\nMARKER\r\n0\r\nnext prompt");
+        assert_eq!(
+            monitor.wait_for_line_after("MARKER", SHORT),
+            WaitResult::Found("0".to_string())
+        );
+        assert_eq!(monitor.snapshot(), "next prompt");
+    }
+
+    #[test]
+    fn wait_for_line_after_waits_for_a_complete_line() {
+        let monitor = OutputMonitor::default();
+        monitor.push(b"MARKER\n1");
+        assert_eq!(
+            monitor.wait_for_line_after("MARKER", SHORT),
+            WaitResult::Timeout
+        );
+        monitor.push(b"7\nrest");
+        assert_eq!(
+            monitor.wait_for_line_after("MARKER", SHORT),
+            WaitResult::Found("17".to_string())
+        );
+        assert_eq!(monitor.snapshot(), "rest");
+    }
+
+    #[test]
+    fn waits_time_out_without_a_match() {
+        let monitor = OutputMonitor::default();
+        monitor.push(b"something else");
+        let start = Instant::now();
+        assert_eq!(monitor.wait_for_text("login: ", SHORT), WaitResult::Timeout);
+        assert!(start.elapsed() >= SHORT);
+        assert_eq!(monitor.snapshot(), "something else");
+    }
+
+    #[test]
+    fn close_wakes_every_waiter() {
+        let monitor = Arc::new(OutputMonitor::default());
+        let start = Instant::now();
+        let text_waiter = thread::spawn({
+            let monitor = monitor.clone();
+            move || monitor.wait_for_text("login: ", LONG)
+        });
+        let line_waiter = thread::spawn({
+            let monitor = monitor.clone();
+            move || monitor.wait_for_line_after("MARKER", Duration::from_secs(24 * 60 * 60))
+        });
+        thread::sleep(SHORT);
+        monitor.close();
+        assert_eq!(text_waiter.join().unwrap(), WaitResult::Closed);
+        assert_eq!(line_waiter.join().unwrap(), WaitResult::Closed);
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn buffered_text_still_matches_after_close() {
+        let monitor = OutputMonitor::default();
+        monitor.push(b"login: ");
+        monitor.close();
+        assert_eq!(
+            monitor.wait_for_text("login: ", LONG),
+            WaitResult::Found(())
+        );
+        assert_eq!(monitor.wait_for_text("login: ", LONG), WaitResult::Closed);
     }
 }

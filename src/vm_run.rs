@@ -8,12 +8,14 @@ use std::{
 };
 
 use objc2_foundation::*;
+use objc2_virtualization::VZVirtualMachineState;
 
 use crate::DirectoryShare;
 use crate::networking::PreparedNetworkBackend;
 use crate::session::{
+    DiskSource,
     LoginAction::{self, *},
-    VmOutput, spawn_login_actions_thread, write_file_into_vm,
+    LoginFailure, VmOutput, legacy_login_prefix, needs_provision_hint, spawn_login_actions_thread,
 };
 use crate::vm_config::{SHARED_DIRECTORIES_TAG, create_vm_configuration};
 use crate::vm_io::{OutputMonitor, create_pipe, spawn_vm_io};
@@ -21,20 +23,36 @@ use crate::vm_lifecycle::{request_stop, start_vm};
 
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 
-// #region scripts for the guest vm
-const BASHRC_SCRIPT: &str = include_str!("bashrc.sh");
-const BASH_LOGOUT_SCRIPT: &str = include_str!("bash_logout.sh");
-// #endregion
+/// How a VM run ended when no login action reported an error.
+pub(crate) struct RunOutcome {
+    /// Every login action, including the caller's, ran to completion.
+    pub(crate) actions_completed: bool,
+    /// The VM reached the stopped state without an error.
+    pub(crate) stopped_normally: bool,
+    /// Console output that was not consumed by login actions.
+    #[allow(dead_code)]
+    pub(crate) output: String,
+}
 
+/// Boots `disk_path` attached to the host terminal, logs in as root, runs the
+/// internal setup and then `login_actions`.
+///
+/// Returns an error when a login action fails or times out, and when the VM
+/// stops before the root login completed. `disk_source` selects the
+/// `vibe provision` suggestion attached to boot and login errors; `None`
+/// omits it. `actions_completed_notice` is printed once all actions finished.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_vm(
     disk_path: &Path,
+    disk_source: Option<&DiskSource>,
     network_log_dir: Option<&Path>,
     login_actions: &[LoginAction],
     directory_shares: &[DirectoryShare],
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
     cpu_count: usize,
     ram_bytes: u64,
-) -> Result<String, Box<dyn std::error::Error>> {
+    actions_completed_notice: Option<&str>,
+) -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let disk_path_str = disk_path.to_string_lossy();
     let ram_mib = ram_bytes / 1024 / 1024;
     println!("Run VM (disk: {disk_path_str}; cpu: {cpu_count}; ram: {ram_mib} MiB) ...");
@@ -66,35 +84,7 @@ pub(crate) fn run_vm(
         we_write_resize_to,
     );
 
-    let mut all_login_actions = vec![
-        Expect {
-            text: "login: ".to_string(),
-            timeout: LOGIN_EXPECT_TIMEOUT,
-        },
-        Send("root".to_string()),
-        Expect {
-            text: "Debian GNU/Linux".to_string(),
-            timeout: LOGIN_EXPECT_TIMEOUT,
-        },
-        // Temporarily disable bash history and set commands starting with space to be ignored
-        Send(" export HISTCONTROL=ignorespace".to_string()),
-        Send(" unset HISTFILE".to_string()),
-        // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
-        // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
-        Send(" stty -F /dev/hvc0 sane".to_string()),
-        // In background, continuously read host terminal resizes sent over hvc1 and update hvc0.
-        Send({
-            // sorry for this nonsense, the string is so long it angers rustfmt =(
-            const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
-            S.to_string()
-        }),
-        //
-        Send(write_file_into_vm("/root/.profile", BASHRC_SCRIPT)?),
-        Send(write_file_into_vm(
-            "/root/.bash_logout",
-            BASH_LOGOUT_SCRIPT,
-        )?),
-    ];
+    let mut all_login_actions = legacy_login_prefix(LOGIN_EXPECT_TIMEOUT)?;
 
     if !directory_shares.is_empty() {
         all_login_actions.push(Send(" mkdir -p /mnt/shared".into()));
@@ -128,9 +118,49 @@ pub(crate) fn run_vm(
         vm_output_tx,
     );
 
-    let mut last_state = None;
-    let mut exit_result = Ok(());
-    loop {
+    let login_error = |failure: LoginFailure| -> String {
+        let mut message = failure.describe(disk_path);
+        if let Some(source) = disk_source.filter(|_| failure.suggests_provision()) {
+            message.push('\n');
+            message.push_str(&needs_provision_hint(disk_path, source));
+        }
+        message
+    };
+
+    let mut login_ready = false;
+    let mut actions_completed = false;
+    // Handles one message from the actions thread; returns the error that
+    // ends the run, if any.
+    let mut handle_output = |output: VmOutput| -> Option<String> {
+        let error = match output {
+            VmOutput::LoginActionTimeout { action, timeout } => {
+                format!("Login action ({action}) timed out after {timeout:?}; shutting down.")
+            }
+            VmOutput::LoginActionFailed { action, status } => {
+                format!("Login action ({action}) failed with exit code {status}")
+            }
+            VmOutput::LoginFailed(failure) => login_error(failure),
+            VmOutput::LoginReady => {
+                login_ready = true;
+                return None;
+            }
+            VmOutput::ActionsCompleted => {
+                actions_completed = true;
+                if let Some(notice) = actions_completed_notice {
+                    // Use stderr: the stdout forwarding thread holds the stdout
+                    // lock for the whole run. The terminal may be in raw mode,
+                    // so start on a fresh line.
+                    eprintln!("\r\n{notice}\r");
+                }
+                return None;
+            }
+        };
+        Some(error)
+    };
+
+    let mut exit_error = None;
+
+    let final_state = loop {
         unsafe {
             NSRunLoop::mainRunLoop().runMode_beforeDate(
                 NSDefaultRunLoopMode,
@@ -138,40 +168,44 @@ pub(crate) fn run_vm(
             )
         };
 
-        let state = unsafe { vm.state() };
-        if last_state != Some(state) {
-            //eprintln!("[state] {:?}", state);
-            last_state = Some(state);
+        while exit_error.is_none()
+            && let Ok(output) = vm_output_rx.try_recv()
+        {
+            exit_error = handle_output(output);
         }
-        match vm_output_rx.try_recv() {
-            Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
-                exit_result = Err(format!(
-                    "Login action ({action}) timed out after {timeout:?}; shutting down."
-                ));
-                request_stop(&vm);
-                break;
-            }
-            Ok(VmOutput::LoginActionFailed { action, status }) => {
-                exit_result = Err(format!(
-                    "Login action ({action}) failed with exit code {status}"
-                ));
-                request_stop(&vm);
-                break;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {}
+        if exit_error.is_some() {
+            request_stop(&vm);
+            break None;
         }
-        if state != objc2_virtualization::VZVirtualMachineState::Running {
-            //eprintln!("VM stopped with state: {:?}", state);
-            break;
-        }
-    }
 
+        let state = unsafe { vm.state() };
+        if state != VZVirtualMachineState::Running {
+            break Some(state);
+        }
+    };
+
+    // Wake any action still waiting for output, so the thread can be joined
+    // right away instead of after its timeout.
+    output_monitor.close();
     let _ = login_actions_thread.join();
+    while exit_error.is_none()
+        && let Ok(output) = vm_output_rx.try_recv()
+    {
+        exit_error = handle_output(output);
+    }
 
     io_ctx.shutdown();
 
-    let output = output_monitor.snapshot();
-    exit_result?;
-    Ok(output)
+    let error = exit_error.or_else(|| (!login_ready).then(|| login_error(LoginFailure::VmStopped)));
+    if let Some(error) = error {
+        // Guest output usually ends mid-line; start the error on a new line.
+        eprintln!();
+        return Err(error.into());
+    }
+
+    Ok(RunOutcome {
+        actions_completed,
+        stopped_normally: final_state == Some(VZVirtualMachineState::Stopped),
+        output: output_monitor.snapshot(),
+    })
 }

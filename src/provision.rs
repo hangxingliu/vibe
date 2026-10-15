@@ -186,24 +186,40 @@ export VIBE_PROVISION_SCRIPTS='{}'",
             timeout: DEFAULT_EXPECT_TIMEOUT,
         });
 
-        if repl {
+        let actions_completed_notice = if repl {
             // Leave the shell open for interactive customisation.
             // The VM will shut down when the user types `exit` or runs a shutdown command.
-            println!("Provisioning complete. Dropping into interactive shell (--repl).");
-            println!("Type `exit` or run `systemctl poweroff` when you are done.");
+            Some(
+                "Provisioning complete. Dropping into interactive shell (--repl).\r\n\
+Type `exit` or run `systemctl poweroff` when you are done.",
+            )
         } else {
             login_actions.push(Send(" systemctl poweroff; sleep 100".to_string()));
-        }
+            None
+        };
 
-        run_vm(
+        let outcome = run_vm(
             &tmp_raw,
+            None,
             None,
             &login_actions,
             directory_shares,
             prepare_network_backend,
             cpu_count,
             ram_bytes,
+            actions_completed_notice,
         )?;
+        if !outcome.actions_completed || !outcome.stopped_normally {
+            return Err(format!(
+                "The VM stopped before provisioning of image '{image_name}' completed{}; the image was not published.",
+                if outcome.actions_completed {
+                    " (it did not shut down cleanly)"
+                } else {
+                    ""
+                }
+            )
+            .into());
+        }
 
         fs::rename(&tmp_raw, image_raw)?;
         Ok(())

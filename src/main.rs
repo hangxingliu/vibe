@@ -34,7 +34,6 @@ const DEFAULT_RAM_MB: u64 = 2048;
 const DEFAULT_RAM_BYTES: u64 = DEFAULT_RAM_MB * BYTES_PER_MB;
 const DEFAULT_DISK_GB: u64 = 12;
 const DEFAULT_PROVISION_RAM_BYTES: u64 = 4096 * BYTES_PER_MB;
-const PASSWORD_EXPECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_IMAGE_NAME: &str = "default";
 const INSTANCE_DIR_NAME: &str = ".vibe";
 const INSTANCE_DISK_IMAGE_NAME: &str = "instance.raw";
@@ -153,7 +152,19 @@ fn provisioning_scripts_banner() -> String {
     )
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    // Print errors with Display so multi-line diagnostics (such as the
+    // provision hint for boot failures) stay readable and copyable.
+    match run_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_cli()?;
 
     let home = env::var("HOME").map(PathBuf::from)?;
@@ -311,12 +322,14 @@ Cache directory:
                 );
                 return run_vm(
                     &target_image_raw,
+                    Some(&DiskSource::CachedImage(image.clone())),
                     None,
                     &[],
                     &default_shares,
                     prepare_network_backend,
                     cpu_count,
                     ram_bytes,
+                    None,
                 )
                 .map(|_| ());
             }
@@ -358,6 +371,11 @@ Cache directory:
             // Only persist the networking log for the managed instance disk in `.vibe/`.
             // For external `--disk` there's no natural per-instance directory to write to, so skip logging.
             let log_to_instance = disk.is_none();
+            let disk_source = if disk.is_some() {
+                DiskSource::External
+            } else {
+                DiskSource::Instance
+            };
             let disk_path = if let Some(path) = disk {
                 if !path.exists() {
                     return Err(format!("Disk image does not exist: {}", path.display()).into());
@@ -557,12 +575,14 @@ Cache directory:
 
             run_vm(
                 &disk_path,
+                Some(&disk_source),
                 log_to_instance.then_some(instance_dir.as_path()),
                 &login_actions,
                 &directory_shares[..],
                 prepare_network_backend,
                 args.cpu_count,
                 args.ram_bytes,
+                None,
             )
             .map(|_| ())
         }

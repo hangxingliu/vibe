@@ -1,5 +1,7 @@
 .vibe
 
+/.vscode/settings.json
+
 /target
 /helpers/vibe-usernet/vibe-usernet
 

@@ -16,7 +16,14 @@ Vibe is a lightweight, zero-configuration tool designed to spin up Linux virtual
 
 ## Key Files & Directories
 
-- `src/main.rs`: Entry point, CLI parsing (via `lexopt`), VM configuration, and IO multiplexing.
+- `src/main.rs`: Entry point, CLI parsing (via `lexopt`), help text, and `main()` dispatch for run/provision (project directory shares and login actions).
+- `src/vm_io.rs`: Host terminal and console I/O: `OutputMonitor`, `spawn_vm_io`, raw mode, and terminal resize forwarding.
+- `src/vm_config.rs`: Virtualization framework configuration (`create_vm_configuration`, EFI variable store, disk, VirtioFS shares, serial ports).
+- `src/vm_lifecycle.rs`: Starting a configured VM (`start_vm`) and requesting it to stop (`request_stop`).
+- `src/vm_run.rs`: `run_vm()`: boots a disk, performs the root login and internal setup, then runs the login actions.
+- `src/session.rs`: `LoginAction`, the login actions thread, and helpers that build guest shell commands.
+- `src/images.rs`: Base image download and verification, image names/paths, and instance disks.
+- `src/provision.rs`: Provisioning flow (`ensure_default_image`, `provision_image`).
 - `src/tests.rs`: Unit tests for CLI parsing. Declared from `main.rs` as `#[cfg(test)] mod tests`, so the file is part of the binary crate (and can call private parsers) and is compiled only for `cargo test`.
 - `src/networking.rs`: Logic for setting up NAT, bridged, and `vmnet-helper` networking backends.
 - `provisioning/base.sh`: Shell script used to initialize the default Debian image with essential tools (gcc, rust, mise, etc.).

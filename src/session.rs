@@ -48,6 +48,39 @@ pub(crate) enum LoginAction {
 
 pub(crate) use LoginAction::*;
 
+impl LoginAction {
+    /// Short description used in error prefixes. `Send` text is not included
+    /// because it may contain proxy URLs or other environment values.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Expect { text, .. } => format!("expect '{text}'"),
+            Send(_) => "send".to_string(),
+            Script { name, .. } => format!("script '{name}'"),
+            LegacyLogin { .. } => "login".to_string(),
+        }
+    }
+}
+
+/// Error prefix for the login action at `index` in the full action list.
+/// Actions in `user` (a sub-range of `caller`) are numbered from 1 in the
+/// order the user gave them. Vibe's own actions after the user's ones (the
+/// provision finalize and poweroff steps) are part of the shutdown; anything
+/// else is part of the internal login and setup.
+pub(crate) fn action_prefix(
+    index: usize,
+    caller: &std::ops::Range<usize>,
+    user: &std::ops::Range<usize>,
+    action: &LoginAction,
+) -> String {
+    if user.contains(&index) {
+        format!("[action {}: {}]", index - user.start + 1, action.label())
+    } else if caller.contains(&index) && index >= user.end {
+        format!("[shutdown] {}", action.label())
+    } else {
+        format!("[login] setup {}", action.label())
+    }
+}
+
 /// Actions that every VM boot starts with: the legacy root login with its
 /// readiness probe, followed by the internal shell setup.
 pub(crate) fn legacy_login_prefix(
@@ -334,12 +367,16 @@ pub(crate) fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<L
 }
 
 pub(crate) enum VmOutput {
+    /// The action at `index` (in the full action list) started.
+    ActionStarted {
+        index: usize,
+    },
     LoginActionTimeout {
-        action: String,
+        index: usize,
         timeout: Duration,
     },
     LoginActionFailed {
-        action: String,
+        index: usize,
         status: u8,
     },
     LoginFailed(LoginFailure),
@@ -429,20 +466,18 @@ pub(crate) fn spawn_login_actions_thread(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for (index, a) in login_actions.into_iter().enumerate() {
+            let _ = vm_output_tx.send(VmOutput::ActionStarted { index });
             let step = match a {
                 Expect { text, timeout } => match output_monitor.wait_for_text(&text, timeout) {
                     WaitResult::Found(()) => Step::Continue,
                     WaitResult::Timeout => {
-                        let _ = vm_output_tx.send(VmOutput::LoginActionTimeout {
-                            action: format!("expect '{text}'"),
-                            timeout,
-                        });
+                        let _ = vm_output_tx.send(VmOutput::LoginActionTimeout { index, timeout });
                         Step::Stop
                     }
                     WaitResult::Closed => Step::Stop,
                 },
                 Send(text) => send_text(&input_tx, text),
-                Script { name, content } => {
+                Script { content, .. } => {
                     let id = format!("script_{index}");
                     let (command, status_marker) = script_command_and_status_marker(&id, &content);
                     match send_text(&input_tx, command) {
@@ -455,16 +490,14 @@ pub(crate) fn spawn_login_actions_thread(
                                 if status == 0 {
                                     Step::Continue
                                 } else {
-                                    let _ = vm_output_tx.send(VmOutput::LoginActionFailed {
-                                        action: format!("script '{name}'"),
-                                        status,
-                                    });
+                                    let _ = vm_output_tx
+                                        .send(VmOutput::LoginActionFailed { index, status });
                                     Step::Stop
                                 }
                             }
                             WaitResult::Timeout => {
                                 let _ = vm_output_tx.send(VmOutput::LoginActionTimeout {
-                                    action: format!("script '{name}'"),
+                                    index,
                                     timeout: SCRIPT_ACTION_TIMEOUT,
                                 });
                                 Step::Stop
@@ -662,6 +695,13 @@ mod tests {
         (input_rx, output_rx, handle)
     }
 
+    /// Next message other than `ActionStarted`, if one is queued.
+    fn next_report(output_rx: &mpsc::Receiver<VmOutput>) -> Option<VmOutput> {
+        output_rx
+            .try_iter()
+            .find(|output| !matches!(output, VmOutput::ActionStarted { .. }))
+    }
+
     #[test]
     fn actions_thread_reports_completion_only_after_every_action() {
         let monitor = Arc::new(OutputMonitor::default());
@@ -674,12 +714,12 @@ mod tests {
         ];
         let (input_rx, output_rx, handle) = actions_thread(actions, &monitor);
         assert_eq!(typed_line(&input_rx), "echo hi");
-        assert!(output_rx.try_recv().is_err());
+        assert!(next_report(&output_rx).is_none());
         monitor.push(b"hi\r\n");
         handle.join().unwrap();
         assert!(matches!(
-            output_rx.try_recv(),
-            Ok(VmOutput::ActionsCompleted)
+            next_report(&output_rx),
+            Some(VmOutput::ActionsCompleted)
         ));
     }
 
@@ -696,7 +736,7 @@ mod tests {
         monitor.close();
         handle.join().unwrap();
         assert!(start.elapsed() < Duration::from_secs(5));
-        assert!(output_rx.try_recv().is_err());
+        assert!(next_report(&output_rx).is_none());
     }
 
     #[test]
@@ -706,7 +746,91 @@ mod tests {
         let (input_rx, output_rx, handle) = actions_thread(actions, &monitor);
         drop(input_rx);
         handle.join().expect("actions thread must not panic");
-        assert!(output_rx.try_recv().is_err());
+        assert!(next_report(&output_rx).is_none());
+    }
+
+    #[test]
+    fn actions_thread_reports_the_index_of_a_failed_script() {
+        let monitor = Arc::new(OutputMonitor::default());
+        let actions = vec![
+            Send("echo hi".to_string()),
+            Script {
+                name: "fail.sh".to_string(),
+                content: "exit 3\n".to_string(),
+            },
+            Send("never".to_string()),
+        ];
+        let (input_rx, output_rx, handle) = actions_thread(actions, &monitor);
+        assert_eq!(typed_line(&input_rx), "echo hi");
+        let id = "script_1";
+        // The wrapper is several lines; its last line prints the status marker.
+        while !typed_line(&input_rx).contains("VIBE_SCRIPT_STATUS_") {}
+        // Reply with the status line the wrapper prints after the script.
+        let (_, marker) = script_command_and_status_marker(id, "exit 3\n");
+        monitor.push(format!("\r\n{marker}\r\n3\r\n").as_bytes());
+        handle.join().unwrap();
+        let started: Vec<usize> = output_rx
+            .try_iter()
+            .filter_map(|output| match output {
+                VmOutput::ActionStarted { index } => Some(index),
+                VmOutput::LoginActionFailed { index, status } => {
+                    assert_eq!((index, status), (1, 3));
+                    None
+                }
+                _ => panic!("unexpected report"),
+            })
+            .collect();
+        assert_eq!(started, vec![0, 1]);
+    }
+
+    #[test]
+    fn action_prefix_numbers_user_actions_from_one() {
+        let script = Script {
+            name: "base".to_string(),
+            content: String::new(),
+        };
+        // Caller actions 7..12: two Vibe setup actions, three user actions,
+        // then one Vibe shutdown action.
+        let caller = 7..13;
+        let user = 9..12;
+        assert_eq!(
+            action_prefix(10, &caller, &user, &script),
+            "[action 2: script 'base']"
+        );
+        let expect = Expect {
+            text: "VIBE_PROVISION_SUCCESS".to_string(),
+            timeout: LONG,
+        };
+        assert_eq!(
+            action_prefix(11, &caller, &user, &expect),
+            "[action 3: expect 'VIBE_PROVISION_SUCCESS']"
+        );
+        assert_eq!(
+            action_prefix(8, &caller, &user, &Send(" cd project".to_string())),
+            "[login] setup send"
+        );
+        let finalize = Script {
+            name: "finalize-machine-id".to_string(),
+            content: String::new(),
+        };
+        assert_eq!(
+            action_prefix(12, &caller, &user, &finalize),
+            "[shutdown] script 'finalize-machine-id'"
+        );
+        assert_eq!(
+            action_prefix(
+                2,
+                &caller,
+                &user,
+                &Send("export HTTP_PROXY=http://secret".to_string())
+            ),
+            "[login] setup send"
+        );
+        assert!(
+            !Send("export X=secret".to_string())
+                .label()
+                .contains("secret")
+        );
     }
 
     #[test]

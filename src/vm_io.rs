@@ -1,5 +1,11 @@
 //! Host-side VM console I/O: stdin/stdout forwarding, the output monitor used by
 //! login actions, terminal raw mode, and terminal resize forwarding.
+//!
+//! User keystrokes stay behind an input gate until the caller opens it (after
+//! every automatic login action has finished). Bytes that arrive while the
+//! gate is closed are discarded, not queued: replaying them later would mix
+//! them into commands the host is still typing. Two consecutive Ctrl-C bytes
+//! in that window ask the main thread to stop the VM.
 
 use std::{
     io::{self, Write},
@@ -12,6 +18,7 @@ use std::{
     },
     sync::{
         Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -165,11 +172,54 @@ impl<T> WaitResult<T> {
 
 pub struct IoContext {
     pub input_tx: Sender<VmInput>,
+    /// Set when automatic login actions have finished and user keystrokes
+    /// may be forwarded to the guest.
+    pub(crate) input_open: Arc<AtomicBool>,
+    /// Set when the user presses Ctrl-C twice while [`Self::input_open`] is still false.
+    pub(crate) stop_requested: Arc<AtomicBool>,
     wakeup_write: OwnedFd,
     stdin_thread: thread::JoinHandle<()>,
     mux_thread: thread::JoinHandle<()>,
     resize_thread: thread::JoinHandle<()>,
     stdout_thread: thread::JoinHandle<()>,
+}
+
+/// What to do with one read from the host terminal.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UserInputDecision {
+    /// The gate is open. Forward the bytes unchanged.
+    Forward,
+    /// The gate is closed. Drop the bytes. `arm_ctrl_c` is true when the
+    /// last byte was Ctrl-C, so the next Ctrl-C stops the VM. `hint` is true
+    /// when this read armed that pending Ctrl-C and the user should be told.
+    Discard { arm_ctrl_c: bool, hint: bool },
+    /// The gate is closed and this read completed a pair of Ctrl-C bytes.
+    Stop,
+}
+
+/// Decides how host keystrokes are treated. Closed-gate input is never
+/// returned to the caller, so it cannot be replayed into a later command.
+pub(crate) fn decide_user_input(
+    input_open: bool,
+    mut arm_ctrl_c: bool,
+    bytes: &[u8],
+) -> UserInputDecision {
+    if input_open {
+        return UserInputDecision::Forward;
+    }
+    let mut hint = false;
+    for &byte in bytes {
+        if byte == 0x03 {
+            if arm_ctrl_c {
+                return UserInputDecision::Stop;
+            }
+            arm_ctrl_c = true;
+            hint = true;
+        } else {
+            arm_ctrl_c = false;
+        }
+    }
+    UserInputDecision::Discard { arm_ctrl_c, hint }
 }
 
 #[must_use]
@@ -185,6 +235,8 @@ pub fn spawn_vm_io(
     resize_control_fd: OwnedFd,
 ) -> IoContext {
     let (input_tx, input_rx): (Sender<VmInput>, Receiver<VmInput>) = mpsc::channel();
+    let input_open = Arc::new(AtomicBool::new(false));
+    let stop_requested = Arc::new(AtomicBool::new(false));
 
     // raw_guard is set when we've put the user's terminal into raw mode because we've attached stdin/stdout to the VM.
     let raw_guard = Arc::new(Mutex::new(None));
@@ -233,21 +285,54 @@ pub fn spawn_vm_io(
     let stdin_thread = thread::spawn({
         let input_tx = input_tx.clone();
         let raw_guard = raw_guard.clone();
+        let input_open = input_open.clone();
+        let stop_requested = stop_requested.clone();
         let wakeup_read = wakeup_read.try_clone().unwrap();
 
         move || {
             let mut buf = [0u8; 1024];
+            // True after a Ctrl-C that was not followed by any other byte.
+            let mut arm_ctrl_c = false;
             loop {
                 match poll_with_wakeup(libc::STDIN_FILENO, wakeup_read.as_raw_fd(), &mut buf) {
                     PollResult::Shutdown | PollResult::Error => break,
                     PollResult::Spurious => continue,
                     PollResult::Ready(bytes) => {
-                        // discard input if the VM hasn't booted up yielded output yet (which triggers us entering raw_mode)
+                        // Before the first guest byte the terminal is still
+                        // cooked, and Ctrl-C is a signal rather than input.
+                        // Discard those bytes without counting them.
                         if raw_guard.lock().unwrap().is_none() {
                             continue;
                         }
-                        if input_tx.send(VmInput::Bytes(bytes.to_vec())).is_err() {
-                            break;
+                        match decide_user_input(
+                            input_open.load(Ordering::Acquire),
+                            arm_ctrl_c,
+                            bytes,
+                        ) {
+                            UserInputDecision::Forward => {
+                                arm_ctrl_c = false;
+                                if input_tx.send(VmInput::Bytes(bytes.to_vec())).is_err() {
+                                    break;
+                                }
+                            }
+                            UserInputDecision::Discard {
+                                arm_ctrl_c: armed,
+                                hint,
+                            } => {
+                                arm_ctrl_c = armed;
+                                if hint {
+                                    // stderr: the stdout thread holds the stdout lock.
+                                    // Raw mode does not translate newline to CRLF.
+                                    eprintln!(
+                                        "\r\nInput is closed until setup finishes. Press Ctrl-C again to stop the VM.\r"
+                                    );
+                                }
+                            }
+                            UserInputDecision::Stop => {
+                                eprintln!("\r\nStopping the VM.\r");
+                                stop_requested.store(true, Ordering::Release);
+                                break;
+                            }
                         }
                     }
                 }
@@ -347,6 +432,8 @@ pub fn spawn_vm_io(
 
     IoContext {
         input_tx,
+        input_open,
+        stop_requested,
         wakeup_write,
         stdin_thread,
         mux_thread,
@@ -514,6 +601,70 @@ mod tests {
         assert_eq!(text_waiter.join().unwrap(), WaitResult::Closed);
         assert_eq!(line_waiter.join().unwrap(), WaitResult::Closed);
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn closed_gate_discards_keystrokes_and_does_not_return_them() {
+        assert_eq!(
+            decide_user_input(false, false, b"root\n"),
+            UserInputDecision::Discard {
+                arm_ctrl_c: false,
+                hint: false,
+            }
+        );
+        // A pending Ctrl-C is cleared by any other byte, so a later Ctrl-C
+        // is a new first press rather than the second of a pair.
+        assert_eq!(
+            decide_user_input(false, true, b"x\x03"),
+            UserInputDecision::Discard {
+                arm_ctrl_c: true,
+                hint: true,
+            }
+        );
+    }
+
+    #[test]
+    fn closed_gate_stops_only_on_two_consecutive_ctrl_c() {
+        assert_eq!(
+            decide_user_input(false, false, &[0x03]),
+            UserInputDecision::Discard {
+                arm_ctrl_c: true,
+                hint: true,
+            }
+        );
+        assert_eq!(
+            decide_user_input(false, true, &[0x03]),
+            UserInputDecision::Stop
+        );
+        assert_eq!(
+            decide_user_input(false, false, &[0x03, 0x03]),
+            UserInputDecision::Stop
+        );
+        // Already armed, so the first byte of this read completes the pair.
+        // The bytes after that Ctrl-C are not forwarded.
+        assert_eq!(
+            decide_user_input(false, true, &[0x03, b'a', 0x03]),
+            UserInputDecision::Stop
+        );
+        assert_eq!(
+            decide_user_input(false, false, &[0x03, b'a', 0x03]),
+            UserInputDecision::Discard {
+                arm_ctrl_c: true,
+                hint: true,
+            }
+        );
+    }
+
+    #[test]
+    fn open_gate_forwards_every_byte_including_ctrl_c() {
+        assert_eq!(
+            decide_user_input(true, true, &[0x03, 0x03]),
+            UserInputDecision::Forward
+        );
+        assert_eq!(
+            decide_user_input(true, false, b"echo ready\n"),
+            UserInputDecision::Forward
+        );
     }
 
     #[test]

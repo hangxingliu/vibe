@@ -176,6 +176,8 @@ export VIBE_PROVISION_SCRIPTS='{}'",
             shell_single_quote(&script_names)
         )));
 
+        // `[action N: ...]` numbers the provisioning scripts (`@base` first).
+        let user_actions = login_actions.len()..login_actions.len() + scripts.len();
         for script in scripts {
             login_actions.push(build_provision_script(script, guest_proxy));
         }
@@ -203,6 +205,7 @@ Type `exit` or run `systemctl poweroff` when you are done.",
             None,
             None,
             &login_actions,
+            user_actions,
             directory_shares,
             prepare_network_backend,
             cpu_count,

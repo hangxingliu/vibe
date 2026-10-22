@@ -332,6 +332,7 @@ Cache directory:
                     Some(&DiskSource::CachedImage(image.clone())),
                     None,
                     &[],
+                    0..0,
                     &default_shares,
                     prepare_network_backend,
                     cpu_count,
@@ -578,6 +579,7 @@ Cache directory:
             }
 
             // Any user-provided login actions must come after our system ones
+            let user_actions = login_actions.len()..login_actions.len() + args.login_actions.len();
             login_actions.extend(args.login_actions);
 
             run_vm(
@@ -585,6 +587,7 @@ Cache directory:
                 Some(&disk_source),
                 log_to_instance.then_some(instance_dir.as_path()),
                 &login_actions,
+                user_actions,
                 &directory_shares[..],
                 prepare_network_backend,
                 args.cpu_count,

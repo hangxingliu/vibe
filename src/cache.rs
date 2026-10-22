@@ -5,10 +5,12 @@
 //! A maintenance directory is `{prefix}{pid}-{nonce}` with mode 0700 so
 //! `sweep_stale` can drop leftovers whose pid no longer exists.
 //!
-//! TODO(T18): Alpine download holds `alpine.lock` with `FileLock`.
-//! TODO(T28): provision clones the Alpine image and publishes through `replace`.
-
-#![allow(dead_code)]
+//! `FileLock::acquire` is the Alpine download lock. `try_acquire_existing`
+//! locks `{disk}.lock` beside an existing disk, without changing the disk's
+//! mode. The disk image itself is not locked: Virtualization.framework flocks
+//! that file when it attaches the disk, and a lock already held by this
+//! process makes the attachment invalid. `process_disk` takes that sibling
+//! lock; `ensure_bootable` does not take a second one.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -58,11 +60,39 @@ impl FileLock {
         Ok(Self { file })
     }
 
+    /// Non-blocking lock used by tests. Provision does not call this yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn try_acquire(path: &Path) -> Result<Self, LockError> {
         let file = open_lock_file(path)?;
         flock_wait(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)?;
         Ok(Self { file })
     }
+
+    /// Lock an existing disk for maintenance.
+    ///
+    /// The disk is opened read-write only long enough to prove this process
+    /// can write it. The exclusive lock is `{disk}.lock` in the same directory.
+    /// Holding `flock` on the disk image itself makes
+    /// `VZDiskImageStorageDeviceAttachment` fail at start with
+    /// "storage device attachment is invalid".
+    pub(crate) fn try_acquire_existing(path: &Path) -> Result<Self, LockError> {
+        {
+            let writable = OpenOptions::new().read(true).write(true).open(path)?;
+            drop(writable);
+        }
+        let file = open_lock_file(&disk_lock_path(path))?;
+        flock_wait(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)?;
+        Ok(Self { file })
+    }
+}
+
+pub(crate) fn disk_lock_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("disk"))
+        .to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
 }
 
 impl Drop for FileLock {
@@ -365,6 +395,40 @@ mod tests {
             "contending acquire returned in {elapsed:?}"
         );
         drop(lock);
+    }
+
+    #[test]
+    fn existing_disk_lock_is_a_sibling_and_does_not_change_the_disk() {
+        let dir = DirGuard(scratch());
+        let disk = dir.0.join("disk.raw");
+        fs::write(&disk, b"raw").unwrap();
+        fs::set_permissions(&disk, fs::Permissions::from_mode(0o644)).unwrap();
+        let held = FileLock::try_acquire_existing(&disk).unwrap();
+        let lock_path = dir.0.join("disk.raw.lock");
+        assert!(lock_path.is_file());
+        assert_eq!(
+            fs::metadata(&disk).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::read(&disk).unwrap(), b"raw");
+        let other = disk.clone();
+        let handle = thread::spawn(move || {
+            let began = Instant::now();
+            let result = FileLock::try_acquire_existing(&other);
+            (began.elapsed(), result)
+        });
+        let (elapsed, result) = handle.join().unwrap();
+        assert!(matches!(result, Err(LockError::WouldBlock)));
+        assert!(elapsed < Duration::from_millis(200), "took {elapsed:?}");
+        drop(held);
+        assert!(FileLock::try_acquire_existing(&disk).is_ok());
+
+        fs::set_permissions(&disk, fs::Permissions::from_mode(0o444)).unwrap();
+        match FileLock::try_acquire_existing(&disk) {
+            Err(LockError::Io(err)) => assert_eq!(err.kind(), ErrorKind::PermissionDenied),
+            Err(LockError::WouldBlock) => panic!("read-only disk reported WouldBlock"),
+            Ok(_) => panic!("read-only disk was locked"),
+        }
     }
 
     #[test]

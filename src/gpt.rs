@@ -5,15 +5,14 @@
 //! The parser checks the primary header at LBA 1 only; it does not fall back
 //! to the backup header.
 //!
-//! TODO(T18): Alpine image unpack checks partition 2's ext4 UUID.
-//! TODO(T21): maintenance safety check calls `scan_labels`.
-//! TODO(T28): `probe_disk` calls `read_gpt` and `select_layout`.
-
-#![allow(dead_code)]
+//! Alpine unpack checks partition 2's ext4 UUID. Maintenance rejects label and
+//! UUID clashes with `scan_labels` before it boots. Provision reaches this
+//! parser through `ensure_bootable` and `process_disk`. The run path does not.
 
 use std::{
     fs::File,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::Path,
 };
 
 /// EFI System Partition type GUID.
@@ -480,7 +479,7 @@ fn read_u64(buf: &[u8], off: usize) -> u64 {
 }
 
 /// ISO-HDLC CRC-32 (the polynomial GPT uses).
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
         crc ^= u32::from(byte);
@@ -495,6 +494,73 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Canonical GUID text (`8-4-4-4-12`) to the mixed-endian bytes stored in GPT.
+fn guid_to_mixed_bytes(canonical: &str) -> Result<[u8; 16], GptError> {
+    let hex: String = canonical.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(GptError::BadHeader);
+    }
+    let mut raw = [0u8; 16];
+    for i in 0..16 {
+        raw[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| GptError::BadHeader)?;
+    }
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&u32::from_be_bytes(raw[0..4].try_into().unwrap()).to_le_bytes());
+    out[4..6].copy_from_slice(&u16::from_be_bytes(raw[4..6].try_into().unwrap()).to_le_bytes());
+    out[6..8].copy_from_slice(&u16::from_be_bytes(raw[6..8].try_into().unwrap()).to_le_bytes());
+    out[8..16].copy_from_slice(&raw[8..16]);
+    Ok(out)
+}
+
+/// Replace one partition's type GUID and recompute the primary header CRC and
+/// the entry-array CRC. The backup GPT is left unchanged. `index` is 1-based.
+pub(crate) fn set_partition_type_guid(
+    path: &Path,
+    index: u32,
+    type_guid: &str,
+) -> Result<(), GptError> {
+    if index == 0 {
+        return Err(GptError::BadHeader);
+    }
+    let type_bytes = guid_to_mixed_bytes(type_guid)?;
+    let mut file = File::options().read(true).write(true).open(path)?;
+    let mut header = [0u8; SECTOR_BYTES as usize];
+    file.seek(SeekFrom::Start(SECTOR_BYTES))?;
+    file.read_exact(&mut header)?;
+    if &header[0..8] != GPT_SIGNATURE {
+        return Err(GptError::BadSignature);
+    }
+    let entry_lba = read_u64(&header, 0x48);
+    let entry_count = read_u32(&header, 0x50);
+    let entry_size = read_u32(&header, 0x54);
+    if index > entry_count || !(128..MAX_ENTRY_SIZE + 1).contains(&entry_size) {
+        return Err(GptError::BadHeader);
+    }
+    let array_bytes = u64::from(entry_count) * u64::from(entry_size);
+    if array_bytes > MAX_PARTITION_ARRAY_BYTES {
+        return Err(GptError::EntryCount);
+    }
+    let mut array = vec![0u8; array_bytes as usize];
+    file.seek(SeekFrom::Start(entry_lba * SECTOR_BYTES))?;
+    file.read_exact(&mut array)?;
+    let start = (index as usize - 1) * entry_size as usize;
+    array[start..start + 16].copy_from_slice(&type_bytes);
+    let entries_crc = crc32(&array);
+    header[0x58..0x5C].copy_from_slice(&entries_crc.to_le_bytes());
+    header[0x10..0x14].fill(0);
+    let header_bytes = read_u32(&header, 0x0C) as usize;
+    if !(HEADER_BYTES_MIN as usize..=SECTOR_BYTES as usize).contains(&header_bytes) {
+        return Err(GptError::BadHeader);
+    }
+    let header_crc = crc32(&header[..header_bytes]);
+    header[0x10..0x14].copy_from_slice(&header_crc.to_le_bytes());
+    file.seek(SeekFrom::Start(SECTOR_BYTES))?;
+    file.write_all(&header)?;
+    file.seek(SeekFrom::Start(entry_lba * SECTOR_BYTES))?;
+    file.write_all(&array)?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct TestPart {
@@ -504,22 +570,6 @@ pub(crate) struct TestPart {
     pub first_lba: u64,
     pub last_lba: u64,
     pub name: &'static str,
-}
-
-#[cfg(test)]
-fn guid_to_mixed_bytes(canonical: &str) -> [u8; 16] {
-    let hex: String = canonical.chars().filter(|c| *c != '-').collect();
-    assert_eq!(hex.len(), 32, "guid {canonical}");
-    let mut raw = [0u8; 16];
-    for i in 0..16 {
-        raw[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
-    }
-    let mut out = [0u8; 16];
-    out[0..4].copy_from_slice(&u32::from_be_bytes(raw[0..4].try_into().unwrap()).to_le_bytes());
-    out[4..6].copy_from_slice(&u16::from_be_bytes(raw[4..6].try_into().unwrap()).to_le_bytes());
-    out[6..8].copy_from_slice(&u16::from_be_bytes(raw[6..8].try_into().unwrap()).to_le_bytes());
-    out[8..16].copy_from_slice(&raw[8..16]);
-    out
 }
 
 /// Build a primary GPT image. The buffer is only as long as the entry array;
@@ -534,8 +584,8 @@ pub(crate) fn build_gpt(parts: &[TestPart], disk_bytes: u64, entry_count: u32) -
         assert!(part.index >= 1 && part.index <= entry_count);
         let start = (part.index as usize - 1) * entry_size as usize;
         let entry = &mut array[start..start + entry_size as usize];
-        entry[0..16].copy_from_slice(&guid_to_mixed_bytes(part.type_guid));
-        entry[16..32].copy_from_slice(&guid_to_mixed_bytes(part.unique_guid));
+        entry[0..16].copy_from_slice(&guid_to_mixed_bytes(part.type_guid).unwrap());
+        entry[16..32].copy_from_slice(&guid_to_mixed_bytes(part.unique_guid).unwrap());
         entry[0x20..0x28].copy_from_slice(&part.first_lba.to_le_bytes());
         entry[0x28..0x30].copy_from_slice(&part.last_lba.to_le_bytes());
         let mut units: Vec<u16> = part.name.encode_utf16().collect();

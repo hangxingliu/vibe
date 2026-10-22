@@ -8,12 +8,10 @@
 //! `/etc/os-release` on current Debian is one symlink to `../usr/lib/os-release`.
 //! That final component is resolved once, lexically, and the target is read
 //! only when every earlier component is a real directory. No other path is
-//! followed. `run` does not call this module.
+//! followed. The run path does not call this module. Provision does, from
+//! `ensure_bootable`, and again before it publishes an image.
 //!
-//! TODO(T21): `verify_processed` runs after the maintenance VM stops.
-//! TODO(T28): provision probes its work copy before publishing it.
-
-#![allow(dead_code)]
+//! `verify_processed` runs after the maintenance VM stops.
 
 use std::{fs::File, hint::black_box, path::Path};
 
@@ -121,6 +119,11 @@ impl std::fmt::Display for VerifyError {
 impl std::error::Error for VerifyError {}
 
 pub(crate) fn probe_disk(path: &Path) -> (ImageClass, ProbeFacts) {
+    // Lets tests confirm which paths probe a disk (running a disk must not).
+    // Unset in normal use.
+    if std::env::var_os("VIBE_TRACE_PROBE").is_some() {
+        eprintln!("vibe: probe_disk {}", path.display());
+    }
     let mut facts = ProbeFacts::default();
     inspect(path, &mut facts);
     let class = classify(&facts);
@@ -733,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "set VIBE_TEST_DEBIAN_NEW_RAW, VIBE_TEST_DEBIAN_OLD_RAW, VIBE_TEST_ALPINE_RAW; VIBE_TEST_T09_PREPARED_RAW is optional"]
+    #[ignore = "set VIBE_TEST_DEBIAN_NEW_RAW, VIBE_TEST_DEBIAN_OLD_RAW, VIBE_TEST_ALPINE_RAW; VIBE_TEST_DEBIAN_LOCKED_ROOT_RAW is optional"]
     fn real_images_match_recorded_classes() {
         let Some(new) = std::env::var_os("VIBE_TEST_DEBIAN_NEW_RAW") else {
             eprintln!("skipping real image probe; set VIBE_TEST_DEBIAN_NEW_RAW");
@@ -778,9 +781,11 @@ mod tests {
         let (class, _) = probe_disk(Path::new(&alpine));
         assert_eq!(class, ImageClass::Unsupported("not Debian".into()));
 
-        match std::env::var_os("VIBE_TEST_T09_PREPARED_RAW") {
+        // A new Debian copy whose machine-id was cleared while root stayed
+        // locked still needs preparation.
+        match std::env::var_os("VIBE_TEST_DEBIAN_LOCKED_ROOT_RAW") {
             None => eprintln!(
-                "VIBE_TEST_T09_PREPARED_RAW is unset; the T09 prepared copy was not in the workspace"
+                "VIBE_TEST_DEBIAN_LOCKED_ROOT_RAW is unset; skipping the cleared machine-id, locked root case"
             ),
             Some(path) => {
                 let (class, facts) = probe_disk(Path::new(&path));

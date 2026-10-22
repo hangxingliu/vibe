@@ -5,9 +5,8 @@
 //! It is not an authenticator. This parser checks syntax only; step order is
 //! enforced by the maintenance driver.
 //!
-//! TODO(T21): the maintenance VM reads these frames from hvc1.
-
-#![allow(dead_code)]
+//! `run_headless` feeds hvc1 to `FrameReader`. `maintenance` checks step order.
+//! The host sends no frames, so `encode` stays unused outside tests.
 
 use std::{
     fs::File,
@@ -98,6 +97,10 @@ impl FrameReader {
                 continue;
             }
             if byte == b'\n' {
+                // The guest console has ONLCR, so each frame arrives as CRLF.
+                if self.buf.last() == Some(&b'\r') {
+                    self.buf.pop();
+                }
                 out.push(self.parse_line());
                 self.buf.clear();
                 continue;
@@ -212,6 +215,7 @@ pub(crate) fn new_nonce() -> io::Result<String> {
     Ok(text)
 }
 
+#[allow(dead_code)]
 pub(crate) fn encode(frame: &Frame, nonce: &str) -> String {
     match frame {
         Frame::PrepReady => format!("VIBE1 {nonce} PREP-READY\n"),
@@ -271,6 +275,22 @@ mod tests {
         let mut reader = reader();
         let parsed = reader.push(encode(&frame, NONCE).as_bytes());
         assert_eq!(parsed, vec![Ok(frame)]);
+    }
+
+    #[test]
+    fn crlf_from_the_guest_console_is_one_frame() {
+        let mut reader = reader();
+        let bytes = format!("VIBE1 {NONCE} PREP-READY\r\nVIBE1 {NONCE} PREP-STEP seed\r\n");
+        assert_eq!(
+            reader.push(bytes.as_bytes()),
+            vec![
+                Ok(Frame::PrepReady),
+                Ok(Frame::PrepStep {
+                    name: "seed".into()
+                })
+            ]
+        );
+        assert!(reader.finish().is_ok());
     }
 
     #[test]

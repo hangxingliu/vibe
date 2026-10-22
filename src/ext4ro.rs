@@ -6,9 +6,8 @@
 //! `needs_recovery` is rejected so a dirty journal is left for Alpine's
 //! `e2fsck` instead of being ignored.
 //!
-//! TODO(T28): provision is the production caller, via `image_probe`.
-
-#![allow(dead_code)]
+//! `image_probe` and the maintenance VM checks read through this module.
+//! Provision is a production caller, via `image_probe`. The run path is not.
 
 use std::{
     fs::File,
@@ -101,6 +100,8 @@ pub(crate) enum FileRead {
 
 struct Inode {
     mode: u16,
+    uid: u32,
+    gid: u32,
     flags: u32,
     /// Size used for regular files and directories (includes `i_size_high`).
     size: u64,
@@ -109,11 +110,25 @@ struct Inode {
     iblock: [u8; 60],
 }
 
+/// `lstat` of one path. The final symlink is not followed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileMeta {
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+}
+
 struct Extent {
     logical: u32,
     len: u32,
     start: u64,
     uninit: bool,
+}
+
+enum Walked {
+    Root,
+    Missing,
+    Found(u32),
 }
 
 pub(crate) struct Ext4Ro<R> {
@@ -272,6 +287,30 @@ impl<R: ReadAt> Ext4Ro<R> {
     /// indirection (only `/etc/os-release`) resolve the returned target
     /// themselves. `max_len` is a hard cap; the file is not truncated.
     pub(crate) fn read_file(&self, path: &str, max_len: usize) -> Result<FileRead, Ext4Error> {
+        match self.walk(path)? {
+            Walked::Root => Ok(FileRead::Other),
+            Walked::Missing => Ok(FileRead::Missing),
+            Walked::Found(ino) => self.read_inode_data(ino, max_len),
+        }
+    }
+
+    /// Metadata of the final component. A final symlink is not followed.
+    /// `Ok(None)` means the path is missing.
+    pub(crate) fn lstat(&self, path: &str) -> Result<Option<FileMeta>, Ext4Error> {
+        match self.walk(path)? {
+            Walked::Root | Walked::Missing => Ok(None),
+            Walked::Found(ino) => {
+                let inode = self.read_inode(ino)?;
+                Ok(Some(FileMeta {
+                    mode: inode.mode,
+                    uid: inode.uid,
+                    gid: inode.gid,
+                }))
+            }
+        }
+    }
+
+    fn walk(&self, path: &str) -> Result<Walked, Ext4Error> {
         if !path.starts_with('/') {
             return Err(Ext4Error::Corrupt("path is not absolute"));
         }
@@ -283,7 +322,7 @@ impl<R: ReadAt> Ext4Ro<R> {
             return Err(Ext4Error::Unsupported("path contains . or .."));
         }
         if parts.is_empty() {
-            return Ok(FileRead::Other);
+            return Ok(Walked::Root);
         }
         let mut ino = 2u32;
         for (index, part) in parts.iter().enumerate() {
@@ -292,10 +331,10 @@ impl<R: ReadAt> Ext4Ro<R> {
                 return Err(Ext4Error::Unsupported("path component is not a directory"));
             }
             let Some(child) = self.lookup(&dir, part.as_bytes())? else {
-                return Ok(FileRead::Missing);
+                return Ok(Walked::Missing);
             };
             if index + 1 == parts.len() {
-                return self.read_inode_data(child, max_len);
+                return Ok(Walked::Found(child));
             }
             let next = self.read_inode(child)?;
             match next.mode & S_IFMT {
@@ -304,7 +343,7 @@ impl<R: ReadAt> Ext4Ro<R> {
                 _ => return Err(Ext4Error::Unsupported("path component is not a directory")),
             }
         }
-        Ok(FileRead::Missing)
+        Ok(Walked::Missing)
     }
 
     fn read_inode_data(&self, ino: u32, max_len: usize) -> Result<FileRead, Ext4Error> {
@@ -595,10 +634,22 @@ impl<R: ReadAt> Ext4Ro<R> {
         } else {
             0
         };
+        let uid_lo = u32::from(u16_at(&raw, 0x02)?);
+        let gid_lo = u32::from(u16_at(&raw, 0x18)?);
+        let (uid_hi, gid_hi) = if raw.len() >= 0x7C {
+            (
+                u32::from(u16_at(&raw, 0x78)?),
+                u32::from(u16_at(&raw, 0x7A)?),
+            )
+        } else {
+            (0, 0)
+        };
         let mut iblock = [0u8; 60];
         iblock.copy_from_slice(&raw[0x28..0x28 + 60]);
         Ok(Inode {
             mode: u16_at(&raw, 0x00)?,
+            uid: uid_lo | (uid_hi << 16),
+            gid: gid_lo | (gid_hi << 16),
             flags: u32_at(&raw, 0x20)?,
             size: u64::from(size_lo) | (u64::from(size_hi) << 32),
             size_lo,
@@ -959,6 +1010,24 @@ mod tests {
             FileRead::Regular(b"deep-ok".to_vec())
         );
         assert_eq!(fs.read_file("/missing", 64).unwrap(), FileRead::Missing);
+        let mut owned = img.clone();
+        let hello = sample_inode_offset(3);
+        put_u16(&mut owned, hello + 0x02, 7);
+        put_u16(&mut owned, hello + 0x18, 42);
+        put_u16(&mut owned, hello + 0x78, 1);
+        put_u16(&mut owned, hello + 0x7A, 2);
+        let fs = open_sample(&owned);
+        assert_eq!(
+            fs.lstat("/hello").unwrap(),
+            Some(FileMeta {
+                mode: S_IFREG | 0o644,
+                uid: (1 << 16) | 7,
+                gid: (2 << 16) | 42,
+            })
+        );
+        let link = fs.lstat("/short").unwrap().unwrap();
+        assert_eq!(link.mode & S_IFMT, S_IFLNK);
+        assert!(fs.lstat("/missing").unwrap().is_none());
         assert!(matches!(
             fs.read_file("/via/hello", 64),
             Err(Ext4Error::Unsupported("symlink in path"))

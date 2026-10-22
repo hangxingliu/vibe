@@ -33,6 +33,7 @@ mod control;
 mod ext4ro;
 mod gpt;
 mod image_probe;
+mod seed;
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
 const DEFAULT_CPU_COUNT: usize = 2;

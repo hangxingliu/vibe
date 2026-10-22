@@ -27,6 +27,7 @@ use vm_io::*;
 mod vm_lifecycle;
 mod vm_run;
 use vm_run::*;
+mod alpine;
 mod cache;
 mod control;
 mod ext4ro;

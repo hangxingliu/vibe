@@ -36,6 +36,7 @@ mod gpt;
 mod image_probe;
 mod maintenance;
 mod seed;
+mod vm_checks;
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
 const DEFAULT_CPU_COUNT: usize = 2;
@@ -162,6 +163,19 @@ fn provisioning_scripts_banner() -> String {
 }
 
 fn main() -> std::process::ExitCode {
+    // VM checks for the integration tests run here, on the main thread.
+    // The normal CLI never sets this.
+    if let Ok(which) = env::var("VIBE_VM_CHECK") {
+        ensure_signed();
+        match vm_checks::run(&which) {
+            Ok(()) => return std::process::ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("Error: {err}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    }
+
     // Print errors with Display so multi-line diagnostics (such as the
     // provision hint for boot failures) stay readable and copyable.
     match run_main() {

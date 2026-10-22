@@ -30,9 +30,11 @@ use vm_run::*;
 mod alpine;
 mod cache;
 mod control;
+mod disk_prepare;
 mod ext4ro;
 mod gpt;
 mod image_probe;
+mod maintenance;
 mod seed;
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
@@ -197,11 +199,14 @@ Options may appear before or after `provision`.
 `--base`, `--replace`, and `--repl` are only valid with `provision`.
 Login actions, `--no-default-mounts`, `--env`, `--mount`, `--git`, and `--ssh-key` are only valid when running a VM.
 
+`path/to/disk.raw`, when given, is booted as-is. Run time does not inspect or modify the disk. An unprepared current Debian image must be copied first with `vibe provision --base`.
+
 Options:
 
   --help                                                    Print this help message.
   --version                                                 Print the version (commit SHA and build date).
   --image NAME                                              Run: template image (ignored if `{INSTANCE_DIR_NAME}/{INSTANCE_DISK_IMAGE_NAME}` already exists).
+                                                            Run time does not inspect or modify the disk. An unprepared current Debian image must be copied first with `vibe provision --base`.
                                                             Provision: name of the image to create (default `default`).
   --cpus COUNT                                              Number of virtual CPUs (default 2).
   --ram MEGABYTES                                           RAM size in megabytes (default 2048 when running, 4096 when provisioning).
@@ -252,6 +257,9 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                                                             directly for interactive use without re-running any scripts.
   --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
   --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 4096).
+
+A new Debian base is first prepared once in a headless Alpine maintenance VM; older bases and Vibe images are used as-is.
+Set the environment variable VIBE_KEEP_FAILED_WORK=1 to keep the work copy and maintenance files of a failed provision for debugging.
 
 {}
   
@@ -354,6 +362,7 @@ Cache directory:
                 return Err(format!("Base image does not exist: {}", base_raw.display()).into());
             }
             provision_image(
+                &cache_dir,
                 &base_raw,
                 &target_image_raw,
                 replace,
@@ -396,6 +405,7 @@ Cache directory:
                 let template_raw = image_path(&cache_dir, &image);
                 if image == DEFAULT_IMAGE_NAME {
                     ensure_default_image(
+                        &cache_dir,
                         &base_raw,
                         &base_compressed,
                         &template_raw,

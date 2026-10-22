@@ -26,7 +26,7 @@ This forked version introduces several core improvements, focusing on custom env
 6. **Guest Environment & I/O Optimizations**:
     - Automatically syncs host configurations (like `~/.tmux.conf`) to the guest VM on boot, and provisions clean `.profile` and `.bash_logout` setups.
 
-CLI parsing unit tests live in `src/tests.rs` (a `#[cfg(test)]` module of the binary) and run as part of `cargo test`.
+CLI parsing unit tests live in the `#[cfg(test)] mod tests` at the end of `src/main.rs` and run as part of `cargo test`.
 
 ---
 

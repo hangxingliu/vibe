@@ -43,19 +43,7 @@ curl -fsSL https://x.ai/cli/install.sh | bash
 curl -fsSL https://gh.io/copilot-install | bash
 ```
 
-
-
-## Disk Image Files Explanation
-
-- **Base Image**: A raw Debian 13 "trixie" (testing) nocloud image downloaded from the official Debian cloud repository. It is decompressed and stored in the global cache directory (`~/.cache/vibe/`).
-- **Default Image**: A copy of the base image that is resized to 10 GB and provisioned using `provisioning/base.sh`. The provisioning includes:
-  - Expanding the disk partition and filesystem.
-  - Installing system packages (`build-essential`, `curl`, `git`, `ripgrep`, `vim`, `htop`, `tmux`, etc.).
-  - Setting up development environments (Rust via `rustup`, `mise`, `node`, `uv`).
-  - Configuring optional proxy settings.
-  It is also stored in the global cache directory and acts as a reusable template for all projects.
-- **Instance Image (`.vibe/instance.raw`)**: A local copy of the **Default Image** created within the project's directory. This is the actual disk used by the VM, ensuring that each project has its own isolated, persistent state.
-
+Disk images, how a VM boots, and how a new Debian base is prepared are described in [docs/how-vm-boot.md](docs/how-vm-boot.md).
 
 ## \[DEPRECATED\] Configure Gemini Cli
 

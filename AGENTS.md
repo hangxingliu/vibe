@@ -8,35 +8,41 @@ Vibe is a lightweight, zero-configuration tool designed to spin up Linux virtual
 - **Core Technology:** Built with **Rust** using Apple's **Virtualization framework** (via `objc2` interop).
 - **Guest OS:** Uses a **Debian Linux** (nocloud) base image, optimized for fast boot (~10s).
 - **Architecture:**
-    - **Single Binary:** The entire tool is a single binary (< 1MB).
+    - **Single Binary:** The entire tool is a single binary. The `vibe-usernet` network helper and the provisioning scripts are embedded in it.
     - **Direct Console:** Attaches the host terminal directly to the VM's serial console.
     - **Directory Sharing:** Uses **VirtioFS** for high-performance directory sharing between host and guest.
-    - **Networking:** Includes a bundled C-based `vmnet-helper` (in `vendor/vmnet-helper`) for reliable NAT and bridged networking, bypassing limitations in macOS's default virtualization networking.
+    - **Networking:** The default `nat` mode spawns the bundled Go user-mode network helper `vibe-usernet` (built from `helpers/vibe-usernet` on top of the `helpers/gvisor-tap-vsock` submodule), which survives host network changes. `vznat` uses Apple's `VZNATNetworkDeviceAttachment` instead.
+- **Disk preparation:** New Debian nocloud images no longer ship an empty root password and stop in firstboot. `vibe provision` (including the implicit first `default.raw`) processes its private work copy of the base once in a headless Alpine maintenance VM (clear `/etc/machine-id`, empty the root password field) before running scripts. Running a disk (`disk.raw`, `.vibe/instance.raw`, `--image`) never probes or modifies it.
 - **Security:** Automatically signs itself with the `com.apple.security.virtualization` entitlement if missing.
 
 ## Key Files & Directories
 
-- `src/main.rs`: Entry point, CLI parsing (via `lexopt`), help text, and `main()` dispatch for run/provision (project directory shares and login actions).
-- `src/vm_io.rs`: Host terminal and console I/O: `OutputMonitor` (cancellable waits returning `WaitResult::{Found, Timeout, Closed}`, `wait_for_any`, `close()`), `spawn_vm_io`, raw mode, and terminal resize forwarding.
-- `src/vm_config.rs`: Virtualization framework configuration (`create_vm_configuration`, EFI variable store, disk, VirtioFS shares, serial ports).
-- `src/vm_lifecycle.rs`: Starting a configured VM (`start_vm`) and requesting it to stop (`request_stop`).
-- `src/vm_run.rs`: `run_vm()`: boots a disk, performs the root login and internal setup, then runs the login actions. Returns a `RunOutcome` (all actions completed, VM stopped normally); fails with a `[boot]`/`[login]` diagnostic when the VM never reaches a root shell. It closes the `OutputMonitor` before joining the actions thread, so the host exits promptly when the guest powers off.
-- `src/session.rs`: `LoginAction`, the login actions thread, `legacy_login_prefix()` (root login, `Password:` detection, readiness probe, internal setup), `LoginFailure` diagnostics, `DiskSource` and `needs_provision_hint()`, and helpers that build guest shell commands.
-- `src/images.rs`: Base image download and verification, image names/paths, and instance disks.
-- `src/provision.rs`: Provisioning flow (`ensure_default_image`, `provision_image`).
-- `src/gpt.rs`: Read-only GPT parser (`read_gpt`, `select_layout`, `scan_labels`) and filesystem label probes for ext4, FAT, and ISO9660. Not called from the boot path yet (`TODO(T18)`, `TODO(T21)`, `TODO(T28)`).
-- `src/ext4ro.rs`: Bounded read-only ext4 reader (`Ext4Ro::open`, `read_file`) using `pread`. Symlinks are returned and not followed. Not called from the boot path yet (`TODO(T28)`).
-- `src/control.rs`: Maintenance control frames (`PREP-READY`, `PREP-STEP`, `PREP-RESULT`), incremental `FrameReader`, and `new_nonce`. Not called from the boot path yet (`TODO(T21)`).
-- `src/cache.rs`: `FileLock` (`flock`), exclusive temp files, `clonefile` with a copy fallback, same-directory `replace`, and `sweep_stale`. Not called from the boot path yet (`TODO(T18)`, `TODO(T28)`).
-- `src/image_probe.rs`: `probe_disk`, pure `classify`, and `verify_processed`. Shadow plaintext is not stored. Not called from the boot path yet (`TODO(T21)`, `TODO(T28)`).
-- `src/tests.rs`: Unit tests for CLI parsing. Declared from `main.rs` as `#[cfg(test)] mod tests`, so the file is part of the binary crate (and can call private parsers) and is compiled only for `cargo test`.
+- `src/main.rs`: Entry point, CLI parsing (via `lexopt`), help text, and `main()` dispatch for run/provision (project directory shares and login actions). Its `#[cfg(test)] mod tests` covers CLI parsing.
+- `src/vm_io.rs`: Host terminal and console I/O: `OutputMonitor` (cancellable waits returning `WaitResult::{Found, Timeout, Closed}`, `wait_for_any`, `close()`), `spawn_vm_io`, raw mode, terminal resize forwarding, and the input gate (`decide_user_input`: discard keystrokes until automatic actions finish; two consecutive Ctrl-C bytes while the gate is closed request a stop).
+- `src/vm_config.rs`: Virtualization framework configuration. `VmSpec` (`DiskSpec`, `SerialRole`, `ShareDevice`), `create_vm_configuration`, `default_interactive_spec` (the historical single-disk interactive layout), EFI variable store, and `nsurl_from_path`.
+- `src/vm_lifecycle.rs`: Starting a configured VM (`start_vm`), requesting a stop (`request_stop`), forcing a stop (`force_stop`), and `run_headless` (log file, control frames, phase deadlines).
+- `src/vm_run.rs`: `run_vm()`: boots a disk, performs the root login and internal setup, then runs the login actions. Returns a `RunOutcome` (all actions completed, VM stopped normally, and the prefix of the caller action that was still running); action errors use `[action N: label]` (N counts the caller's actions from 1), Ctrl-C and forced stops use `[shutdown]`, and VM configuration or start errors use `[boot]`; fails with a `[boot]`/`[login]` diagnostic when the VM never reaches a root shell. It closes the `OutputMonitor` before joining the actions thread, so the host exits promptly when the guest powers off. `drive_interactive` is shared with `src/vm_checks/devices.rs`.
+- `src/session.rs`: `LoginAction`, the login actions thread, `legacy_login_prefix()` (root login, `Password:` detection, readiness probe, internal setup), `LoginFailure` diagnostics, `LoginAction::label()` and `action_prefix()` (never include `--send` text, which may hold env values), `DiskSource` and `needs_provision_hint()`, and helpers that build guest shell commands.
+- `src/images.rs`: Base image download and verification, image names/paths, and instance disks. `fetch_verified` and `extract_disk_raw` are shared with the Alpine cache. The Debian download keeps its size check; its errors use the `[download]` prefix.
+- `src/alpine.rs`: Pinned Alpine maintenance image (`ensure_alpine_image`): download, SHA-512, extract, and check partition 2's ext4 UUID. The cached raw is a read-only input. Errors use the `[download]` prefix.
+- `src/seed.rs`: NoCloud seed ISO (`build_seed`, `Manifest::serialize`). Writes `meta-data`, `user-data`, and `manifest` (`policy=minimal`), then `hdiutil makehybrid` with volume name `cidata`.
+- `src/guest/maint.sh`: POSIX maintenance script run by tiny-cloud as `user-data`. Clears `/etc/machine-id` and the root password field. It does not print shadow contents.
+- `src/maintenance.rs`: `process_disk`: host safety checks, Alpine clone, seed ISO, headless maintenance VM, step-order checks, log publish, and `verify_processed`. `PrepareError` displays as `[prepare] <stage> (last PREP-STEP: ...)` or, for the host re-check, `[verify] host-verify`, followed by the published log path and, with `VIBE_KEEP_FAILED_WORK=1`, the kept `maint/<pid>-<nonce>/` directory. Provision calls it from `ensure_bootable`. The run path does not.
+- `src/disk_prepare.rs`: `ensure_bootable` for a provision work copy: probe, skip or warn (`[probe]` warning for unsupported disks), or run Alpine maintenance. Not used by run.
+- `src/provision.rs`: Provisioning flow (`ensure_default_image`, `provision_image`). Copies the base, calls `ensure_bootable` before growing the disk, then clears `/etc/machine-id` before publish. Errors use `[prepare]`, `[action N: label]`, `[shutdown]`, and `[verify]`. With `VIBE_KEEP_FAILED_WORK=1` a failed work copy `<name>.tmp.<pid>` is kept and its path is printed; otherwise it is removed.
+- `src/gpt.rs`: Read-only GPT parser (`read_gpt`, `select_layout`, `scan_labels`) and filesystem label probes for ext4, FAT, and ISO9660. Alpine unpack, maintenance, and provision (through `ensure_bootable`) call it. The run path does not.
+- `src/ext4ro.rs`: Bounded read-only ext4 reader (`Ext4Ro::open`, `read_file`, `lstat`) using `pread`. Symlinks are returned and not followed. Provision reads through `image_probe`. The run path does not.
+- `src/control.rs`: Maintenance control frames (`PREP-READY`, `PREP-STEP`, `PREP-RESULT`), incremental `FrameReader`, and `new_nonce`. `run_headless` feeds hvc1 to `FrameReader`. Step order is enforced by `maintenance::observe_frame`.
+- `src/cache.rs`: `FileLock` (`flock`), exclusive temp files, `clonefile` with a copy fallback, same-directory `replace`, `private_dir`, and `sweep_stale`. Alpine download takes `alpine.lock`. Maintenance locks the work copy through a sibling `{disk}.lock` (the disk image itself is not flocked; Virtualization.framework attaches it) and clones the Alpine raw into `maint/<pid>-<nonce>/`. `ensure_bootable` calls that path and then removes the sibling lock file.
+- `src/image_probe.rs`: `probe_disk`, pure `classify`, and `verify_processed`. Shadow plaintext is not stored. `process_disk` re-checks with `verify_processed`. Provision probes its work copy and the finished image. The run path does not call it. `VIBE_TRACE_PROBE` logs each call for tests.
 - `tests/fixtures/make-ext4.sh`: Rebuilds the small gzip ext4 images used by the `ext4ro` and `image_probe` tests.
-- `src/networking.rs`: Logic for setting up NAT, bridged, and `vmnet-helper` networking backends.
+- `src/networking.rs`: `NetworkMode` (`Nat` through the embedded `vibe-usernet` helper, `VzNat` through Apple's NAT attachment), proxy and DNS options, and port publishing.
+- `src/vm_checks/`: VM checks for the `#[ignore]` integration tests, selected with `VIBE_VM_CHECK` and run by `main()` on the process main thread (Virtualization.framework needs it; `cargo test` threads are not the main thread). `devices.rs` (`read-only-disk`, `headless-timeout`), `maintenance.rs` (`maintenance-<name>`, for example `maintenance-all`), and `prepare.rs` (`probe`, `prepare` on `VIBE_VM_CHECK_DISK` with the Alpine cache at `VIBE_VM_CHECK_CACHE`). Not part of the CLI.
 - `provisioning/base.sh`: Shell script used to initialize the default Debian image with essential tools (gcc, rust, mise, etc.).
 - `src/bashrc.sh`: Guest-side bash configuration.
 - `src/entitlements.plist`: Entitlements required for macOS virtualization.
-- `build.rs`: Compiles the bundled `vmnet-helper` and embeds version info.
-- `vendor/vmnet-helper/`: Vendored C code for the networking helper.
+- `build.rs`: Builds the Go `vibe-usernet` helper with `go build` (a stub on non-Apple hosts), embeds it and the provisioning scripts, and records the git SHA and build date.
+- `helpers/vibe-usernet/`, `helpers/gvisor-tap-vsock/`: Source of the user-mode network helper (the latter is a git submodule).
 
 ## Building and Running
 
@@ -48,7 +54,7 @@ Vibe is a lightweight, zero-configuration tool designed to spin up Linux virtual
 ### Commands
 - **Build:** `cargo build --release`
 - **Run:** `cargo run -- [OPTIONS] [disk-image.raw]`
-- **Test:** `cargo test` (CLI parsing is covered by unit tests in `src/tests.rs`; `OutputMonitor` and the login/actions logic have `#[cfg(test)] mod tests` in `src/vm_io.rs` and `src/session.rs`; GPT, ext4, control frames, cache helpers, and image classification have `#[cfg(test)] mod tests` in `src/gpt.rs`, `src/ext4ro.rs`, `src/control.rs`, `src/cache.rs`, and `src/image_probe.rs`. Real disk images are `#[ignore]` and need `VIBE_TEST_DEBIAN_NEW_RAW`, `VIBE_TEST_DEBIAN_OLD_RAW`, and `VIBE_TEST_ALPINE_RAW`. Booting VMs is integration-heavy and requires a Mac host).
+- **Test:** `cargo test` (CLI parsing is covered by `#[cfg(test)] mod tests` in `src/main.rs`; `OutputMonitor`, the input gate, and the login/actions logic have `#[cfg(test)] mod tests` in `src/vm_io.rs` and `src/session.rs`; GPT, ext4, control frames, cache helpers, and image classification have `#[cfg(test)] mod tests` in `src/gpt.rs`, `src/ext4ro.rs`, `src/control.rs`, `src/cache.rs`, and `src/image_probe.rs`; `VmSpec` shape and headless phase deadlines have tests in `src/vm_config.rs` and `src/vm_lifecycle.rs`; Alpine cache, seed manifest, and maintenance step order have tests in `src/alpine.rs`, `src/seed.rs`, and `src/maintenance.rs`. Prepare decisions and the machine-id finalize scripts have tests in `src/disk_prepare.rs` and `src/provision.rs`. Real disk images are `#[ignore]` and need `VIBE_TEST_DEBIAN_NEW_RAW`, `VIBE_TEST_DEBIAN_OLD_RAW`, and `VIBE_TEST_ALPINE_RAW`. Booting VMs is integration-heavy and requires a Mac host; `tests/vm_devices.rs` (`VIBE_VM_CHECK=read-only-disk|headless-timeout`), `tests/alpine_maintenance.rs` (`VIBE_VM_CHECK=maintenance-all`), and `tests/disk_prepare.rs` (`VIBE_VM_CHECK=prepare`) are `#[ignore]` and spawn the `vibe` binary so the check runs on its main thread. The maintenance checks use e2fsprogs from `VIBE_E2FS_SBIN` or `PATH`; `tests/fixtures/make-ext4.sh` uses the same tools).
 
 ## Development Conventions
 

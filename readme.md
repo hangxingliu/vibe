@@ -149,17 +149,20 @@ If you don't want this, you can make your own `.raw` disk images and copy them i
 Vibe is a quick way to spin up a Linux virtual machine on Mac to sandbox LLM agents.
 
 vibe [OPTIONS] [LOGIN-ACTIONS ...] [path/to/disk.raw]
-vibe provision [OPTIONS] [PROVISIONING_OPTIONS] [@built-in | path/to/script.sh ...]
+vibe provision [OPTIONS] [PROVISIONING-OPTIONS] [@built-in | path/to/script.sh ...]
 
 Options may appear before or after `provision`.
 `--base`, `--replace`, and `--repl` are only valid with `provision`.
 Login actions, `--no-default-mounts`, `--env`, `--mount`, `--git`, and `--ssh-key` are only valid when running a VM.
+
+`path/to/disk.raw`, when given, is booted as-is. Run time does not inspect or modify the disk. An unprepared current Debian image must be copied first with `vibe provision --base`.
 
 Options:
 
   --help                                                    Print this help message.
   --version                                                 Print the version (commit SHA and build date).
   --image NAME                                              Run: template image (ignored if `.vibe/instance.raw` already exists).
+                                                            Run time does not inspect or modify the disk. An unprepared current Debian image must be copied first with `vibe provision --base`.
                                                             Provision: name of the image to create (default `default`).
   --cpus COUNT                                              Number of virtual CPUs (default 2).
   --ram MEGABYTES                                           RAM size in megabytes (default 2048 when running, 4096 when provisioning).
@@ -211,6 +214,9 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
   --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
   --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 4096).
 
+A new Debian base is first prepared once in a headless Alpine maintenance VM; older bases and Vibe images are used as-is.
+Set the environment variable VIBE_KEEP_FAILED_WORK=1 to keep the work copy and maintenance files of a failed provision for debugging.
+
 Built-in provisioning scripts:
 
   @claude     Install Anthropic's Claude.
@@ -247,7 +253,8 @@ Built-in provisioning scripts:
 
 - MacOS only lets binaries signed with the `com.apple.security.virtualization` entitlement run virtual machines, so `vibe` checks itself on startup and, if necessary, signs itself using `codesign`. SeCuRiTy!
 
-- Debian "nocloud" is used as a base image because it boots directly to a root prompt.
+- Debian "nocloud" is used as a base image because it historically booted directly to a root prompt.
+  Newer nocloud images ask for a root password and run a firstboot wizard instead, so Vibe processes them once while provisioning (see [docs/how-vm-boot.md](docs/how-vm-boot.md)).
   The other images use [cloudinit](https://cloudinit.readthedocs.io/en/latest/), which I found much more complex:
   - Network requests are made during the boot process, and if you're offline they take several *minutes* to timeout before the login prompt is reached (thanks, `systemd-networkd-wait-online.service`).
   - Subsequent boots are much slower (at least, I couldn't easily figure out how to remove the associated cloud init machinery).

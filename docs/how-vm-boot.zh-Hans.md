@@ -1,0 +1,332 @@
+# 虚拟机如何启动
+
+Vibe 提供了两个用于启动虚拟机的命令。`vibe`（以及 `vibe path/to/disk.raw`）将终端附加到现有的 raw 磁盘，并保持该文件不变。`vibe provision` 则将基础镜像复制到专用的工作文件中，可能对该副本进行一次性预处理，随后启动该副本、运行脚本，并将其发布为命名模板。
+
+这两个命令最终都会进入相同的交互式启动流程：即 `src/vm_run.rs` 中的 `run_vm`。磁盘检查和 Alpine 维护虚拟机仅在启动前由 `provision_image`（`src/provision.rs`）在工作副本上执行。
+
+```mermaid
+flowchart TD
+  main["src/main.rs 中的 main()"] --> check{"是否设置了 VIBE_VM_CHECK？"}
+  check -->|是| checks["vm_checks::run"]
+  check -->|否| runmain["run_main()"]
+  runmain --> cmd{"CliCommand"}
+  cmd -->|Run| disk["解析磁盘，构建共享与登录操作"]
+  cmd -->|"Provision --repl，镜像已存在"| runvm
+  cmd -->|Provision| copy["provision_image：复制基础镜像到 name.tmp.pid"]
+  copy --> prep["ensure_bootable"]
+  prep --> grow["将 raw 文件扩容至 12 GiB"]
+  grow --> runvm["run_vm"]
+  disk --> runvm
+  runvm --> spec["default_interactive_spec"]
+  spec --> cfg["create_vm_configuration"]
+  cfg --> start["start_vm"]
+  start --> login["legacy_login，随后执行 setup 及调用方操作"]
+  prep -->|需要准备| alpine["process_disk：无头 Alpine 虚拟机"]
+  alpine --> grow
+```
+
+Virtualization.framework 的完成处理程序（completion handler）在进程主线程上运行。因此，当设置了 `VIBE_VM_CHECK` 时，`main` 会在解析 CLI 之前调用 `vm_checks::run`。常规 CLI 从不设置该变量。`ensure_signed`（`src/main.rs`）会检查 `com.apple.security.virtualization` 权限；如果缺失，则使用 `src/entitlements.plist` 对二进制文件执行 `codesign` 代码签名并重新执行。
+
+## 磁盘文件
+
+`run_main` 将所有缓存文件存放在 `$XDG_CACHE_HOME/vibe` 下；如果未设置 `XDG_CACHE_HOME`，则存放在 `~/.cache/vibe` 下。
+
+| 文件 | 创建者 | 作用 |
+| --- | --- | --- |
+| `debian-13-nocloud-arm64-20261001-2618.tar.xz` | `ensure_base_image` | 已下载的 Debian 基础归档包。 |
+| `debian-13-nocloud-arm64-20261001-2618.raw` | `extract_disk_raw` | 解压后的基础镜像。归档内的成员文件为 `disk.raw`。该文件从不被修改。 |
+| `alpine-3.24.2-aarch64-tiny-r1.raw.tar.gz` 与 `.raw` | `ensure_alpine_image` | 固定版本的 Alpine 维护镜像。仅在工作副本需要预处理时下载。 |
+| `alpine.lock` | `FileLock::acquire` | 串行化 Alpine 的下载和解压流程。 |
+| `<name>.raw` | `provision_image` | 已发布的模板。省略 `--image` 时使用的模板为 `default.raw`。 |
+| `<name>.tmp.<pid>` | `provision_image` | 专用工作副本。仅在配置（provision）成功后才会重命名覆盖为 `<name>.raw`。 |
+| `<name>.tmp.<pid>.lock` | `FileLock::try_acquire_existing` | 维护虚拟机的同级锁文件。磁盘镜像本身不加 flock 锁，否则 Virtualization.framework 会拒绝附加该磁盘。 |
+| `maint/<pid>-<nonce>/` | `process_disk` | 单次维护运行环境：Alpine 克隆、seed ISO、EFI 变量存储、控制台日志。 |
+| `logs/maint-<unix>-<pid>.log` | `publish_log` | 已发布的维护控制台日志。仅保留最新的 5 个日志。 |
+| `vibe-usernet` | `ensure_usernet_helper_extracted` | 内置的用户态网络辅助程序，在缓存字节不一致时写出。 |
+| `.vibe/instance.raw` | `ensure_instance_disk` | 项目专属磁盘，从模板复制一次生成。这是常规 `vibe` 启动的文件。 |
+| `.vibe/vibe-usernet.log` | `NetworkMode::prepare` | 项目实例的辅助程序日志。外部的 `path/to/disk.raw` 不会生成此日志。 |
+| `$TMPDIR/efi_variable_store_<pid>.efivars` | `default_efi_vars_path` | 交互式虚拟机的 EFI 变量存储。每次启动时以 `AllowOverwrite` 重新创建。 |
+
+### Debian 基础镜像
+
+`src/images.rs` 中的 `DEBIAN_COMPRESSED_DISK_URL` 是 Debian 13 "trixie" nocloud arm64 镜像 `20261001-2618`。当 `.raw` 文件已存在时，`ensure_base_image` 会立即返回。否则，当归档文件缺失或小于 `DEBIAN_COMPRESSED_SIZE_BYTES` 时，它会通过 `curl` 下载，使用 `verify_sha512`（`/usr/bin/shasum`）校验 SHA-512，并通过 `extract_disk_raw` 解压（数据先写入同级临时文件，然后通过 `cache::replace` 替换）。失败信息会带上 `[download]` 前缀。
+
+在未指定 `--base` 进行配置时，`run_main` 会调用 `ensure_base_image`；在构建第一个 `default.raw` 之前，`ensure_default_image` 也会再次调用它。
+
+### Alpine 维护镜像
+
+`src/alpine.rs` 中的 `ALPINE_IMAGE_NAME` 是 `alpine-3.24.2-aarch64-tiny-r1`。归档的 URL 和 SHA-512 分别为 `ALPINE_ARCHIVE_URL` 和 `ALPINE_ARCHIVE_SHA512`。归档大小约为 66 MB。解压后的 raw 文件是一个约 1 GiB 的稀疏文件。
+
+`ensure_alpine_image` 会持有 `alpine.lock`，随后执行 `ensure_locked`：
+
+1. 损坏的归档会被删除，并通过 `images::fetch_verified` 重新获取（下载为 `.part`，校验 SHA-512，重命名）。
+2. `extract_disk_raw` 发布 `{name}.raw`。
+3. `alpine_root_uuid_matches` 要求分区 2（`ALPINE_ROOT_PART`）必须是 UUID 为 `ALPINE_ROOT_FS_UUID` 的 ext4。Alpine 通过标签 `/` 寻找自身的根目录。
+
+如果存在有效的 raw 文件和有效的归档，则不会发起网络请求。缓存的 raw 文件作为只读输入。`run_maintenance` 通过 `cache::clone_file`（优先使用 APFS clone，失败时回退到复制）将其克隆到维护目录中，并启动该克隆副本。Alpine 镜像绝不会用作用户虚拟机的磁盘。被 `classify` 判定为兼容旧版（legacy compatible）的工作副本绝不会下载它。
+
+### 命名模板与项目实例
+
+`image_path` 将名称映射到 `{cache}/{name}.raw`。名称必须为 ASCII 字母数字以及 `-` 和 `_`（`assert_valid_image_name`）。
+
+`provision_image` 按以下步骤构建模板：
+
+1. 使用 `fs::copy` 将基础镜像复制到 `{name}.tmp.{pid}` 并赋予用户写入权限。基础镜像文件保持原样。
+2. 保持副本的原始大小，在该副本上执行 `ensure_bootable`。如果预先扩容文件，会导致维护清单（manifest）与分区表不一致。
+3. 如果副本小于 `DEFAULT_DISK_SIZE`（`DEFAULT_DISK_GB` 为 12，即 12 GiB），则通过 `set_len` 进行扩容。额外增加的字节为稀疏分配。
+4. 启动该副本并运行脚本。`provisioning/base.sh` 始终最先执行。它安装基础软件包，然后运行 `growpart /dev/vda 1` 和 `resize2fs /dev/vda1`。
+5. 清空 `/etc/machine-id`，通过 `probe_disk` 确认清空，然后通过 `fs::rename` 将工作副本重命名为 `<name>.raw`。
+
+`ensure_default_image` 会针对 `default.raw` 配合所有内置脚本执行一次此流程。已存在的 `default.raw` 会被立即返回，且不会再次探测。在没有实例磁盘的项目中，当 `--image` 为 `default`（或省略）时，首次执行普通的 `vibe` 会调用 `ensure_default_image`。
+
+当 `.vibe/instance.raw`（`INSTANCE_DIR_NAME`，`INSTANCE_DISK_IMAGE_NAME`）不存在时，`ensure_instance_disk` 会将所选模板复制到该文件。后续运行则直接按原样启动该实例。一旦 `.vibe/instance.raw` 存在，`vibe --image NAME` 参数将被忽略（当 `NAME` 不是 `default` 时，`run_main` 会打印提示信息）。
+
+位置参数指定的 `path/to/disk.raw` 会直接按原样启动（`DiskSource::External`）。它不会创建 `.vibe/instance.raw`，也不会读取缓存模板。
+
+每个发布的镜像都具有空的 `/etc/machine-id` 和空的 root 密码字段。因此，每个实例都会在首次启动时生成自己的 machine id，并在重启后保持不变。root 密码字段保持为空，与早期的 nocloud 镜像一致。
+
+## 从 CLI 到运行中的客户机
+
+### `run_main`
+
+`parse_cli`（`lexopt`）用于填充 `CliArgs`。`run_main` 负责创建缓存目录，通过 `create_cache_share` 构建 `DEFAULT_CACHE_SHARES`，调用 `ensure_signed`，并准备一个包裹 `NetworkMode::prepare` 的闭包。
+
+在 `nat` 模式下，`guest_proxy` 为 `None`：`vibe-usernet` 辅助程序自身会应用 `--proxy`，因此客户机不会额外接收代理环境变量。在 `vznat` 模式下，`--proxy` 的 URL 会被传递到配置脚本和登录环境变量导出中。
+
+### Run 命令
+
+`run_main` 中的 `CliCommand::Run` 处理流程如下：
+
+1. 按照上文所述解析磁盘。`DiskSource` 为 `External` 或 `Instance`。仅针对实例磁盘时，网络日志目录才为 `.vibe/`。
+2. 除非指定了 `--no-default-mounts`：将项目目录挂载共享到 `/root/<project>`（`is_project_dir`），使用 tmpfs 遮蔽 `.vibe`，使用绑定挂载的空文件遮蔽 `.env`；当宿主机目录存在时从缓存共享 `node_modules`；根据 `--git` 参数共享或遮蔽 `.git`（默认为只读；如果是子模块中的 `.git` 文件则跳过）；然后追加缓存共享、Agent 配置目录（`codex`、`copilot`、`claude`、`gemini`、`pi`、`grok`、`opencode`）以及宿主机上存在的 `~/.tmux`。宿主机的 `~/.tmux.conf` 会作为一个写入 `/root/.tmux.conf` 的 `Send` 动作排队执行。
+3. 追加宿主机的 `--env` 导出变量（`env_login_actions`）、`HISTFILE`、共享目录表（`motd_login_action`）、设置了 `guest_proxy` 时的代理导出，以及 `--ssh-key` 命令（`authorized_keys`、`systemctl start ssh`、`ip -4 -br addr`）。
+4. 追加用户的 `--script`、`--send` 和 `--expect` 动作。`user_actions` 记录了它们的索引范围，以便后续报错时仅针对这些动作编号。
+5. 调用 `run_vm`。
+
+### Provision 命令
+
+`CliCommand::Provision` 处理流程如下：
+
+- 带 `--repl` 且镜像已存在、同时未指定 `--replace` 时，打印一行提示并对该镜像调用 `run_vm`（`DiskSource::CachedImage`）。不运行任何脚本，也不探测该镜像。
+- 否则解析 `--base`。包含 `/` 的值表示文件系统路径。不含 `/` 的值代表缓存中的 `image_path`。未指定 `--base` 时，由 `ensure_base_image` 提供 Debian raw 镜像。
+- 调用 `provision_image`。
+
+除非指定了 `--replace`，否则 `provision_image`（`src/provision.rs`）会拒绝覆盖已存在的 `<name>.raw`。它会复制基础镜像，调用 `ensure_bootable`，扩容文件，随后构建登录动作：
+
+1. 一个导出 `VIBE_PROVISION_IMAGE`、`VIBE_PROVISION_BASE`、`VIBE_GIT_SHA`、`VIBE_BUILD_DATE` 和 `VIBE_PROVISION_SCRIPTS` 的 `Send` 动作。
+2. `Script` 动作：首先是来自 `build_provision_script` 的 `@base`（如果设置了 `guest_proxy`，则填充 `provisioning/base.sh` 中的 `INJECT_PROXY_CODE` 区域），然后是其他额外脚本。此范围属于 `user_actions`，因此脚本执行失败会显示为 `[action N: script '...']`。
+3. `finalize-machine-id`。未指定 `--repl` 时，执行 `CLEAR_MACHINE_ID_SCRIPT`，它会拒绝挂载覆盖（mount overlay）或符号链接，并截断清空 `/etc/machine-id` 及常规的 `/var/lib/dbus/machine-id`。指定了 `--repl` 时，执行 `REPL_FINALIZE_SCRIPT`：在 `/run` 下创建一个临时的 `vibe-finalize-template` unit，在关机时清空 id，以便当前打开的 shell 仍保留 systemd 在启动时写入的 id。
+4. 针对 `VIBE_PROVISION_SUCCESS` 的 `Send` / `Expect` 动作。
+5. 未指定 `--repl` 时，执行 `systemctl poweroff; sleep 100`。指定了 `--repl` 时，`run_vm` 会打印交互提示并等待用户退出。
+
+调用 `run_vm` 时传入 `disk_source: None`，因此本次启动失败不会追加“配置此磁盘（provision this disk）”的提示。虚拟机停止后，如果动作未完成或最终状态不是 `Stopped`，`incomplete_run_error` 会拒绝该次运行。随后 `probe_disk` 必须报告 `MachineIdFact::EmptyFile`，否则会报错 `[verify]` 且镜像不会被发布。最后通过 `fs::rename` 发布该工作副本。
+
+除非设置了 `VIBE_KEEP_FAILED_WORK=1`，否则任何错误都会删除 `<name>.tmp.<pid>`。失败的配置绝不会发布残缺的镜像。`failed_work_message` 会打印保留的路径，或提示你设置该环境变量。
+
+## 交互式启动
+
+`run_vm` 打印磁盘、CPU 核心数和内存大小，然后调用 `drive_interactive`。对于普通运行，默认配置为 2 核 CPU 和 2048 MiB 内存（`DEFAULT_CPU_COUNT`，`DEFAULT_RAM_BYTES`）。配置流程默认使用 2 核 CPU 和 4096 MiB 内存（`DEFAULT_PROVISION_RAM_BYTES`），除非显式设置了 `--cpus` 或 `--ram`。
+
+### 配置与启动
+
+1. `create_pipe`（`src/vm_io.rs`）构建三对套接字：客户机读取的字节（宿主机按键和输入的动作）、客户机写入的字节（控制台输出），以及客户机在第二个串口上读取的终端窗口调整大小字节。
+2. `prepare_network_backend` 调用 `NetworkMode::prepare`（`src/networking.rs`）。`nat` 模式会解压 `vibe-usernet`，通过数据报套接字对和存活管道启动它，并返回 `PreparedNetworkBackend::Usernet`。`vznat` 模式返回 `PreparedNetworkBackend::VzNat` 且不启动辅助程序。传入日志目录时，辅助程序的 stderr 会输出到 `vibe-usernet.log`。
+3. `default_interactive_spec`（`src/vm_config.rs`）构建一个 `VmSpec`：一个可写的 `DiskSpec`（客户机 `vda`）、网络后端、存在共享目录时打上 `shared` 标签（`SHARED_DIRECTORIES_TAG`）的 VirtioFS 设备、串口角色先为 `Terminal` 后为 `Resize`、临时 EFI 存储路径，以及 CPU 和内存大小。串口顺序与客户机内部顺序一致：`hvc0` 为控制台，`hvc1` 为窗口大小调整通道。
+4. `create_vm_configuration` 将该规格转换为 `VZVirtualMachineConfiguration`：
+   - `VZGenericPlatformConfiguration` 与 `VZEFIBootLoader`。仅支持 EFI 引导。
+   - `load_efi_variable_store` 创建变量存储。
+   - Virtio 网络：在 usernet 套接字上绑定 MAC 地址为 `USERNET_MAC_ADDRESS` 的 `VZFileHandleNetworkDeviceAttachment`，或者使用 `VZNATNetworkDeviceAttachment`。
+   - `VZVirtioEntropyDeviceConfiguration`。
+   - 每个磁盘对应一个 `VZVirtioBlockDeviceConfiguration`（`VZDiskImageCachingMode::Cached`，`VZDiskImageSynchronizationMode::Full`）。
+   - 用于共享目录的 `VZVirtioFileSystemDeviceConfiguration` / `VZMultipleDirectoryShare`。
+   - 每个串口对应一个 `VZVirtioConsoleDeviceSerialPortConfiguration`。
+   - `validateWithError`。磁盘缺失会在 `initWithURL` 中失败，并由 `disk_attachment_error` 进行报告。
+5. `start_vm`（`src/vm_lifecycle.rs`）在主调度队列上创建 `VZVirtualMachine`，调用 `startWithCompletionHandler`，并持续驱动 `NSRunLoop`，直到处理程序触发或超时 `START_TIMEOUT`（60 秒）。
+
+在 `drive_interactive` 中，`create_vm_configuration` 和 `start_vm` 的错误会加上 `[boot]` 前缀。随后宿主机打印 `VM booting...`。
+
+### 控制台 I/O 与登录线程
+
+`spawn_vm_io` 启动终端线程。客户机的输出会被复制到宿主机终端并输入到 `OutputMonitor`（`wait_for_text`、`wait_for_any`、`wait_for_line_after` 返回 `Found`、`Timeout` 或 `Closed`）。stdin 线程调用 `decide_user_input`：在 `input_open` 设置之前按键会被丢弃，在输入门控关闭时连续按下两次 Ctrl-C 会设置 `stop_requested`。当宿主机终端大小改变时，resize 线程会向 `hvc1` 写入 `rows cols`。
+
+`drive_interactive` 构建完整的动作列表：
+
+1. `legacy_login_prefix(LOGIN_EXPECT_TIMEOUT)`，其中 `LOGIN_EXPECT_TIMEOUT` = 120 秒。
+2. 存在共享目录时：执行 `mkdir -p /mnt/shared`、`mount -t virtiofs shared /mnt/shared`，然后为每个共享执行 `mkdir` 和 `mount --bind`。
+3. 来自 `run_main` 或 `provision_image` 的调用方动作。
+4. 尾部两个 `Send` 动作：当命令存在时激活 `mise` 和 `fzf`。
+
+`action_prefix` 标记每个索引。用户范围内的动作用 `[action N: ...]` 标记，从 1 开始计数。该范围之后的调用方动作（provision 的收尾与关机）标记为 `[shutdown] ...`。调用方范围之前的动作以及位于其后的尾部 `mise` 和 `fzf` 发送动作均标记为 `[login] setup ...`。`Send` 动作的 `LoginAction::label` 为单词 `send`，不包含实际输入的文本。
+
+`spawn_login_actions_thread`（`src/session.rs`）在后台线程上运行该列表，并通过通道报告 `VmOutput`。主线程每 0.2 秒轮询驱动一次运行循环，应用这些消息，并在动作失败或设置了 `stop_requested` 时调用 `request_stop`（错误提示为 `[shutdown] Stopped because Ctrl-C was pressed twice before setup finished.`）。`request_stop` 优先使用 `canRequestStop`，回退时使用 `stopWithCompletionHandler`。`VIBE_FORCE_STOP_AFTER_LOGIN=1` 是一个测试钩子：在 `LoginReady` 之后，`force_stop` 会使客户机文件系统保持未正常卸载的脏状态。
+
+当虚拟机离开 `Running` 状态或收到停止请求时，`output_monitor.close()` 会解除动作线程的阻塞。`drive_interactive` 等待其汇合（join），关闭 I/O 线程并返回。如果始终未达到 `LoginReady`，错误为 `LoginFailure::VmStopped`（`[boot] The VM stopped before the root login completed`）。`RunOutcome` 记录了是否所有动作均已完成、最终状态是否为 `Stopped`，以及当时仍在运行的调用方动作的前缀。
+
+### 旧版 root 登录流程
+
+`legacy_login` 实现了 `LoginAction::LegacyLogin`。这是唯一的登录路径，不存在 cloud-init 通道。
+
+1. `wait_for_text("login: ", timeout)`。`hvc0` 上为零字节则返回 `LoginFailure::NoSerialOutput`。其他超时则返回 `NoLoginPrompt`。两者均显示为 `[boot]`。
+2. 输入 `root`。
+3. 在 `Password:`、`Debian GNU/Linux` 和 `login: ` 中执行 `wait_for_any`。匹配到 `Password:` 则为 `LoginFailure::PasswordRequired`（`[login]`）。超时则为 `NoBanner`。
+4. 输入就绪探测命令。`readiness_probe_command_and_marker` 构建一个 `printf` 命令，其标记 `VIBE_READY_<nonce>` 被拆分在两个参数中，从而确保回显的命令行本身不包含完整标记。下一行必须是 `id -u` 且结果等于 `0`。其他任何情况均为 `ProbeTimeout` 或 `ProbeNotRoot`（`[login]`）。
+
+当探测返回 uid 0 时发送 `LoginReady`。在 `ActionsCompleted`（即 setup 发送、共享挂载和调用方动作均完成）之前，`input_open` 始终为 false。在此之前，键盘输入均会被丢弃。
+
+`legacy_login_prefix` 内的 setup 发送动作包括：`HISTCONTROL=ignorespace` 和 `unset HISTFILE`（使自动执行的命令不计入历史记录）、`stty -F /dev/hvc0 sane`、一个从 `/dev/hvc1` 读取 `rows cols` 并应用到 `hvc0` 的后台循环，随后通过 `write_file_into_vm` 将 `src/bashrc.sh` 写入 `/root/.profile`，并将 `src/bash_logout.sh` 写入 `/root/.bash_logout`。注销脚本在正常退出时会运行 `systemctl poweroff`。如果 shell 属于 SSH 会话、位于 tmux 内或 tmux 存在活动会话，则跳过关机。
+
+`Script` 动作（`script_command_and_status_marker`）将内容 base64 解码到 `/tmp/vibe-scripts/<id>.sh`，在 stdin 重定向自 `/dev/null` 的情况下运行该文件，并等待 `VIBE_SCRIPT_STATUS_<id>` 及其退出码。非零状态视为 `LoginActionFailed`。脚本超时时间为 24 小时。
+
+### 启动失败提示
+
+在无输出、缺少 `login:` 提示符、出现密码提示以及虚拟机在登录前停止的情况下，`suggests_provision` 均为 true。当 `disk_source` 为 `Some` 时，`needs_provision_hint` 会追加一条 `vibe provision` 命令提示。措辞保持推测性：因为运行路径并未对磁盘进行实际检查。
+
+- `DiskSource::External`：提示 `vibe provision --base <absolute disk> --image <name>`，随后在项目中运行 `vibe --image <name>`。
+- `DiskSource::Instance`：同样的 provision 命令，随后移走 `.vibe/instance.raw` 并运行 `vibe --image <name>`，以便从处理好的镜像中复制出新实例。
+- `DiskSource::CachedImage`：提示 `vibe provision --base <name> --image <new-name>`，或执行 `vibe provision --image <name> --replace` 从 Debian 基础镜像重新构建该名称。
+
+未经处理的新版 Debian 磁盘不会产生任何控制台输出（卡在初次启动向导中），并在 120 秒后触发 `NoSerialOutput`。`[boot]` 错误会包含上述命令建议。
+
+## 配置过程中的磁盘预处理
+
+`ensure_bootable`（`src/disk_prepare.rs`）是配置路径上对 Alpine 虚拟机的唯一调用方。
+
+### 宿主机分类检查
+
+`probe_disk`（`src/image_probe.rs`）始终会返回一个分类。它在宿主机上使用 `pread` 读取文件。`gpt::read_gpt` 和 `gpt::select_layout` 要求必须具有一个 EFI 系统分区和一个根分区：存在 ARM64 根分区类型 `LINUX_ROOT_ARM64_GUID` 时采用该类型，否则采用单个 `LINUX_FILESYSTEM_GUID` 分区。`Ext4Ro` 读取 `/etc/os-release`（支持单层词法符号链接；Debian 的 `/etc/os-release` 指向 `../usr/lib/os-release`）、`/etc/debian_version`、`/etc/machine-id`、`/etc/shadow` 和 `/var/lib/dbus/machine-id`。解析 shadow 字节以获取 root 密码字段后立即清零。这些信息不会保存在 `ProbeFacts` 中。`VIBE_TRACE_PROBE=1` 会记录每个 `probe_disk` 路径。普通运行路径从不设置该变量，也从不调用 `probe_disk`。
+
+`classify` 随后调用 `prepare_decision`：
+
+| `ImageClass` | 决策 | 处理操作 |
+| --- | --- | --- |
+| `LegacyCompatible` | `AlreadyCompatible` | 打印 `Disk is already legacy compatible; skipping Alpine preparation.`。系统为 Debian，machine-id 缺失、为空文件或为有效的 32 位十六进制 id，且仅有一行 `root:` shadow 记录且密码字段为空。 |
+| `Unsupported` | `WarnUnsupported` | `unsupported_warning` 打印 `[probe] Warning: ...`，且副本仍会在旧版登录路径上尝试启动。这对应 `no GPT root`，或 ext4 根分区中的 `os-release` 非 Debian（`ID=debian` 或 `ID_LIKE` 包含 `debian`）。此类磁盘通常无法登录成功。 |
+| `NeedsPreparation` | `Process` | machine-id 内容为 `uninitialized\n` 或其他内容，或者 root 密码字段不为空。`preparation_notice` 会指出这些原因，并提示该步骤大约需要 20 秒。 |
+| `Unknown` | `Process` | 有界读取器无法做出判定（不可读的文件系统、`needs recovery`、machine-id 符号链接、异常的 root 记录行数等）。交由 Alpine 自行检查镜像。 |
+
+在预处理前会打印 `EMPTY_ROOT_NOTICE`：在此操作后，该镜像及其衍生的虚拟机中的 root 密码均为空。
+
+### 维护虚拟机
+
+`process_disk`（`src/maintenance.rs`）：
+
+1. `prepare_target` 要求目标为常规可写文件。它以读写模式打开磁盘仅为验证其可写性，随后获取同级 `{disk}.lock` 上的非阻塞 flock。它读取 GPT、选择布局并执行 `scan_labels`。`label_block_reason` 会拒绝 ext4 UUID 等于 `ALPINE_ROOT_FS_UUID` 以及文件系统标签为 `/` 或 `cidata`（不区分大小写）的磁盘。它会记录 `ProbeFacts` 以供后续复检。
+2. `cache::sweep_stale` 清理 `maint/` 目录下 `<pid>-<nonce>` 对应 pid 已不存在的废弃目录。`cache::private_dir` 以权限 `0700` 创建 `maint/<pid>-<nonce>`。
+3. `run_maintenance`：
+   - 生成 `control::new_nonce`（32 位小写十六进制数字）。
+   - 将 Alpine raw 克隆到该目录下的 `alpine.raw`。
+   - 构建 `seed::Manifest`：版本为格式 1，包含 nonce、Alpine 根分区 UUID、工作副本字节大小、根分区索引、PARTUUID、类型 GUID、ESP 索引以及 `policy=minimal`。`Manifest::serialize` 会拒绝任何其他格式。
+   - `seed::build_seed` 写入 `meta-data`、`user-data`（内嵌的 `src/guest/maint.sh`）和 `manifest`，然后使用 `hdiutil makehybrid` 创建卷名为 `cidata` 的 ISO。该 ISO 必须非空且小于 8 MiB。
+   - 按照客户机顺序配置 `VmSpec` 磁盘：`vda` 为 Alpine 克隆（可写），`vdb` 为 Debian 工作副本（可写），`vdc` 为 `seed.iso`（只读）。`network` 设为 `None`。无共享设备，无键盘串口。`hvc0` 为 `SerialRole::Log`，`hvc1` 为 `SerialRole::Control`（`output_serial` 保留宿主机读取端）。EFI 变量保存在工作目录下的 `efivars`。配置为 2 核 CPU 和 1 GiB 内存（`MAINT_CPU`，`MAINT_RAM_BYTES`）。
+   - `run_headless` 启动该规格。日志工作线程将 `hvc0` 复制到 `hvc0.log`。控制工作线程将 `hvc1` 传递给 `FrameReader::new(nonce)`。接收到的每个有效帧都会传递给 `observe_frame`。
+4. 成功后，`image_probe::verify_processed` 重新读取工作副本。要求 GPT 布局未改变、`/etc/machine-id` 为空常规文件、恰好有一行密码字段为空的 root shadow 记录、dbus machine-id 缺失、为空或者是指向 `/etc/machine-id` 的符号链接，且 `classify` == `LegacyCompatible`。失败则报错 `[verify] host-verify`。
+5. `publish_log` 将控制台日志移动到 `~/.cache/vibe/logs/maint-<unix>-<pid>.log`，`retain_newest_logs` 保留 `LOGS_TO_KEEP`（5 个）。除非设置了 `VIBE_KEEP_FAILED_WORK=1`（此时会打印路径），否则工作目录会被删除。保留的目录在对应 pid 退出后，仍会被下一次 `process_disk` 删除。随后 `ensure_bootable` 会解绑并删除同级 `.lock` 文件，除非错误原因是另一个 Vibe 进程正持有该锁。
+
+发生 `PrepareError` 时会打印 `[prepare] <stage> (last PREP-STEP: ...)` 以及日志路径。宿主机复检失败使用 `[verify]` 前缀。
+
+### 客户机脚本执行流程
+
+`src/guest/maint.sh` 为 NoCloud 的 `user-data`，由 tiny-cloud 执行。它将控制台输出写入 `hvc0`，并将控制帧以 `VIBE1 <nonce> <kind> ...` 格式（`control::Frame`，最大 `MAX_FRAME_LEN` 字节）写入 `hvc1`。宿主机不发送任何帧。nonce 仅用于将日志行与本次运行绑定，并非鉴权凭据。
+
+`mount_seed` 挂载 `LABEL=cidata` 并要求设备必须是 `/dev/vdc`。无法挂载 seed 则不会发出任何帧。随后 `parse_manifest` 发出 `PREP-READY`。
+
+`MAINT_STEPS` 和脚本严格按以下顺序运行。`observe_frame` 会拒绝任何其他顺序。客户机返回 `PREP-RESULT fail` 时会附带来自 `step_code` 的步骤错误码，并自行关闭虚拟机。只有协议或步骤顺序错误才会导致 `decision_for` 返回 `FrameDecision::Fail` 并请求客户机停止。
+
+| 步骤 | 代码 | 检查内容 |
+| --- | --- | --- |
+| `seed` | 2 | Manifest 格式为 1，策略为 `minimal`，校验各 token 字段。 |
+| `self` | 3 | Alpine 自身的根分区为 `/dev/vda2`，且与 `findfs UUID=<ALPINE_ROOT_FS_UUID>` 匹配。 |
+| `target` | 4 | `/sys/class/block/vdb/size` 与 `disk_bytes` 匹配。`/dev/vdb` 上的 `sgdisk -i` 与根分区类型 GUID 及 PARTUUID 匹配。 |
+| `fsck` | 5 | 在根分区上执行 `e2fsck -p`，返回值为 0 或 1。 |
+| `inspect` | 6 | 以只读方式挂载根分区。检查 `os-release` 中 `ID=debian`；`/etc/machine-id` 为常规文件；`/etc/shadow` 为常规文件且恰好包含一行格式正确的 `root` 记录；dbus machine-id 不存在、为常规文件或为指向 `/etc/machine-id` 的符号链接；`sshd_config` 或 `sshd_config.d/*.conf` 中不存在 `PermitEmptyPasswords yes`；`/etc/passwd` 恰好包含一行密码字段为 `x` 的 `root` 记录。随后重新以读写模式挂载。 |
+| `apply` | 7 | 截断清空 `/etc/machine-id` 和常规的 dbus machine-id 文件。`apply_shadow` 将 root 密码字段改为空，并保留文件的权限模式和所有者。不打印 shadow 内容，且脚本不开启 xtrace。 |
+| `verify` | 8 | machine-id 为空的常规文件，shadow 字节匹配清空后的内容，且 shadow 的权限模式和所有者保持不变。 |
+| `unmount` | 9 | 执行 `sync`，卸载，确认 `/dev/vdb` 下没有任何挂载残留，执行 `e2fsck -n`。 |
+
+卸载之后发出 `PREP-RESULT ok 0 done`。退出 trap 触发关机。
+
+`HeadlessDeadlines::maintenance` 等待 `PREP-READY` 的超时时间为 90 秒（`MAINT_FIRST_OUTPUT_TIMEOUT`；实测启动时间约为 17 秒，包含 Limine 的 10 秒菜单等待），等待 `PREP-RESULT` 为 300 秒（`MAINT_TOTAL_TIMEOUT`），随后在执行 `force_stop` 之前给予请求停止预留 30 秒（`STOP_TIMEOUT`）。工作线程必须在 10 秒内汇合退出。
+
+维护虚拟机没有网络、没有共享文件夹，也没有键盘输入。
+
+### 预处理会拒绝的镜像
+
+在处理过程中遇到以下情况会被拒绝，报错 `[prepare]` 且不会发布镜像：
+
+- `/etc/shadow` 或 `/etc/passwd` 存在异常的 root 记录（客户机 `inspect`）。
+- `/etc/machine-id` 为符号链接或非常规文件。
+- SSH 配置显式设置了 `PermitEmptyPasswords yes`。
+- GPT 中缺少单一根分区或单一 ESP、分区超出边界，或者标签及 ext4 UUID 会导致 Alpine 挂载错误的磁盘（`prepare_target`）。
+
+宿主机探测与客户机检查并不是同一种测试。`classify` 会将 `ID_LIKE` 包含 `debian` 的系统视为 Debian，且不读取 `sshd_config`。而客户机严格要求 `ID=debian`，并且会读取 `sshd_config`。已经是 `LegacyCompatible` 的镜像会跳过客户机检查，因此只有在 Alpine 实际运行时才会强制检查 SSH 配置行。
+
+非 Debian 的 GPT 磁盘会被标记为 `Unsupported`：产生 `[probe]` 警告，不运行 Alpine，随后直接进入旧版登录路径。
+
+## 新版 Debian 镜像
+
+自 2026 年底发布的 Debian nocloud 镜像（包括锁定的 `debian-13-nocloud-arm64-20261001-2618`）不再保留空的 root 密码字段，控制台会停在交互式初次启动向导中。早期的 nocloud 镜像会直接引导至 `login:` 提示符，这就是 Vibe 登录流程输入 `root` 且预期无密码的原因。
+
+Vibe 仅在配置（provision）阶段将新镜像恢复到早期状态：
+
+- 复制基础镜像或 `--base` 指定的文件。原始文件不作修改。
+- 对于旧镜像和 Vibe 已经发布过的镜像，宿主机探测会跳过 Alpine 处理。
+- 新镜像仅在执行 `base.sh` 和文件扩容之前被处理一次。
+- 运行 `vibe path/to/disk.raw`、`.vibe/instance.raw` 或 `vibe --image NAME` 从不检查或修改这些磁盘。
+
+要转换未处理的磁盘，请配置一个副本并启动生成的结果：
+
+```bash
+# 外部磁盘镜像。不带 "/" 的 --base 值表示缓存中的模板名称。
+vibe provision --base /abs/path/disk.raw --image my-image
+vibe --image my-image
+
+# 从未处理的镜像创建的旧项目实例
+vibe provision --base /abs/path/project/.vibe/instance.raw --image my-image
+mv .vibe/instance.raw .vibe/instance.raw.old
+vibe --image my-image
+```
+
+### 安全性
+
+在所有处理过的镜像以及由其创建的实例中，root 用户均拥有空密码。任何能够打开控制台的人（包括引导该磁盘的其他工具）都可以直接以 root 身份登录。客户机内部的非 root 用户无需密码即可执行 `su -`。Vibe 自身仅以 root 身份登录，不会创建其他用户。
+
+Debian 的 SSH 服务端默认拒绝空密码（`PermitEmptyPasswords no`）。如果配置文件中设置了 `PermitEmptyPasswords yes`，预处理将会失败。`provisioning/base.sh` 还会在 `sshd_config.d` 下写入 `PasswordAuthentication no` 和 `PermitRootLogin yes`，并禁用 `ssh` 服务，直到后续通过 `--ssh-key` 启动。
+
+配置流程在脚本运行后会再次清空 `/etc/machine-id`，因为配置启动本身会生成一个 id。发布的模板保持为空，以便各个实例能够生成各自独立的 id。
+
+### 错误分类
+
+错误前缀代表发生失败的阶段：
+
+| 前缀 | 触发时机 |
+| --- | --- |
+| `[download]` | Debian 或 Alpine 的拉取、校验和、解压或 Alpine UUID 检查失败。 |
+| `[probe]` | 不支持的磁盘。这属于警告。配置流程仍将继续并启动该副本。 |
+| `[prepare]` | 工作副本复制、扩容、维护安全检查、seed、启动、客户机步骤、协议或超时错误。如果观测到了步骤，详情会包含最后看到的 `PREP-STEP`。 |
+| `[verify]` | 维护后的 `verify_processed` 失败、配置启动后 machine-id 仍存在，或最终重命名失败。 |
+| `[boot]` | 虚拟机配置、启动失败，无串口输出，缺少 `login:` 提示符，或虚拟机在登录前停止。 |
+| `[login]` | 密码提示、缺失横幅（banner）、就绪探测失败，或调用方动作之前的 setup 动作失败。 |
+| `[action N: ...]` | 第 N 个调用方动作失败：用户登录动作或配置脚本。 |
+| `[shutdown]` | setup 完成前按下 Ctrl-C、配置收尾或关机动作失败，或动作完成后虚拟机未能进入 `Stopped` 状态。 |
+
+失败的维护运行会打印其日志路径。设置 `VIBE_KEEP_FAILED_WORK=1` 还可以保留 `<name>.tmp.<pid>` 和 `maint/<pid>-<nonce>/`（Alpine 克隆与 seed ISO）。保留的工作副本需自行手动删除。保留的维护目录将在对应 pid 结束后由下一次磁盘预处理自动清理。
+
+### 实测耗时
+
+在 M2 芯片的 Mac 上，预处理新基础镜像耗时约 19 秒；在高速网络下包含 Alpine 下载时约需 20 秒。面向用户的提示说明大约需要 20 秒。处理后的镜像约 10.5 秒到达登录提示符，约 12 秒进入就绪 shell。在新的基础镜像上配置默认镜像大约需要 3 分钟，大部分时间消耗在软件包下载上。
+
+## 涉及磁盘启动或分类的测试
+
+单元测试位于代码旁的 `#[cfg(test)]` 中：包括 `src/main.rs` 中的 CLI 解析、`src/session.rs` 中的登录与 provision 提示、`src/vm_config.rs` 中的 `VmSpec` 结构、`src/vm_lifecycle.rs` 中的无头虚拟机超时控制、GPT 和 ext4 测试固件、控制帧、`classify` / `verify_processed`、缓存辅助函数、Alpine UUID 检查、seed 清单规则、`observe_frame`、`prepare_decision` 以及 machine-id 清理脚本。
+
+无法在工作线程中通过 `cargo test` 启动虚拟机。标记了 `#[ignore]` 的测试会带有 `VIBE_VM_CHECK` 环境变量启动 `vibe` 二进制文件，由 `main` 在主线程上运行检查：
+
+| 测试 | 环境变量 | 调用内容 |
+| --- | --- | --- |
+| `tests/vm_devices.rs` | `read-only-disk` | 挂载第二个只读磁盘运行 `drive_interactive`。客户机读取 `/sys/block/vdb/ro`。 |
+| `tests/vm_devices.rs` | `headless-timeout` | 针对从不发送 `PREP-READY` 的客户机执行 `run_headless`，验证首次输出、停止与汇合的时间预算。 |
+| `tests/disk_prepare.rs` | `prepare` | 通过 `src/vm_checks/prepare.rs` 运行 `ensure_bootable`。旧版 Debian 镜像返回 `AlreadyCompatible` 且保持空缓存不变。新版 Debian 镜像则会被处理。 |
+| `tests/alpine_maintenance.rs` | `maintenance-all` | 运行 `src/vm_checks/maintenance.rs`：下载、shadow 编辑、新旧镜像预处理、重复预处理、反向异常磁盘用例、needs-recovery、SSH `PermitEmptyPasswords` 以及日志保留。缓存的 Alpine raw 的 SHA-256 必须保持不变。`maintenance-<name>` 运行其中某一项检查。 |
+| `src/vm_checks/prepare.rs` | `probe` | 对 `VIBE_VM_CHECK_DISK` 执行 `probe_disk`。打印分类、machine-id 状态以及 root 密码字段是否为空。不打印 shadow 字节。 |
+
+被忽略的测试依赖于 `VIBE_TEST_DEBIAN_NEW_RAW`、`VIBE_TEST_DEBIAN_OLD_RAW` 和 `VIBE_TEST_ALPINE_RAW`。维护镜像的编辑操作使用来自 `VIBE_E2FS_SBIN` 或 `PATH` 中的 e2fsprogs。`tests/fixtures/make-ext4.sh` 用于重建进程内 ext4 与探测测试所需的 gzip ext4 小镜像。`VIBE_VM_CHECK_DISK` 和 `VIBE_VM_CHECK_CACHE` 为 `probe` 和 `prepare` 选择测试磁盘及 Alpine 缓存路径。设置 `VIBE_MAINT_TEST_PARTUUID` 可以替换写入清单中的 PARTUUID，以便通过反向检查强制触发目标不匹配错误。

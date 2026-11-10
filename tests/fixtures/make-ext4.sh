@@ -1,9 +1,10 @@
 #!/bin/sh
 # Rebuild the small ext4 fixtures used by ext4ro and image_probe tests.
 #
-# The plan text generates these inside the T09 Alpine maintenance VM.
-# This host copy uses the same mkfs.ext4 / debugfs / e2fsck commands.
-# Tool lookup order: $MKFS_EXT4 (and siblings), /tmp/e2fs-install, Homebrew.
+# The generated images are committed. Rerun this script only when a fixture
+# needs to change. It uses the same mkfs.ext4 / debugfs / e2fsck commands as
+# the Alpine maintenance image.
+# Tool lookup order: $MKFS_EXT4 (mkfs.ext4 only), /tmp/e2fs-install, Homebrew, PATH.
 #
 # Usage: tests/fixtures/make-ext4.sh
 # Outputs gzip-compressed images next to this script.
@@ -40,6 +41,10 @@ find_tool() {
 MKFS=$(find_tool mkfs.ext4)
 DEBUGFS=$(find_tool debugfs)
 E2FSCK=$(find_tool e2fsck)
+
+printf "mkfs: %s\n" "$MKFS";
+printf "debugfs: %s\n" "$DEBUGFS";
+printf "e2fsck: %s\n" "$E2FSCK";
 
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/vibe-ext4.XXXXXX")
 cleanup() { rm -rf "$WORKDIR"; }

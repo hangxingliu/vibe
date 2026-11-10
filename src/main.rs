@@ -206,13 +206,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Vibe is a quick way to spin up a Linux virtual machine on Mac to sandbox LLM agents.
 
 vibe [OPTIONS] [LOGIN-ACTIONS ...] [path/to/disk.raw]
-vibe provision [PROVISIONING_OPTIONS] [@built-in | path/to/script.sh ...]
+vibe provision [OPTIONS] [PROVISIONING-OPTIONS] [@built-in | path/to/script.sh ...]
+
+Options may appear before or after `provision`.
+`--base`, `--replace`, and `--repl` are only valid with `provision`.
+Login actions, `--no-default-mounts`, `--env`, `--mount`, `--git`, and `--ssh-key` are only valid when running a VM.
 
 Options:
 
   --help                                                    Print this help message.
   --version                                                 Print the version (commit SHA and build date).
-  --image NAME                                              Use this template image (ignored if `{INSTANCE_DIR_NAME}/{INSTANCE_DISK_IMAGE_NAME}` already exists)
+  --image NAME                                              Run: template image (ignored if `{INSTANCE_DIR_NAME}/{INSTANCE_DISK_IMAGE_NAME}` already exists).
+                                                            Provision: name of the image to create (default `default`).
+  --cpus COUNT                                              Number of virtual CPUs (default 2).
+  --ram MEGABYTES                                           RAM size in megabytes (default 2048 when running, 4096 when provisioning).
   --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
   --env NAME                                                Export host environment variable NAME inside VM.
                                                             Errors if NAME is unset or empty.
@@ -240,7 +247,7 @@ Options:
                                                             no: mask .git with tmpfs.
 							    
 
-Login actions (executed in order after root login, repeatable):
+Login actions (executed in order after root login, repeatable; not valid with `provision`):
 
   --script PATH_TO_SCRIPT                                   Run script in VM; stop if it exits non-zero.
   --send SOME_COMMAND                                       Type SOME_COMMAND followed by newline into the VM.
@@ -259,7 +266,7 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                                                             If the image already exists (and --replace is not given): boots the existing image
                                                             directly for interactive use without re-running any scripts.
   --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
-  --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 2048).
+  --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 4096).
 
 {}
   
@@ -630,7 +637,47 @@ enum CliCommand {
     },
 }
 
+fn cannot_use_with_provision(flag: &str) -> Box<dyn std::error::Error> {
+    format!("{flag} cannot be used with provision").into()
+}
+
+fn only_valid_with_provision(flag: &str) -> Box<dyn std::error::Error> {
+    format!("{flag} is only valid with provision").into()
+}
+
+fn load_provision_script(name: String) -> Result<ProvisionScript, Box<dyn std::error::Error>> {
+    if let Some(builtin) = name.strip_prefix('@') {
+        return BUILTIN_PROVISION_SCRIPTS
+            .iter()
+            .find(|script| script.name == builtin)
+            .cloned()
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                format!(
+                    "Unknown built-in provisioning script: @{builtin}\n\n{}",
+                    provisioning_scripts_banner()
+                )
+                .into()
+            });
+    }
+
+    let content = fs::read_to_string(&name)
+        .map_err(|err| format!("Failed to read provisioning script {name}: {err}"))?;
+    Ok(ProvisionScript {
+        content: Cow::Owned(content),
+        name: Cow::Owned(name),
+        description: Cow::Borrowed(""),
+    })
+}
+
 fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
+    parse_cli_from(env::args_os().skip(1))
+}
+
+fn parse_cli_from<I>(args: I) -> Result<CliArgs, Box<dyn std::error::Error>>
+where
+    I: IntoIterator,
+    I::Item: Into<OsString>,
+{
     fn os_to_string(value: OsString, flag: &str) -> Result<String, Box<dyn std::error::Error>> {
         value
             .into_string()
@@ -657,81 +704,30 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         Ok(value)
     }
 
-    fn parse_provision_command(
-        parser: &mut lexopt::Parser,
-    ) -> Result<CliCommand, Box<dyn std::error::Error>> {
-        let mut base = None;
-        let mut image = DEFAULT_IMAGE_NAME.to_string();
-        let mut image_seen = false;
-        let mut replace = false;
-        let mut repl = false;
-        let mut scripts = Vec::new();
-        let mut cpu_count = DEFAULT_CPU_COUNT;
-        let mut ram_bytes = DEFAULT_PROVISION_RAM_BYTES;
-
-        while let Some(arg) = parser.next()? {
-            match arg {
-                Long("base") => {
-                    if base.is_some() {
-                        return Err("Duplicate --base".into());
-                    }
-                    base = Some(os_to_string(parser.value()?, "--base")?);
-                }
-                Long("image") => {
-                    if image_seen {
-                        return Err("Duplicate --image".into());
-                    }
-                    image_seen = true;
-                    image = os_to_string(parser.value()?, "--image")?;
-                    assert_valid_image_name(&image);
-                }
-                Long("replace") => replace = true,
-                Long("repl") => repl = true,
-                Long("cpus") => cpu_count = parse_cpu_count(parser)?,
-                Long("ram") => ram_bytes = parse_ram_size(parser)?,
-                Value(value) => {
-                    let name = os_to_string(value, "provisioning script")?;
-                    let script = if let Some(name) = name.strip_prefix('@') {
-                        BUILTIN_PROVISION_SCRIPTS
-                            .iter()
-                            .find(|script| script.name == name)
-                            .cloned()
-                            .ok_or_else(|| -> Box<dyn std::error::Error> {
-                                format!(
-                                    "Unknown built-in provisioning script: @{name}\n\n{}",
-                                    provisioning_scripts_banner()
-                                )
-                                .into()
-                            })?
-                    } else {
-                        ProvisionScript {
-                            content: Cow::Owned(fs::read_to_string(&name).map_err(|err| {
-                                format!("Failed to read provisioning script {name}: {err}")
-                            })?),
-                            name: Cow::Owned(name),
-                            description: Cow::Borrowed(""),
-                        }
-                    };
-                    scripts.push(script);
-                }
-                _ => return Err(arg.unexpected().into()),
-            }
+    // Run-only flags are parsed in either position so a value is never left
+    // for a later flag to consume. They are rejected once `provision` is selected.
+    fn reject_run_only(
+        parsing_provision: bool,
+        run_only: &mut Option<&'static str>,
+        flag: &'static str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if parsing_provision {
+            return Err(cannot_use_with_provision(flag));
         }
-
-        Ok(CliCommand::Provision {
-            base,
-            image,
-            replace,
-            repl,
-            scripts,
-            cpu_count,
-            ram_bytes,
-        })
+        if run_only.is_none() {
+            *run_only = Some(flag);
+        }
+        Ok(())
     }
 
-    let mut parser = lexopt::Parser::from_env();
+    let mut parser = lexopt::Parser::from_args(args);
+    let mut parsing_provision = false;
+    let mut run_only: Option<&'static str> = None;
     let mut disk = None;
-    let mut command = None;
+    let mut base = None;
+    let mut replace = false;
+    let mut repl = false;
+    let mut scripts = Vec::new();
     let mut image = DEFAULT_IMAGE_NAME.to_string();
     let mut image_seen = false;
     let mut version = false;
@@ -743,6 +739,9 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut network_mode = NetworkMode::Nat;
     let mut cpu_count = DEFAULT_CPU_COUNT;
     let mut ram_bytes = DEFAULT_RAM_BYTES;
+    // Running and provisioning use different RAM defaults. An explicit `--ram`
+    // applies to whichever command is selected; an omitted one keeps that default.
+    let mut ram_explicit = false;
     let mut proxy = None;
     let mut proxy_udp = false;
     let mut dns: Vec<String> = Vec::new();
@@ -762,8 +761,12 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 image = os_to_string(parser.value()?, "--image")?;
                 assert_valid_image_name(&image);
             }
-            Long("no-default-mounts") => no_default_mounts = true,
+            Long("no-default-mounts") => {
+                reject_run_only(parsing_provision, &mut run_only, "--no-default-mounts")?;
+                no_default_mounts = true;
+            }
             Long("env") => {
+                reject_run_only(parsing_provision, &mut run_only, "--env")?;
                 let name = os_to_string(parser.value()?, "--env")?;
                 assert!(
                     !env_vars.contains_key(&name),
@@ -779,7 +782,10 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 env_vars.insert(name, value);
             }
             Long("cpus") => cpu_count = parse_cpu_count(&mut parser)?,
-            Long("ram") => ram_bytes = parse_ram_size(&mut parser)?,
+            Long("ram") => {
+                ram_bytes = parse_ram_size(&mut parser)?;
+                ram_explicit = true;
+            }
             Long("proxy") => {
                 proxy = Some(os_to_string(parser.value()?, "--proxy")?);
             }
@@ -790,9 +796,11 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 dns.push(os_to_string(parser.value()?, "--dns")?);
             }
             Long("ssh-key") => {
+                reject_run_only(parsing_provision, &mut run_only, "--ssh-key")?;
                 ssh_key = Some(PathBuf::from(parser.value()?));
             }
             Long("git") => {
+                reject_run_only(parsing_provision, &mut run_only, "--git")?;
                 let value = os_to_string(parser.value()?, "--git")?;
                 git_mode = match value.as_str() {
                     "rw" => GitMode::Rw,
@@ -805,6 +813,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 publish.push(os_to_string(parser.value()?, "-p/--publish")?);
             }
             Long("mount") => {
+                reject_run_only(parsing_provision, &mut run_only, "--mount")?;
                 mounts.push(os_to_string(parser.value()?, "--mount")?);
             }
             Long("network") => {
@@ -812,6 +821,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 network_mode = NetworkMode::parse(&value)?;
             }
             Long("script") => {
+                reject_run_only(parsing_provision, &mut run_only, "--script")?;
                 let path = os_to_string(parser.value()?, "--script")?;
                 let content = fs::read_to_string(&path)
                     .map_err(|err| format!("Failed to read script {path}: {err}"))?;
@@ -821,9 +831,11 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 });
             }
             Long("send") => {
+                reject_run_only(parsing_provision, &mut run_only, "--send")?;
                 login_actions.push(Send(os_to_string(parser.value()?, "--send")?));
             }
             Long("expect") => {
+                reject_run_only(parsing_provision, &mut run_only, "--expect")?;
                 let text = os_to_string(parser.value()?, "--expect")?;
                 let timeout = match parser.optional_value() {
                     Some(value) => Duration::from_secs(os_to_string(value, "--expect")?.parse()?),
@@ -831,16 +843,35 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 };
                 login_actions.push(Expect { text, timeout });
             }
+            Long("base") => {
+                if base.is_some() {
+                    return Err("Duplicate --base".into());
+                }
+                base = Some(os_to_string(parser.value()?, "--base")?);
+            }
+            Long("replace") => replace = true,
+            Long("repl") => repl = true,
             Value(value) => {
-                let value = os_to_string(value, "argument")?;
-                if disk.is_none() && command.is_none() && value == "provision" {
-                    command = Some(parse_provision_command(&mut parser)?);
-                    break;
-                }
-                if disk.is_some() {
+                let value = os_to_string(
+                    value,
+                    if parsing_provision {
+                        "provisioning script"
+                    } else {
+                        "argument"
+                    },
+                )?;
+                if parsing_provision {
+                    scripts.push(load_provision_script(value)?);
+                } else if disk.is_none() && value == "provision" {
+                    if let Some(flag) = run_only {
+                        return Err(cannot_use_with_provision(flag));
+                    }
+                    parsing_provision = true;
+                } else if disk.is_some() {
                     return Err("Only one disk path may be provided".into());
+                } else {
+                    disk = Some(PathBuf::from(value));
                 }
-                disk = Some(PathBuf::from(value));
             }
             _ => return Err(arg.unexpected().into()),
         }
@@ -860,11 +891,33 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         }
     }
 
+    // Apply the provisioning default only when the user did not pass `--ram`.
+    if parsing_provision && !ram_explicit {
+        ram_bytes = DEFAULT_PROVISION_RAM_BYTES;
+    }
+
+    let command = if parsing_provision {
+        CliCommand::Provision {
+            base,
+            image,
+            replace,
+            repl,
+            scripts,
+            cpu_count,
+            ram_bytes,
+        }
+    } else if base.is_some() {
+        return Err(only_valid_with_provision("--base"));
+    } else if replace {
+        return Err(only_valid_with_provision("--replace"));
+    } else if repl {
+        return Err(only_valid_with_provision("--repl"));
+    } else {
+        CliCommand::Run { disk, image }
+    };
+
     Ok(CliArgs {
-        command: match command {
-            Some(command) => command,
-            None => CliCommand::Run { disk, image },
-        },
+        command,
         version,
         help,
         no_default_mounts,
@@ -2176,3 +2229,7 @@ pub fn ensure_signed() {
         }
     }
 }
+
+// CLI unit tests live in src/tests.rs and compile only for `cargo test`.
+#[cfg(test)]
+mod tests;

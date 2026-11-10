@@ -10,8 +10,7 @@ usage() {
 run_rust() {
   cargo fmt --check
   cargo clippy --all-targets -- --deny warnings
-  # TODO: write Rust tests
-  # cargo test
+  cargo test
 }
 
 run_go() {

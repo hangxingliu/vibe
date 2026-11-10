@@ -17,6 +17,7 @@ Vibe is a lightweight, zero-configuration tool designed to spin up Linux virtual
 ## Key Files & Directories
 
 - `src/main.rs`: Entry point, CLI parsing (via `lexopt`), VM configuration, and IO multiplexing.
+- `src/tests.rs`: Unit tests for CLI parsing. Declared from `main.rs` as `#[cfg(test)] mod tests`, so the file is part of the binary crate (and can call private parsers) and is compiled only for `cargo test`.
 - `src/networking.rs`: Logic for setting up NAT, bridged, and `vmnet-helper` networking backends.
 - `provisioning/base.sh`: Shell script used to initialize the default Debian image with essential tools (gcc, rust, mise, etc.).
 - `src/bashrc.sh`: Guest-side bash configuration.
@@ -34,7 +35,7 @@ Vibe is a lightweight, zero-configuration tool designed to spin up Linux virtual
 ### Commands
 - **Build:** `cargo build --release`
 - **Run:** `cargo run -- [OPTIONS] [disk-image.raw]`
-- **Test:** `cargo test` (Note: Most logic is integration-heavy and requires a Mac host).
+- **Test:** `cargo test` (CLI parsing is covered by unit tests in `src/tests.rs`. Most other logic is integration-heavy and requires a Mac host).
 
 ## Development Conventions
 

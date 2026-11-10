@@ -13,6 +13,7 @@ This forked version introduces several core improvements, focusing on custom env
     - For `--network nat` (default network type), these proxies are implemented via code in helpers/vibe-usernet and are transparent to the VM. Loopback, link-local, and private destinations are dialed directly.
     - For other `--network` types, the proxy is implemented via environment variables and `apt` configuration files within the VM.
     - Example usage: `--proxy "socks5://127.0.0.1:1080" --proxy-udp`
+    - These networking options work with both `vibe` and `vibe provision`, before or after the `provision` command.
 3. **SSH Access Support**:
     - Added the `--ssh-key <PUBLIC_KEY_FILE>` option to automatically inject the host's public key and start the SSH server inside the guest, facilitating direct connection from external tools and SSH clients.
 4. **Advanced Directory Isolation & Safety**:
@@ -24,6 +25,9 @@ This forked version introduces several core improvements, focusing on custom env
     - Use `vibe provision --repl` to provision the base image via commands inside the VM after the provisioning script finishes.
 6. **Guest Environment & I/O Optimizations**:
     - Automatically syncs host configurations (like `~/.tmux.conf`) to the guest VM on boot, and provisions clean `.profile` and `.bash_logout` setups.
+
+CLI parsing unit tests live in `src/tests.rs` (a `#[cfg(test)]` module of the binary) and run as part of `cargo test`.
+
 ---
 
 Vibe is a quick, zero-configuration way to spin up a Linux virtual machine on Mac to sandbox LLM agents:
@@ -128,8 +132,9 @@ When you first run `vibe`, a Debian Linux base image is downloaded and [all of t
 As a thoughtful person who reads the README, you'll probably appreciate the ability to create custom template images by running:
 
     vibe provision --image my-template @rust @codex my-custom-script.sh
+    vibe provision --proxy socks5://127.0.0.1:1080 --proxy-udp @rust
 
-(Omitting `--image` provisions the default template.)
+(Omitting `--image` provisions the default template. `--proxy`, `--proxy-udp`, `--dns`, `--network`, and `-p`/`--publish` can be placed before or after `provision`.)
 Scripts are run in order, and those prefixed with `@` are resolved against the built-in scripts shipped with Vibe.
 
 In `my-custom-script.sh` I set up my tmux keybindings, favorite shell customizations, etc.
@@ -144,13 +149,20 @@ If you don't want this, you can make your own `.raw` disk images and copy them i
 Vibe is a quick way to spin up a Linux virtual machine on Mac to sandbox LLM agents.
 
 vibe [OPTIONS] [LOGIN-ACTIONS ...] [path/to/disk.raw]
-vibe provision [PROVISIONING_OPTIONS] [@built-in | path/to/script.sh ...]
+vibe provision [OPTIONS] [PROVISIONING_OPTIONS] [@built-in | path/to/script.sh ...]
+
+Options may appear before or after `provision`.
+`--base`, `--replace`, and `--repl` are only valid with `provision`.
+Login actions, `--no-default-mounts`, `--env`, `--mount`, `--git`, and `--ssh-key` are only valid when running a VM.
 
 Options:
 
   --help                                                    Print this help message.
   --version                                                 Print the version (commit SHA and build date).
-  --image NAME                                              Use this template image (ignored if `.vibe/instance.raw` already exists)
+  --image NAME                                              Run: template image (ignored if `.vibe/instance.raw` already exists).
+                                                            Provision: name of the image to create (default `default`).
+  --cpus COUNT                                              Number of virtual CPUs (default 2).
+  --ram MEGABYTES                                           RAM size in megabytes (default 2048 when running, 4096 when provisioning).
   --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
   --env NAME                                                Export host environment variable NAME inside VM.
                                                             Errors if NAME is unset or empty.
@@ -178,7 +190,7 @@ Options:
                                                             no: mask .git with tmpfs.
 							    
 
-Login actions (executed in order after root login, repeatable):
+Login actions (executed in order after root login, repeatable; not valid with `provision`):
 
   --script PATH_TO_SCRIPT                                   Run script in VM; stop if it exits non-zero.
   --send SOME_COMMAND                                       Type SOME_COMMAND followed by newline into the VM.
@@ -197,7 +209,7 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                                                             If the image already exists (and --replace is not given): boots the existing image
                                                             directly for interactive use without re-running any scripts.
   --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
-  --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 2048).
+  --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 4096).
 
 Built-in provisioning scripts:
 

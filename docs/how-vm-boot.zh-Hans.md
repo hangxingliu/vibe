@@ -46,7 +46,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 | `<name>.tmp.<pid>.lock` | 与 `<name>.raw` 同目录 | `FileLock::try_acquire_existing` | 维护虚拟机的同级锁文件。磁盘镜像本身不加 flock 锁，否则 Virtualization.framework 会拒绝附加该磁盘。 |
 | `maint/<pid>-<nonce>/` | Alpine `.raw` 所在目录，否则首选目录 | `process_disk` | 单次维护运行环境：Alpine 克隆、seed ISO、EFI 变量存储、控制台日志。 |
 | `logs/maint-<unix>-<pid>.log` | 默认目录 | `publish_log` | 已发布的维护控制台日志，开头带有列出完整路径的头部。仅保留最新的 5 个日志。 |
-| `apt/`、`cargo/`、agent 配置、`guest_node_modules/` | 默认目录 | `create_cache_share` | VirtioFS 共享的源目录。 |
+| `mise-cache/`、`apt/`、`cargo/`、`yarn/`、`m2/`、`go/`、`guest_node_modules/`；agent 配置（`codex/`、`copilot/` 等，仅在 `--mount-agents-conf` 时） | 默认目录 | `create_cache_share` | VirtioFS 共享的源目录，只在实际挂载时创建。 |
 | `vibe-usernet` | 默认目录 | `ensure_usernet_helper_extracted` | 内置的用户态网络辅助程序，在缓存字节不一致时写出。 |
 | `.vibe/instance.raw` | 项目目录 | `ensure_instance_disk` | 项目专属磁盘，从模板复制一次生成。这是常规 `vibe` 启动的文件。 |
 | `.vibe/vibe-usernet.log` | 项目目录 | `NetworkMode::prepare` | 项目实例的辅助程序日志。外部的 `path/to/disk.raw` 不会生成此日志。 |
@@ -94,7 +94,9 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 ### `run_main`
 
-`parse_cli`（`lexopt`）用于填充 `CliArgs`。`run_main` 负责创建缓存目录，通过 `create_cache_share` 构建 `DEFAULT_CACHE_SHARES`，调用 `ensure_signed`，并准备一个包裹 `NetworkMode::prepare` 的闭包。
+`parse_cli`（`lexopt`）用于填充 `CliArgs`。`run_main` 负责创建缓存目录，调用 `ensure_signed`，并准备一个包裹 `NetworkMode::prepare` 的闭包。各命令自行构建缓存共享：`cache_share_specs(sys_cache, mise, agents_conf)` 按 `MISE_CACHE_SHARE`、`SYS_CACHE_SHARES`、`AGENT_CONF_SHARES` 的顺序选取，`create_cache_shares` 只创建这些宿主机目录。
+
+在调用 `run_vm` 之前，run 与 provision 都会打印 `describe_vm_files`：目录共享（`host -> guest (mode)`）以及 Vibe 写入 VM 的文件，没有时打印 `(none)`。
 
 在 `nat` 模式下，`guest_proxy` 为 `None`：`vibe-usernet` 辅助程序自身会应用 `--proxy`，因此客户机不会额外接收代理环境变量。在 `vznat` 模式下，`--proxy` 的 URL 会被传递到配置脚本和登录环境变量导出中。
 
@@ -103,20 +105,22 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 `run_main` 中的 `CliCommand::Run` 处理流程如下：
 
 1. 按照上文所述解析磁盘。`DiskSource` 为 `External` 或 `Instance`。仅针对实例磁盘时，网络日志目录才为 `.vibe/`。
-2. 除非指定了 `--no-default-mounts`：将项目目录挂载共享到 `/root/<project>`（`is_project_dir`），使用 tmpfs 遮蔽 `.vibe`，使用绑定挂载的空文件遮蔽 `.env`；当宿主机目录存在时从缓存共享 `node_modules`；根据 `--git` 参数共享或遮蔽 `.git`（默认为只读；如果是子模块中的 `.git` 文件则跳过）；然后追加缓存共享、Agent 配置目录（`codex`、`copilot`、`claude`、`gemini`、`pi`、`grok`、`opencode`）以及宿主机上存在的 `~/.tmux`。宿主机的 `~/.tmux.conf` 会作为一个写入 `/root/.tmux.conf` 的 `Send` 动作排队执行。
-3. 追加宿主机的 `--env` 导出变量（`env_login_actions`）、`HISTFILE`、共享目录表（`motd_login_action`）、设置了 `guest_proxy` 时的代理导出，以及 `--ssh-key` 命令（`authorized_keys`、`systemctl start ssh`、`ip -4 -br addr`）。
+   使用默认镜像且 `default.raw` 尚不存在时，`check_implicit_provision` 先拒绝 `--no-mount-sys-cache` / `--no-mount-mise`（错误中列出这些选项、`default.raw` 的路径以及 `vibe provision` 的用法），此时 `ensure_default_image` 尚未查找或下载任何东西。`ensure_default_image` 接收缓存目录，只在需要 provision 时才创建共享，并且总是使用 `cache_share_specs(true, true, false)`。
+2. 除非指定了 `--no-mount-cwd`：将项目目录挂载共享到 `/root/<project>`（`is_project_dir`）并 `cd` 进去。`--mount` 共享同样是 `is_project_dir`。对每个项目目录始终：使用 tmpfs 遮蔽 `.vibe`，使用绑定挂载的空文件遮蔽 `.env`；当宿主机目录存在时从缓存共享 `node_modules`；根据 `--git` 参数共享或遮蔽 `.git`（默认为只读；如果是子模块中的 `.git` 文件则跳过）。然后追加 `cache_share_specs(mount_sys_cache, mount_mise, mount_agents_conf)`；Agent 配置目录（`codex`、`copilot`、`claude`、`gemini`、`pi`、`grok`、`opencode`）仅在 `--mount-agents-conf` 时追加。指定 `--mount-tmux-conf` 时，`tmux_conf_mounts` 在 `~/.tmux` 为目录时将其只读共享，并在宿主机存在 `~/.tmux.conf` 时排队一个写入 `/root/.tmux.conf` 的 `Send` 动作；两者都不存在时打印警告。
+3. 指定 `--write-bashrc` 时追加 `write_bashrc_actions`（把 `src/bashrc.sh` 写入 `/root/.profile`，随后执行 ` . /root/.profile`）。未指定时不写也不 source `.profile`；登录 shell 已经读取过镜像自带的那一份。随后追加宿主机的 `--env` 导出变量（`env_login_actions`）、`HISTFILE`、共享目录表（`motd_login_action`）、设置了 `guest_proxy` 时的代理导出，以及 `--ssh-key` 命令（`authorized_keys`、`systemctl start ssh`、`ip -4 -br addr`）。
 4. 追加用户的 `--script`、`--send` 和 `--expect` 动作。`user_actions` 记录了它们的索引范围，以便后续报错时仅针对这些动作编号。
-5. 调用 `run_vm`。
+5. 打印 `describe_vm_files("Run", ...)`（`/root/.bash_logout`，以及写入时的 `/root/.profile`、`/root/.tmux.conf`）；指定 `--no-mount-mise` / `--no-mount-sys-cache` 时打印共享目录中的工具不可用的提示。调用 `run_vm`。
 
 ### Provision 命令
 
 `CliCommand::Provision` 处理流程如下：
 
-- 带 `--repl` 且镜像已存在、同时未指定 `--replace` 时，打印一行提示并对该镜像调用 `run_vm`（`DiskSource::CachedImage`）。不运行任何脚本，也不探测该镜像。
+- 缓存共享为 `cache_share_specs(mount_sys_cache, mount_mise, false)`。指定 `--no-mount-sys-cache` / `--no-mount-mise` 时打印提示：工具会装进镜像自身，运行该镜像时需要使用同样的选项才能看到它们。
+- 带 `--repl` 且镜像已存在、同时未指定 `--replace` 时，打印一行提示和共享日志（`Provision`），并对该镜像调用 `run_vm`（`DiskSource::CachedImage`），唯一的动作是 `write_bashrc_actions`。不运行任何脚本，也不探测该镜像。
 - 否则解析 `--base`。包含 `/` 的值表示文件系统路径。不含 `/` 的值代表缓存中的 `image_path`。未指定 `--base` 时，由 `ensure_base_image` 提供 Debian raw 镜像。
 - 调用 `provision_image`。
 
-除非指定了 `--replace`，否则 `provision_image`（`src/provision.rs`）会拒绝覆盖已存在的 `<name>.raw`。它会复制基础镜像，调用 `ensure_bootable`，扩容文件，随后构建登录动作：
+除非指定了 `--replace`，否则 `provision_image`（`src/provision.rs`）会拒绝覆盖已存在的 `<name>.raw`。它会复制基础镜像，调用 `ensure_bootable`，扩容文件，随后构建登录动作。登录动作以 `write_bashrc_actions` 开头：把 `src/bashrc.sh` 写入 `/root/.profile` 并 source，使 PATH 与 mise 激活对脚本生效，该文件也随镜像保存（此处的错误显示为 `[login] setup send`）。然后：
 
 1. 一个导出 `VIBE_PROVISION_IMAGE`、`VIBE_PROVISION_BASE`、`VIBE_GIT_SHA`、`VIBE_BUILD_DATE` 和 `VIBE_PROVISION_SCRIPTS` 的 `Send` 动作。
 2. `Script` 动作：首先是来自 `build_provision_script` 的 `@base`（如果设置了 `guest_proxy`，则填充 `provisioning/base.sh` 中的 `INJECT_PROXY_CODE` 区域），然后是其他额外脚本。此范围属于 `user_actions`，因此脚本执行失败会显示为 `[action N: script '...']`。
@@ -124,7 +128,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 4. 针对 `VIBE_PROVISION_SUCCESS` 的 `Send` / `Expect` 动作。
 5. 未指定 `--repl` 时，执行 `systemctl poweroff; sleep 100`。指定了 `--repl` 时，`run_vm` 会打印交互提示并等待用户退出。
 
-调用 `run_vm` 时传入 `disk_source: None`，因此本次启动失败不会追加“配置此磁盘（provision this disk）”的提示。虚拟机停止后，如果动作未完成或最终状态不是 `Stopped`，`incomplete_run_error` 会拒绝该次运行。随后 `probe_disk` 必须报告 `MachineIdFact::EmptyFile`，否则会报错 `[verify]` 且镜像不会被发布。最后通过 `fs::rename` 发布该工作副本。
+调用 `run_vm` 之前会打印 `describe_vm_files(stage, ...)`（`Provision`，或由 `ensure_default_image` 传入的 `Provision (implicit, for the default image)`）以及调用方传入的提示。调用 `run_vm` 时传入 `disk_source: None`，因此本次启动失败不会追加“配置此磁盘（provision this disk）”的提示。虚拟机停止后，如果动作未完成或最终状态不是 `Stopped`，`incomplete_run_error` 会拒绝该次运行。随后 `probe_disk` 必须报告 `MachineIdFact::EmptyFile`，否则会报错 `[verify]` 且镜像不会被发布。最后通过 `fs::rename` 发布该工作副本。
 
 除非设置了 `VIBE_KEEP_FAILED_WORK=1`，否则任何错误都会删除 `<name>.tmp.<pid>`。失败的配置绝不会发布残缺的镜像。`failed_work_message` 会打印保留的路径，或提示你设置该环境变量。
 
@@ -178,7 +182,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 当探测返回 uid 0 时发送 `LoginReady`。在 `ActionsCompleted`（即 setup 发送、共享挂载和调用方动作均完成）之前，`input_open` 始终为 false。在此之前，键盘输入均会被丢弃。
 
-`legacy_login_prefix` 内的 setup 发送动作包括：`HISTCONTROL=ignorespace` 和 `unset HISTFILE`（使自动执行的命令不计入历史记录）、`stty -F /dev/hvc0 sane`、一个从 `/dev/hvc1` 读取 `rows cols` 并应用到 `hvc0` 的后台循环，随后通过 `write_file_into_vm` 将 `src/bashrc.sh` 写入 `/root/.profile`，并将 `src/bash_logout.sh` 写入 `/root/.bash_logout`。注销脚本在正常退出时会运行 `systemctl poweroff`。如果 shell 属于 SSH 会话、位于 tmux 内或 tmux 存在活动会话，则跳过关机。
+`legacy_login_prefix` 内的 setup 发送动作包括：`HISTCONTROL=ignorespace` 和 `unset HISTFILE`（使自动执行的命令不计入历史记录）、`stty -F /dev/hvc0 sane`、一个从 `/dev/hvc1` 读取 `rows cols` 并应用到 `hvc0` 的后台循环，随后通过 `write_file_into_vm` 将 `src/bash_logout.sh` 写入 `/root/.bash_logout`。它从不写入或 source `/root/.profile`；provision 与 `--write-bashrc` 改为在调用方的动作中加入 `write_bashrc_actions`。注销脚本在正常退出时会运行 `systemctl poweroff`。如果 shell 属于 SSH 会话、位于 tmux 内或 tmux 存在活动会话，则跳过关机。
 
 `Script` 动作（`script_command_and_status_marker`）将内容 base64 解码到 `/tmp/vibe-scripts/<id>.sh`，在 stdin 重定向自 `/dev/null` 的情况下运行该文件，并等待 `VIBE_SCRIPT_STATUS_<id>` 及其退出码。非零状态视为 `LoginActionFailed`。脚本超时时间为 24 小时。
 

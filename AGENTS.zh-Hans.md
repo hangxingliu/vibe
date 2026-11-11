@@ -17,12 +17,12 @@ Vibe 是一款轻量级、零配置的工具，旨在 ARM 架构的 Mac 上启�
 
 ## 核心文件与目录
 
-- `src/main.rs`：入口点、CLI 参数解析（通过 `lexopt`）、帮助文本，以及 run/provision 的 `main()` 分发（项目目录共享和登录操作）。其中的 `#[cfg(test)] mod tests` 覆盖 CLI 解析。
+- `src/main.rs`：入口点、CLI 参数解析（通过 `lexopt`）、帮助文本，以及 run/provision 的 `main()` 分发（项目目录共享和登录操作）。缓存共享由 `cache_share_specs` 从 `MISE_CACHE_SHARE`、`SYS_CACHE_SHARES` 和 `AGENT_CONF_SHARES` 中选取（`--[no-]mount-sys-cache`、`--[no-]mount-mise`、`--[no-]mount-agents-conf`）；`check_implicit_provision` 在隐式 provision `default.raw` 之前拒绝 `--no-mount-*`；`describe_vm_files` 在 VM 启动前打印共享目录与写入的文件。其中的 `#[cfg(test)] mod tests` 覆盖 CLI 解析和这些辅助函数。
 - `src/vm_io.rs`：宿主机终端和控制台 I/O：`OutputMonitor`（可取消的等待，返回 `WaitResult::{Found, Timeout, Closed}`、`wait_for_any`、`close()`）、`spawn_vm_io`、raw 模式、终端尺寸调整转发以及输入门控（`decide_user_input`：丢弃键盘输入直到自动操作完成；门控关闭时连续收到两次 Ctrl-C 则请求停止）。
 - `src/vm_config.rs`：Virtualization framework 配置。`VmSpec`（`DiskSpec`、`SerialRole`、`ShareDevice`）、`create_vm_configuration`、`default_interactive_spec`（历史沿用的单磁盘交互布局）、EFI 变量存储以及 `nsurl_from_path`。
 - `src/vm_lifecycle.rs`：启动已配置的虚拟机（`start_vm`）、请求停止（`request_stop`）、强制停止（`force_stop`）以及 `run_headless`（日志文件、控制帧、各阶段超时期限）。
 - `src/vm_run.rs`：`run_vm()`：引导磁盘启动，执行 root 登录和内部初始化，随后执行登录操作。返回 `RunOutcome`（所有操作完成、虚拟机正常停止以及仍在运行的调用方操作前缀）；操作错误使用 `[action N: label]`（N 从 1 开始统计调用方的操作），Ctrl-C 和强制停止使用 `[shutdown]`，虚拟机配置或启动错误使用 `[boot]`；若虚拟机未能进入 root shell 则报错并输出 `[boot]`/`[login]` 诊断信息。在加入操作线程之前会关闭 `OutputMonitor`，因此客户机关机时宿主机能立即退出。`drive_interactive` 与 `src/vm_checks/devices.rs` 共用。
-- `src/session.rs`：`LoginAction`、登录操作线程、`legacy_login_prefix()`（root 登录、`Password:` 检测、就绪探测、内部设置）、`LoginFailure` 诊断信息、`LoginAction::label()` 与 `action_prefix()`（绝不包含可能包含环境变量的 `--send` 文本）、`DiskSource` 与 `needs_provision_hint()`，以及构建客户机 shell 命令的辅助函数。
+- `src/session.rs`：`LoginAction`、登录操作线程、`legacy_login_prefix()`（root 登录、`Password:` 检测、就绪探测、内部设置，包括写入 `/root/.bash_logout`；从不写入或 source `/root/.profile`）、`write_bashrc_actions()`（把 `src/bashrc.sh` 写入 `/root/.profile` 并 source；由 provision 与 `--write-bashrc` 使用）、`LoginFailure` 诊断信息、`LoginAction::label()` 与 `action_prefix()`（绝不包含可能包含环境变量的 `--send` 文本）、`DiskSource` 与 `needs_provision_hint()`，以及构建客户机 shell 命令的辅助函数。
 - `src/image_dirs.rs`：`ImageDirs`，在 `run_main` 中由 `VIBE_EXTRA_IMAGE_DIR`（`:` 分隔的绝对路径）和 `VIBE_PREFERRED_IMAGE_DIR`（默认缓存目录或 extra 中的某一项，必须存在）构造一次。查找顺序为首选目录、默认目录、其余 extra 目录；不存在的 extra 目录会被跳过。提供 `find_file`、`existing` 和 `describe`（run/provision 开始时以及 `--help` 末尾打印的目录列表）。错误使用 `[image-dirs]` 前缀。共享目录、`vibe-usernet` 和维护日志始终位于默认目录。
 - `src/images.rs`：基础镜像下载与验证、镜像名称/路径（`find_named_image`、`new_image_path`、跨镜像目录查找的 `locate_debian_base`）以及实例磁盘。`fetch_verified` 和 `extract_disk_raw` 与 Alpine 缓存共用。Debian 下载保留了文件大小检查；其错误信息使用 `[download]` 前缀。
 - `src/alpine.rs`：固定版本的 Alpine 维护镜像（`ensure_alpine_image`）：下载、SHA-512、解压并检查分区 2 的 ext4 UUID。下载与修复只在首选镜像目录中进行；其他镜像目录中的 raw 在 UUID 匹配时以只读方式复用，否则打印警告并跳过。缓存的原始镜像为只读输入。错误使用 `[download]` 前缀。
@@ -67,7 +67,7 @@ Vibe 是一款轻量级、零配置的工具，旨在 ARM 架构的 Mac 上启�
 
 ## 常见任务
 
-- **添加默认挂载：** 修改 `main.rs` 中 `main()` 的 `directory_shares` 部分。
+- **添加默认挂载：** 在 `main.rs` 的 `SYS_CACHE_SHARES` 或 `AGENT_CONF_SHARES` 中添加缓存共享（由 `cache_share_specs` 选取），或修改 `run_main()` 中 `CliCommand::Run` 分支的项目目录共享。
 - **更新客户机预配配置：** 编辑 `provisioning/base.sh`。注意，这仅在创建 `default.raw` 的*首次*运行时生效。
 - **调整网络设置：** 查看 `src/networking.rs` 和 `NetworkMode` 枚举。
 - **修复权限问题：** `main.rs` 包含一个 `ensure_signed()` 函数，用于处理自签名和重新执行。

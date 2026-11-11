@@ -46,7 +46,7 @@ Image names (`--image`, `--base NAME`, `default`) go through `find_named_image`,
 | `<name>.tmp.<pid>.lock` | Next to `<name>.raw` | `FileLock::try_acquire_existing` | Sibling lock for the maintenance VM. The disk image itself is not flocked, because Virtualization.framework then refuses the attachment. |
 | `maint/<pid>-<nonce>/` | Next to the Alpine `.raw`, else preferred | `process_disk` | One maintenance run: Alpine clone, seed ISO, EFI variable store, console log. |
 | `logs/maint-<unix>-<pid>.log` | Default | `publish_log` | Published maintenance console with a header of full paths. The newest five logs are kept. |
-| `apt/`, `cargo/`, agent configuration, `guest_node_modules/` | Default | `create_cache_share` | VirtioFS share sources. |
+| `mise-cache/`, `apt/`, `cargo/`, `yarn/`, `m2/`, `go/`, `guest_node_modules/`; agent configuration (`codex/`, `copilot/`, ... only with `--mount-agents-conf`) | Default | `create_cache_share` | VirtioFS share sources, created only when they are mounted. |
 | `vibe-usernet` | Default | `ensure_usernet_helper_extracted` | Bundled user-mode network helper, written out when the cached bytes differ. |
 | `.vibe/instance.raw` | Project | `ensure_instance_disk` | Per-project disk, copied once from a template. This is the file a normal `vibe` boots. |
 | `.vibe/vibe-usernet.log` | Project | `NetworkMode::prepare` | Helper log for a project instance. An external `path/to/disk.raw` does not get one. |
@@ -94,7 +94,9 @@ Every published image has an empty `/etc/machine-id` and an empty root password 
 
 ### `run_main`
 
-`parse_cli` (`lexopt`) fills `CliArgs`. `run_main` creates the cache directory, builds `DEFAULT_CACHE_SHARES` through `create_cache_share`, calls `ensure_signed`, and prepares a closure over `NetworkMode::prepare`.
+`parse_cli` (`lexopt`) fills `CliArgs`. `run_main` creates the cache directory, calls `ensure_signed`, and prepares a closure over `NetworkMode::prepare`. Each command builds its own cache shares: `cache_share_specs(sys_cache, mise, agents_conf)` picks from `MISE_CACHE_SHARE`, `SYS_CACHE_SHARES`, and `AGENT_CONF_SHARES` (in that order), and `create_cache_shares` creates only those host directories.
+
+Before `run_vm`, run and provision print `describe_vm_files`: the directory shares (`host -> guest (mode)`) and the files Vibe writes into the VM, or `(none)`.
 
 In `nat` mode `guest_proxy` is `None`: the `vibe-usernet` helper applies `--proxy` itself, so the guest does not also receive proxy variables. In `vznat` mode the `--proxy` URL is passed into provisioning scripts and into login exports.
 
@@ -103,20 +105,22 @@ In `nat` mode `guest_proxy` is `None`: the `vibe-usernet` helper applies `--prox
 `CliCommand::Run` in `run_main`:
 
 1. Resolve the disk, as described above. `DiskSource` is `External` or `Instance`. The network log directory is `.vibe/` only for the instance disk.
-2. Unless `--no-default-mounts`: share the project directory at `/root/<project>` (`is_project_dir`), mask `.vibe` with tmpfs and `.env` with a bind-mounted empty file, share `node_modules` from the cache when the host directory exists, share or mask `.git` according to `--git` (default read-only; a `.git` file, as in a submodule, is skipped), then append the cache shares, the agent config directories (`codex`, `copilot`, `claude`, `gemini`, `pi`, `grok`, `opencode`), and `~/.tmux` when those host paths exist. A host `~/.tmux.conf` is queued as a `Send` that writes `/root/.tmux.conf`.
-3. Append host `--env` exports (`env_login_actions`), `HISTFILE`, the share table (`motd_login_action`), proxy exports when `guest_proxy` is set, and the `--ssh-key` commands (`authorized_keys`, `systemctl start ssh`, `ip -4 -br addr`).
+   For the default image, when `default.raw` does not exist yet, `check_implicit_provision` first rejects `--no-mount-sys-cache` / `--no-mount-mise` (the error names the options, the `default.raw` path, and `vibe provision`), before `ensure_default_image` looks up or downloads anything. `ensure_default_image` receives the cache directory and creates the shares only when it provisions, always with `cache_share_specs(true, true, false)`.
+2. Unless `--no-mount-cwd`: share the project directory at `/root/<project>` (`is_project_dir`) and `cd` into it. `--mount` shares are also `is_project_dir`. For every project directory, always: mask `.vibe` with tmpfs and `.env` with a bind-mounted empty file, share `node_modules` from the cache when the host directory exists, and share or mask `.git` according to `--git` (default read-only; a `.git` file, as in a submodule, is skipped). Then append `cache_share_specs(mount_sys_cache, mount_mise, mount_agents_conf)`; the agent config directories (`codex`, `copilot`, `claude`, `gemini`, `pi`, `grok`, `opencode`) only with `--mount-agents-conf`. With `--mount-tmux-conf`, `tmux_conf_mounts` shares `~/.tmux` read-only when it is a directory and queues a `Send` that writes host `~/.tmux.conf` to `/root/.tmux.conf`; when neither exists it prints a warning.
+3. With `--write-bashrc`, append `write_bashrc_actions` (write `src/bashrc.sh` to `/root/.profile`, then ` . /root/.profile`). Without it, nothing writes or sources `.profile`; the login shell has already read the image's own copy. Then append host `--env` exports (`env_login_actions`), `HISTFILE`, the share table (`motd_login_action`), proxy exports when `guest_proxy` is set, and the `--ssh-key` commands (`authorized_keys`, `systemctl start ssh`, `ip -4 -br addr`).
 4. Append the user's `--script`, `--send`, and `--expect` actions. `user_actions` is their index range so later errors number only those actions.
-5. Call `run_vm`.
+5. Print `describe_vm_files("Run", ...)` (`/root/.bash_logout`, plus `/root/.profile` and `/root/.tmux.conf` when written) and, for `--no-mount-mise` / `--no-mount-sys-cache`, a note that the tools in the shared directories are not available. Call `run_vm`.
 
 ### Provision
 
 `CliCommand::Provision`:
 
-- `--repl` with an existing image and without `--replace` prints a line and calls `run_vm` on that image (`DiskSource::CachedImage`). No scripts run, and the image is not probed.
+- The cache shares are `cache_share_specs(mount_sys_cache, mount_mise, false)`. `--no-mount-sys-cache` / `--no-mount-mise` print a note that the tools are installed into the image itself and that the image has to be run with the same option to see them.
+- `--repl` with an existing image and without `--replace` prints a line, the share log (`Provision`), and calls `run_vm` on that image (`DiskSource::CachedImage`) with `write_bashrc_actions` as its only actions. No scripts run, and the image is not probed.
 - Otherwise resolve `--base`. A value that contains `/` is a filesystem path. A value without `/` is `image_path` in the cache. With no `--base`, `ensure_base_image` supplies the Debian raw.
 - Call `provision_image`.
 
-`provision_image` (`src/provision.rs`) refuses to overwrite an existing `<name>.raw` unless `--replace` is set. It copies the base, calls `ensure_bootable`, grows the file, then builds login actions:
+`provision_image` (`src/provision.rs`) refuses to overwrite an existing `<name>.raw` unless `--replace` is set. It copies the base, calls `ensure_bootable`, grows the file, then builds login actions. They start with `write_bashrc_actions`: write `src/bashrc.sh` to `/root/.profile` and source it, so PATH and mise activation apply to the scripts and the file is saved with the image (errors here are `[login] setup send`). Then:
 
 1. One `Send` exporting `VIBE_PROVISION_IMAGE`, `VIBE_PROVISION_BASE`, `VIBE_GIT_SHA`, `VIBE_BUILD_DATE`, and `VIBE_PROVISION_SCRIPTS`.
 2. `Script` actions: `@base` from `build_provision_script` (the `INJECT_PROXY_CODE` region in `provisioning/base.sh` is filled when `guest_proxy` is set), then the extra scripts. This range is `user_actions`, so a script failure is `[action N: script '...']`.
@@ -124,7 +128,7 @@ In `nat` mode `guest_proxy` is `None`: the `vibe-usernet` helper applies `--prox
 4. `Send` / `Expect` of `VIBE_PROVISION_SUCCESS`.
 5. Without `--repl`, `systemctl poweroff; sleep 100`. With `--repl`, `run_vm` prints the interactive notice and waits for the user to exit.
 
-`run_vm` is called with `disk_source: None`, so a failure of this boot does not append a "provision this disk" hint. After the VM stops, `incomplete_run_error` rejects a run whose actions did not finish or whose final state is not `Stopped`. `probe_disk` must then report `MachineIdFact::EmptyFile`, or the error is `[verify]` and the image is not published. `fs::rename` publishes the work copy.
+Before `run_vm` it prints `describe_vm_files(stage, ...)` (`Provision`, or `Provision (implicit, for the default image)` from `ensure_default_image`) and the notes passed in by the caller. `run_vm` is called with `disk_source: None`, so a failure of this boot does not append a "provision this disk" hint. After the VM stops, `incomplete_run_error` rejects a run whose actions did not finish or whose final state is not `Stopped`. `probe_disk` must then report `MachineIdFact::EmptyFile`, or the error is `[verify]` and the image is not published. `fs::rename` publishes the work copy.
 
 Any error deletes `<name>.tmp.<pid>` unless `VIBE_KEEP_FAILED_WORK=1`. A failed provision never publishes a partial image. `failed_work_message` prints the kept path, or tells you to set the variable.
 
@@ -178,7 +182,7 @@ When the VM leaves `Running`, or a stop was requested, `output_monitor.close()` 
 
 `LoginReady` is sent when the probe returns uid 0. `input_open` stays false until `ActionsCompleted`, which is after the setup sends, the share mounts, and the caller's actions. Until then the keyboard is discarded.
 
-The setup sends inside `legacy_login_prefix` are: `HISTCONTROL=ignorespace` and `unset HISTFILE` (so the automatic commands stay out of history), `stty -F /dev/hvc0 sane`, a background loop that reads `rows cols` from `/dev/hvc1` and applies them to `hvc0`, then `write_file_into_vm` of `src/bashrc.sh` to `/root/.profile` and `src/bash_logout.sh` to `/root/.bash_logout`. The logout script runs `systemctl poweroff` on a normal exit. It skips poweroff when the shell is SSH, is inside tmux, or tmux has a session.
+The setup sends inside `legacy_login_prefix` are: `HISTCONTROL=ignorespace` and `unset HISTFILE` (so the automatic commands stay out of history), `stty -F /dev/hvc0 sane`, a background loop that reads `rows cols` from `/dev/hvc1` and applies them to `hvc0`, then `write_file_into_vm` of `src/bash_logout.sh` to `/root/.bash_logout`. It never writes or sources `/root/.profile`; provision and `--write-bashrc` add `write_bashrc_actions` to the caller's actions instead. The logout script runs `systemctl poweroff` on a normal exit. It skips poweroff when the shell is SSH, is inside tmux, or tmux has a session.
 
 `Script` actions (`script_command_and_status_marker`) base64-decode into `/tmp/vibe-scripts/<id>.sh`, run the file with stdin from `/dev/null`, and wait for `VIBE_SCRIPT_STATUS_<id>` plus the exit code. A non-zero status is `LoginActionFailed`. The script timeout is 24 hours.
 

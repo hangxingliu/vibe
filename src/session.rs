@@ -82,7 +82,9 @@ pub(crate) fn action_prefix(
 }
 
 /// Actions that every VM boot starts with: the legacy root login with its
-/// readiness probe, followed by the internal shell setup.
+/// readiness probe, followed by the internal shell setup. It writes
+/// `/root/.bash_logout` but never writes or sources `/root/.profile`; see
+/// `write_bashrc_actions`.
 pub(crate) fn legacy_login_prefix(
     timeout: Duration,
 ) -> Result<Vec<LoginAction>, Box<dyn std::error::Error>> {
@@ -100,12 +102,20 @@ pub(crate) fn legacy_login_prefix(
             const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
             S.to_string()
         }),
-        //
-        Send(write_file_into_vm("/root/.profile", BASHRC_SCRIPT)?),
         Send(write_file_into_vm(
             "/root/.bash_logout",
             BASH_LOGOUT_SCRIPT,
         )?),
+    ])
+}
+
+/// Writes `src/bashrc.sh` to /root/.profile and sources it in the current shell.
+/// The two actions always go together: a `.profile` the user may have changed is
+/// never sourced again by Vibe.
+pub(crate) fn write_bashrc_actions() -> Result<Vec<LoginAction>, Box<dyn std::error::Error>> {
+    Ok(vec![
+        Send(write_file_into_vm("/root/.profile", BASHRC_SCRIPT)?),
+        Send(" . /root/.profile".to_string()),
     ])
 }
 
@@ -681,6 +691,34 @@ mod tests {
         assert!(prefix[1..].iter().all(|action| matches!(action, Send(_))));
     }
 
+    fn sent(actions: &[LoginAction]) -> Vec<&str> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Send(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_write_bashrc_actions_touch_the_profile() {
+        let prefix = legacy_login_prefix(LONG).unwrap();
+        let prefix = sent(&prefix);
+        assert!(
+            prefix
+                .iter()
+                .any(|text| text.contains("'/root/.bash_logout'"))
+        );
+        assert!(!prefix.iter().any(|text| text.contains("/root/.profile")));
+
+        let bashrc = write_bashrc_actions().unwrap();
+        let bashrc = sent(&bashrc);
+        assert_eq!(bashrc.len(), 2);
+        assert!(bashrc[0].contains("> '/root/.profile'"));
+        assert_eq!(bashrc[1], " . /root/.profile");
+    }
+
     fn actions_thread(
         actions: Vec<LoginAction>,
         monitor: &Arc<OutputMonitor>,
@@ -830,6 +868,22 @@ mod tests {
             !Send("export X=secret".to_string())
                 .label()
                 .contains("secret")
+        );
+    }
+
+    #[test]
+    fn empty_user_range_position_decides_setup_or_shutdown() {
+        // `provision --repl` on an existing image passes only Vibe's `.profile`
+        // actions (caller actions 7..9) and no user actions.
+        let caller = 7..9;
+        let profile = Send(" . /root/.profile".to_string());
+        assert_eq!(
+            action_prefix(8, &caller, &(9..9), &profile),
+            "[login] setup send"
+        );
+        assert_eq!(
+            action_prefix(8, &caller, &(7..7), &profile),
+            "[shutdown] send"
         );
     }
 

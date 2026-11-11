@@ -20,11 +20,23 @@ This forked version introduces several core improvements, focusing on custom env
     - **Configurable Git Sharing**: Added the `--git <rw | ro | no>` flag to control access to the host's `.git` folder (defaults to read-only `ro` to prevent agents from corrupting repository history; `no` masks `.git` entirely via tmpfs).
     - **`node_modules` Sandboxing**: Automatically mounts `node_modules` to a dedicated guest cache directory, improving disk I/O performance (bypassing slow VirtioFS translation) and keeping the host project clean.
     - **Sensitive Data Masking**: Securely masks `.env` files and `.vibe` subfolders inside the VM via tmpfs mounts.
-    - **CLI Config Isolation**: Separates critical host configuration directories (for Claude, Codex, Gemini, etc.) from the guest VM to prevent credential leakage.
+    - **CLI Config Isolation**: Separates critical host configuration directories (for Claude, Codex, Gemini, etc.) from the guest VM to prevent credential leakage. Vibe keeps its own agent configuration directories in the cache directory; they are not mounted unless you pass `--mount-agents-conf`.
 5. **Custom Provisioning for Base System Images**:
     - Use `vibe provision --repl` to provision the base image via commands inside the VM after the provisioning script finishes.
 6. **Guest Environment & I/O Optimizations**:
-    - Automatically syncs host configurations (like `~/.tmux.conf`) to the guest VM on boot, and provisions clean `.profile` and `.bash_logout` setups.
+    - Syncs host tmux configuration (`~/.tmux`, `~/.tmux.conf`) into the guest VM on boot with `--mount-tmux-conf`.
+    - Provisioning writes a clean `.profile` into the image; `--write-bashrc` rewrites it when running. `.bash_logout` (power off on `exit`) is written on every boot.
+    - Fine-grained control over the default mounts: `--no-mount-cwd`, `--no-mount-sys-cache`, and `--no-mount-mise` (see [Default mounts and files](#default-mounts-and-files)).
+
+### Breaking changes
+
+The version number is still 1.0.0, but these changes are not backward compatible:
+
+- `--no-default-mounts` was removed. Use `--no-mount-cwd`, `--no-mount-sys-cache`, and `--no-mount-mise` instead.
+  The `.vibe`/`.env`/`.git` masking and the `node_modules` share of project directories (the current directory and `--mount` shares) can no longer be turned off.
+- The agent configuration directories (codex, copilot, claude, gemini, pi, grok, opencode) and the tmux configuration are no longer mounted by default. Pass `--mount-agents-conf` and `--mount-tmux-conf`.
+- Running a VM no longer rewrites or sources `/root/.profile`. Pass `--write-bashrc` to rewrite it with Vibe's built-in configuration and source it right away. Provisioning still writes and sources it.
+- While `default.raw` does not exist yet, `vibe` refuses `--no-mount-sys-cache` and `--no-mount-mise`. Create the default image explicitly with `vibe provision` first.
 
 CLI parsing unit tests live in the `#[cfg(test)] mod tests` at the end of `src/main.rs` and run as part of `cargo test`.
 
@@ -50,10 +62,6 @@ Host                                      Guest                    Mode
 /Users/dev/.cache/vibe/.guest-mise-cache  /root/.local/share/mise  read-write
 /Users/dev/.m2                            /root/.m2                read-write
 /Users/dev/.cargo/registry                /root/.cargo/registry    read-write
-/Users/dev/.codex                         /root/.codex             read-write
-/Users/dev/.claude                        /root/.claude            read-write
-/Users/dev/.gemini                        /root/.gemini            read-write
-/Users/dev/.pi                            /root/.pi                read-write
 
 root@vibe:~/my-project#
 ```
@@ -153,7 +161,7 @@ vibe provision [OPTIONS] [PROVISIONING-OPTIONS] [@built-in | path/to/script.sh .
 
 Options may appear before or after `provision`.
 `--base`, `--replace`, and `--repl` are only valid with `provision`.
-Login actions, `--no-default-mounts`, `--env`, `--mount`, `--git`, and `--ssh-key` are only valid when running a VM.
+Login actions, `--[no-]mount-cwd`, `--[no-]mount-tmux-conf`, `--[no-]mount-agents-conf`, `--[no-]write-bashrc`, `--env`, `--mount`, `--git`, and `--ssh-key` are only valid when running a VM.
 
 `path/to/disk.raw`, when given, is booted as-is. Run time does not inspect or modify the disk. An unprepared current Debian image must be copied first with `vibe provision --base`.
 
@@ -166,7 +174,21 @@ Options:
                                                             Provision: name of the image to create (default `default`).
   --cpus COUNT                                              Number of virtual CPUs (default 2).
   --ram MEGABYTES                                           RAM size in megabytes (default 2048 when running, 4096 when provisioning).
-  --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
+  --no-mount-sys-cache                                      Do not mount the shared apt, cargo, yarn, m2, and go caches (run and provision).
+                                                            Tools installed into them during provisioning (e.g. Rust) are not available.
+  --no-mount-mise                                           Do not mount the shared mise data directory at /root/.local/share/mise (run and provision).
+                                                            Tools installed into it by mise during provisioning are not available.
+  --no-mount-cwd                                            Do not share the current directory at /root/<project> or cd into it.
+  --mount-tmux-conf                                         Share host ~/.tmux (read-only) and copy host ~/.tmux.conf into the VM.
+  --mount-agents-conf                                       Mount the shared coding agent configuration directories
+                                                            (codex, copilot, claude, gemini, pi, grok, opencode) from the cache directory.
+  --write-bashrc                                            Overwrite /root/.profile with Vibe's built-in bash configuration and source it.
+                                                            Provisioning always does this.
+
+  Each of the six options above also has the opposite form (`--mount-mise`, `--no-write-bashrc`, ...); the last one given wins.
+  When running, `--no-mount-sys-cache` and `--no-mount-mise` require an existing default image (create it first with `vibe provision`).
+  Project directories (the current directory and `--mount` shares) always have `.vibe` and `.env` masked.
+
   --env NAME                                                Export host environment variable NAME inside VM.
                                                             Errors if NAME is unset or empty.
   --mount HOST_PATH:GUEST_PATH[:read-only | :read-write]    Mount HOST_PATH inside VM at GUEST_PATH (default mode `:read-write`)
@@ -245,6 +267,33 @@ Built-in provisioning scripts:
   
 ```
 
+## Default mounts and files
+
+Before a VM starts, `vibe` and `vibe provision` print the directories shared into it and the files Vibe writes into it.
+
+When running a VM:
+
+| What | Default | Option |
+| --- | --- | --- |
+| Current directory at `/root/<project>`, `cd` into it | on | `--no-mount-cwd` |
+| `.vibe`/`.env` masking, `node_modules`, `.git` handling of project directories (current directory and `--mount`) | always | - |
+| Shared caches `apt`, `cargo`, `yarn`, `m2`, `go` | on | `--no-mount-sys-cache` |
+| Shared mise data at `/root/.local/share/mise` | on | `--no-mount-mise` |
+| Host `~/.tmux` (read-only) and `~/.tmux.conf` | off | `--mount-tmux-conf` |
+| Agent configuration (codex, copilot, claude, gemini, pi, grok, opencode) from the cache directory | off | `--mount-agents-conf` |
+| Write Vibe's `.profile` and source it | off | `--write-bashrc` |
+| Write `.bash_logout` (power off on `exit`) | always | - |
+
+Every option also has the opposite form (`--mount-mise`, `--no-write-bashrc`, ...); the last one given wins.
+Provisioning accepts `--[no-]mount-sys-cache` and `--[no-]mount-mise`, always writes and sources `.profile`, and never mounts the current directory, tmux, or agent configuration.
+
+The shared caches are where provisioning installs many tools: `@rust` installs Rust into `/root/.cargo`, and mise installs its tools into `/root/.local/share/mise`.
+So:
+
+- Running with `--no-mount-sys-cache` or `--no-mount-mise` hides the tools that provisioning put into the shared directories (Vibe prints a note).
+- Provisioning with `--no-mount-sys-cache` or `--no-mount-mise` installs those tools into the image itself. Run that image with the same options to use them; otherwise the shared directories are mounted over them and hide them.
+- The default image is shared by all projects, so `vibe` only creates it with the shared directories mounted. If `default.raw` does not exist yet, `vibe --no-mount-mise` fails and asks you to run `vibe provision` (with or without these options) first.
+
 ## Keeping images on another disk
 
 Disk images are large. If you'd rather keep them on an external drive, list extra image directories with two optional environment variables:
@@ -301,14 +350,14 @@ When an image is found by name, Vibe prints its full path.
   - Network requests are made during the boot process, and if you're offline they take several *minutes* to timeout before the login prompt is reached (thanks, `systemd-networkd-wait-online.service`).
   - Subsequent boots are much slower (at least, I couldn't easily figure out how to remove the associated cloud init machinery).
 
-- Claude Code requires both your `~/.claude` folder (shared in the VM by default) and also the `~/.claude.json` file for auth credentials and session history.
+- Claude Code requires both your `~/.claude` folder (shared in the VM with `--mount-agents-conf`) and also the `~/.claude.json` file for auth credentials and session history.
   VirtioFS only works with folders, so there's not a nice way to "mount" the latter inside the VM.
   Here's what I recommend:
   - Run `claude` and login. (You can do this in a VM or on your actual machine if you trust `claude`.)
   - `mv ~/.claude.json ~/.claude/dot_claude_dot_json_should_have_been_here.json`
   - make a shell alias/script to launch Vibe as:
 
-        vibe --send "ln -fs ~/.claude/dot_claude_dot_json_should_have_been_here.json ~/.claude.json" \
+        vibe --mount-agents-conf --send "ln -fs ~/.claude/dot_claude_dot_json_should_have_been_here.json ~/.claude.json" \
              --send "IS_SANDBOX=1 claude --allow-dangerously-skip-permissions --dangerously-skip-permissions"
 
 

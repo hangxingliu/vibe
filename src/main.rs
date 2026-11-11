@@ -50,16 +50,33 @@ const DEFAULT_IMAGE_NAME: &str = "default";
 const INSTANCE_DIR_NAME: &str = ".vibe";
 const INSTANCE_DISK_IMAGE_NAME: &str = "instance.raw";
 
-/// CACHE_NAME:GUEST_VM_PATH
-/// these shares will be mounted in provision stage and vm runtime stage
-const DEFAULT_CACHE_SHARES: &[&str] = &[
-    "mise-cache:/root/.local/share/mise",
+/// CACHE_NAME:GUEST_VM_PATH. Mounted when running and provisioning unless `--no-mount-sys-cache`.
+const SYS_CACHE_SHARES: &[&str] = &[
     "apt:/var/cache/apt",
     "cargo:/root/.cargo",
     "yarn:/root/.yarn",
     "m2:/root/.m2",
     "go:/root/go",
 ];
+
+/// Mounted when running and provisioning unless `--no-mount-mise`.
+const MISE_CACHE_SHARE: &str = "mise-cache:/root/.local/share/mise";
+
+/// Only mounted when running with `--mount-agents-conf`.
+const AGENT_CONF_SHARES: &[&str] = &[
+    "codex:/root/.codex",
+    "copilot:/root/.copilot",
+    "claude:/root/.claude",
+    "gemini:/root/.gemini",
+    "pi:/root/.pi",
+    "grok:/root/.grok",
+    "opencode:/root/.config/opencode",
+];
+
+const RUN_NO_MOUNT_MISE_NOTE: &str = "Note: --no-mount-mise: the shared mise directory is not mounted; tools that mise installed into it during provisioning are not available in this VM.";
+const RUN_NO_MOUNT_SYS_CACHE_NOTE: &str = "Note: --no-mount-sys-cache: the shared apt, cargo, yarn, m2, and go caches are not mounted; tools installed into them during provisioning (e.g. Rust) are not available in this VM.";
+const PROVISION_NO_MOUNT_MISE_NOTE: &str = "Note: --no-mount-mise: mise tools are installed into the image itself. Run this image with --no-mount-mise to use them; otherwise the shared mise directory hides them.";
+const PROVISION_NO_MOUNT_SYS_CACHE_NOTE: &str = "Note: --no-mount-sys-cache: tools installed into the cache directories (e.g. Rust in /root/.cargo) are written into the image itself. Run this image with --no-mount-sys-cache to use them; otherwise the shared cache directories hide them.";
 
 /// Project subfolders masked with tmpfs to prevent host data leaking into the VM.
 const MASKED_SUBFOLDERS: &[&str] = &[".vibe"];
@@ -215,7 +232,7 @@ vibe provision [OPTIONS] [PROVISIONING-OPTIONS] [@built-in | path/to/script.sh .
 
 Options may appear before or after `provision`.
 `--base`, `--replace`, and `--repl` are only valid with `provision`.
-Login actions, `--no-default-mounts`, `--env`, `--mount`, `--git`, and `--ssh-key` are only valid when running a VM.
+Login actions, `--[no-]mount-cwd`, `--[no-]mount-tmux-conf`, `--[no-]mount-agents-conf`, `--[no-]write-bashrc`, `--env`, `--mount`, `--git`, and `--ssh-key` are only valid when running a VM.
 
 `path/to/disk.raw`, when given, is booted as-is. Run time does not inspect or modify the disk. An unprepared current Debian image must be copied first with `vibe provision --base`.
 
@@ -228,7 +245,21 @@ Options:
                                                             Provision: name of the image to create (default `default`).
   --cpus COUNT                                              Number of virtual CPUs (default 2).
   --ram MEGABYTES                                           RAM size in megabytes (default 2048 when running, 4096 when provisioning).
-  --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
+  --no-mount-sys-cache                                      Do not mount the shared apt, cargo, yarn, m2, and go caches (run and provision).
+                                                            Tools installed into them during provisioning (e.g. Rust) are not available.
+  --no-mount-mise                                           Do not mount the shared mise data directory at /root/.local/share/mise (run and provision).
+                                                            Tools installed into it by mise during provisioning are not available.
+  --no-mount-cwd                                            Do not share the current directory at /root/<project> or cd into it.
+  --mount-tmux-conf                                         Share host ~/.tmux (read-only) and copy host ~/.tmux.conf into the VM.
+  --mount-agents-conf                                       Mount the shared coding agent configuration directories
+                                                            (codex, copilot, claude, gemini, pi, grok, opencode) from the cache directory.
+  --write-bashrc                                            Overwrite /root/.profile with Vibe's built-in bash configuration and source it.
+                                                            Provisioning always does this.
+
+  Each of the six options above also has the opposite form (`--mount-mise`, `--no-write-bashrc`, ...); the last one given wins.
+  When running, `--no-mount-sys-cache` and `--no-mount-mise` require an existing default image (create it first with `vibe provision`).
+  Project directories (the current directory and `--mount` shares) always have `.vibe` and `.env` masked.
+
   --env NAME                                                Export host environment variable NAME inside VM.
                                                             Errors if NAME is unset or empty.
   --mount HOST_PATH:GUEST_PATH[:read-only | :read-write]    Mount HOST_PATH inside VM at GUEST_PATH (default mode `:read-write`)
@@ -312,11 +343,6 @@ Cache directory:
     // Prepare system-wide directories
     fs::create_dir_all(&cache_dir)?;
 
-    let default_shares = DEFAULT_CACHE_SHARES
-        .iter()
-        .map(|share| create_cache_share(&cache_dir, share))
-        .collect::<Result<Vec<_>, _>>()?;
-
     ensure_signed();
 
     println!("{}", image_dirs.describe());
@@ -358,6 +384,11 @@ Cache directory:
             ram_bytes,
         } => {
             let existing_image_raw = find_named_image(&image_dirs, &image);
+            let provision_shares = create_cache_shares(
+                &cache_dir,
+                &cache_share_specs(args.mount_sys_cache, args.mount_mise, false),
+            )?;
+            let notes = provision_share_notes(args.mount_sys_cache, args.mount_mise);
 
             // --repl with an existing image and no --replace: boot the image interactively
             // without re-running any provisioning scripts.
@@ -366,13 +397,24 @@ Cache directory:
                     "Image '{image}' already exists at {}; booting it for interactive use (--repl).",
                     existing.display()
                 );
+                let login_actions = write_bashrc_actions()?;
+                print!(
+                    "{}",
+                    describe_vm_files("Provision", &provision_shares, PROVISION_WRITTEN_FILES)
+                );
+                for note in &notes {
+                    println!("{note}");
+                }
+                // No caller actions are user actions; an empty range at the end
+                // keeps the `.profile` setup labelled as `[login] setup`.
+                let no_user_actions = login_actions.len()..login_actions.len();
                 return run_vm(
                     existing,
                     Some(&DiskSource::CachedImage(image.clone())),
                     None,
-                    &[],
-                    0..0,
-                    &default_shares,
+                    &login_actions,
+                    no_user_actions,
+                    &provision_shares,
                     prepare_network_backend,
                     cpu_count,
                     ram_bytes,
@@ -415,7 +457,9 @@ Cache directory:
                 replace,
                 repl,
                 &scripts,
-                &default_shares,
+                &provision_shares,
+                "Provision",
+                &notes,
                 prepare_network_backend,
                 &guest_proxy,
                 cpu_count,
@@ -452,10 +496,17 @@ Cache directory:
                 let template_raw = if image == DEFAULT_IMAGE_NAME {
                     let default_raw = find_named_image(&image_dirs, &image)
                         .unwrap_or_else(|| new_image_path(&image_dirs, &image));
+                    if !default_raw.exists() {
+                        check_implicit_provision(
+                            args.mount_sys_cache,
+                            args.mount_mise,
+                            &default_raw,
+                        )?;
+                    }
                     ensure_default_image(
                         &image_dirs,
                         &default_raw,
-                        &default_shares,
+                        &cache_dir,
                         prepare_network_backend,
                         &guest_proxy,
                     )?;
@@ -475,8 +526,11 @@ Cache directory:
 
             let mut login_actions = Vec::new();
             let mut directory_shares = Vec::new();
+            // (guest path, source) of the files written into the VM, for the host log.
+            let mut written_files: Vec<(&str, String)> =
+                vec![("/root/.bash_logout", "built-in".to_string())];
 
-            if !args.no_default_mounts {
+            if args.mount_cwd {
                 login_actions.push(Send(format!(" cd {project_name}")));
 
                 directory_shares.push(
@@ -495,115 +549,105 @@ Cache directory:
                 directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
             }
 
-            if !args.no_default_mounts {
-                let mut extra_shares = Vec::new();
+            // Project directories (the current directory and `--mount` shares) are
+            // always masked, so host secrets do not leak into the VM.
+            let mut extra_shares = Vec::new();
 
-                // Collect project dirs to mask. We use a separate vector to avoid borrow checker issues
-                // and because we want to add .git shares at the end of the list to ensure they are
-                // mounted after their parent directories.
-                let project_shares: Vec<DirectoryShare> = directory_shares
-                    .iter()
-                    .filter(|s| s.is_project_dir)
-                    .cloned()
-                    .collect();
+            // Collect project dirs to mask. We use a separate vector to avoid borrow checker issues
+            // and because we want to add .git shares at the end of the list to ensure they are
+            // mounted after their parent directories.
+            let project_shares: Vec<DirectoryShare> = directory_shares
+                .iter()
+                .filter(|s| s.is_project_dir)
+                .cloned()
+                .collect();
 
-                for share in project_shares {
-                    // Discourage read/write of project dir subfolders within the VM.
-                    for subfolder in MASKED_SUBFOLDERS {
-                        if share.host.join(subfolder).exists() {
+            for share in project_shares {
+                // Discourage read/write of project dir subfolders within the VM.
+                for subfolder in MASKED_SUBFOLDERS {
+                    if share.host.join(subfolder).exists() {
+                        login_actions.push(Send(format!(
+                            " mount -t tmpfs tmpfs {}",
+                            share.guest.join(subfolder).display()
+                        )));
+                    }
+                }
+
+                if share.host.join("node_modules").is_dir() {
+                    let share_tag = share.tag();
+                    let node_modules_share = DirectoryShare::new(
+                        cache_dir.join(format!("guest_node_modules/{share_tag}")),
+                        share.guest.join("node_modules"),
+                        false,
+                        true,
+                        false,
+                    );
+                    extra_shares.push(node_modules_share?);
+                }
+
+                // Handle .git directory masking or read-only sharing
+                let git_path = share.host.join(".git");
+                if git_path.exists() {
+                    match args.git_mode {
+                        GitMode::No => {
                             login_actions.push(Send(format!(
                                 " mount -t tmpfs tmpfs {}",
-                                share.guest.join(subfolder).display()
+                                share.guest.join(".git").display()
                             )));
                         }
-                    }
-
-                    if share.host.join("node_modules").is_dir() {
-                        let share_tag = share.tag();
-                        let node_modules_share = DirectoryShare::new(
-                            cache_dir.join(format!("guest_node_modules/{share_tag}")),
-                            share.guest.join("node_modules"),
-                            false,
-                            true,
-                            false,
-                        );
-                        extra_shares.push(node_modules_share?);
-                    }
-
-                    // Handle .git directory masking or read-only sharing
-                    let git_path = share.host.join(".git");
-                    if git_path.exists() {
-                        match args.git_mode {
-                            GitMode::No => {
-                                login_actions.push(Send(format!(
-                                    " mount -t tmpfs tmpfs {}",
-                                    share.guest.join(".git").display()
-                                )));
+                        GitMode::Ro => {
+                            // VirtioFS can only share directories; skip if .git is a file
+                            // (e.g. git submodules store a gitdir pointer file, not a directory).
+                            if git_path.is_dir() {
+                                extra_shares.push(DirectoryShare::new(
+                                    git_path,
+                                    share.guest.join(".git"),
+                                    true,
+                                    false,
+                                    false,
+                                )?);
                             }
-                            GitMode::Ro => {
-                                // VirtioFS can only share directories; skip if .git is a file
-                                // (e.g. git submodules store a gitdir pointer file, not a directory).
-                                if git_path.is_dir() {
-                                    extra_shares.push(DirectoryShare::new(
-                                        git_path,
-                                        share.guest.join(".git"),
-                                        true,
-                                        false,
-                                        false,
-                                    )?);
-                                }
-                            }
-                            GitMode::Rw => {}
                         }
+                        GitMode::Rw => {}
                     }
+                }
 
-                    // Mask individual files by bind-mounting an empty file over them to prevent
-                    // host file contents (e.g. secrets) from being readable inside the VM.
-                    for filename in MASKED_FILES {
-                        if share.host.join(filename).exists() {
-                            login_actions.push(Send(format!(
+                // Mask individual files by bind-mounting an empty file over them to prevent
+                // host file contents (e.g. secrets) from being readable inside the VM.
+                for filename in MASKED_FILES {
+                    if share.host.join(filename).exists() {
+                        login_actions.push(Send(format!(
                         r#" [ -n "$__masked_tmp_file" ] || __masked_tmp_file="$(mktemp)"; mount -o bind "$__masked_tmp_file" {}"#,
                         share.guest.join(filename).display()
                     )));
-                        }
                     }
                 }
-                directory_shares.extend(extra_shares);
+            }
+            directory_shares.extend(extra_shares);
 
-                directory_shares.extend(default_shares);
+            directory_shares.extend(create_cache_shares(
+                &cache_dir,
+                &cache_share_specs(
+                    args.mount_sys_cache,
+                    args.mount_mise,
+                    args.mount_agents_conf,
+                ),
+            )?);
 
-                // Add default shares, if they exist
-                for share in [
-                    create_cache_share(&cache_dir, "codex:/root/.codex"),
-                    create_cache_share(&cache_dir, "copilot:/root/.copilot"),
-                    create_cache_share(&cache_dir, "claude:/root/.claude"),
-                    create_cache_share(&cache_dir, "gemini:/root/.gemini"),
-                    create_cache_share(&cache_dir, "pi:/root/.pi"),
-                    create_cache_share(&cache_dir, "grok:/root/.grok"),
-                    create_cache_share(&cache_dir, "opencode:/root/.config/opencode"),
-                    //
-                    DirectoryShare::new(
-                        home.join(".tmux"),
-                        "/root/.tmux".into(),
-                        true,
-                        false,
-                        false,
-                    ),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    directory_shares.push(share);
+            if args.mount_tmux_conf {
+                let (tmux_share, tmux_conf) = tmux_conf_mounts(&home)?;
+                directory_shares.extend(tmux_share);
+                if let Some((action, host_path)) = tmux_conf {
+                    login_actions.push(action);
+                    written_files
+                        .push(("/root/.tmux.conf", format!("from {}", host_path.display())));
                 }
+            }
 
-                // Provision ~/.tmux.conf
-                let tmux_conf = home.join(".tmux.conf");
-                if tmux_conf.exists() {
-                    login_actions.push(Send(write_file_into_vm(
-                        "/root/.tmux.conf",
-                        &fs::read_to_string(&tmux_conf)?,
-                    )?));
-                }
+            // Written before the `--env` exports so `.profile` cannot override them.
+            if args.write_bashrc {
+                login_actions.extend(write_bashrc_actions()?);
+                written_files.push(("/root/.profile", "built-in".to_string()));
             }
 
             login_actions.extend(env_login_actions(&args.env));
@@ -640,6 +684,18 @@ Cache directory:
             let user_actions = login_actions.len()..login_actions.len() + args.login_actions.len();
             login_actions.extend(args.login_actions);
 
+            let written_files: Vec<(&str, &str)> = written_files
+                .iter()
+                .map(|(guest, source)| (*guest, source.as_str()))
+                .collect();
+            print!(
+                "{}",
+                describe_vm_files("Run", &directory_shares, &written_files)
+            );
+            for note in run_share_notes(args.mount_sys_cache, args.mount_mise) {
+                println!("{note}");
+            }
+
             run_vm(
                 &disk_path,
                 Some(&disk_source),
@@ -661,7 +717,18 @@ struct CliArgs {
     command: CliCommand,
     version: bool,
     help: bool,
-    no_default_mounts: bool,
+    /// Default true. Run and provision.
+    mount_sys_cache: bool,
+    /// Default true. Run and provision.
+    mount_mise: bool,
+    /// Default true. Run only.
+    mount_cwd: bool,
+    /// Default false. Run only.
+    mount_tmux_conf: bool,
+    /// Default false. Run only.
+    mount_agents_conf: bool,
+    /// Default false. Run only; provisioning always writes `/root/.profile`.
+    write_bashrc: bool,
     env: HashMap<String, String>,
     mounts: Vec<String>,
     login_actions: Vec<LoginAction>,
@@ -775,6 +842,20 @@ where
         Ok(())
     }
 
+    // A run-only `--NAME` / `--no-NAME` pair; the last form given wins.
+    // Returns true for `--NAME` (`on`) and false for `--no-NAME` (`off`).
+    fn run_only_switch(
+        parsing_provision: bool,
+        run_only: &mut Option<&'static str>,
+        flag: &str,
+        on: &'static str,
+        off: &'static str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let enabled = flag == on.trim_start_matches('-');
+        reject_run_only(parsing_provision, run_only, if enabled { on } else { off })?;
+        Ok(enabled)
+    }
+
     let mut parser = lexopt::Parser::from_args(args);
     let mut parsing_provision = false;
     let mut run_only: Option<&'static str> = None;
@@ -787,7 +868,12 @@ where
     let mut image_seen = false;
     let mut version = false;
     let mut help = false;
-    let mut no_default_mounts = false;
+    let mut mount_sys_cache = true;
+    let mut mount_mise = true;
+    let mut mount_cwd = true;
+    let mut mount_tmux_conf = false;
+    let mut mount_agents_conf = false;
+    let mut write_bashrc = false;
     let mut env_vars = HashMap::new();
     let mut mounts = Vec::new();
     let mut login_actions = Vec::new();
@@ -816,9 +902,45 @@ where
                 image = os_to_string(parser.value()?, "--image")?;
                 assert_valid_image_name(&image);
             }
-            Long("no-default-mounts") => {
-                reject_run_only(parsing_provision, &mut run_only, "--no-default-mounts")?;
-                no_default_mounts = true;
+            Long("mount-sys-cache") => mount_sys_cache = true,
+            Long("no-mount-sys-cache") => mount_sys_cache = false,
+            Long("mount-mise") => mount_mise = true,
+            Long("no-mount-mise") => mount_mise = false,
+            Long(flag @ ("mount-cwd" | "no-mount-cwd")) => {
+                mount_cwd = run_only_switch(
+                    parsing_provision,
+                    &mut run_only,
+                    flag,
+                    "--mount-cwd",
+                    "--no-mount-cwd",
+                )?;
+            }
+            Long(flag @ ("mount-tmux-conf" | "no-mount-tmux-conf")) => {
+                mount_tmux_conf = run_only_switch(
+                    parsing_provision,
+                    &mut run_only,
+                    flag,
+                    "--mount-tmux-conf",
+                    "--no-mount-tmux-conf",
+                )?;
+            }
+            Long(flag @ ("mount-agents-conf" | "no-mount-agents-conf")) => {
+                mount_agents_conf = run_only_switch(
+                    parsing_provision,
+                    &mut run_only,
+                    flag,
+                    "--mount-agents-conf",
+                    "--no-mount-agents-conf",
+                )?;
+            }
+            Long(flag @ ("write-bashrc" | "no-write-bashrc")) => {
+                write_bashrc = run_only_switch(
+                    parsing_provision,
+                    &mut run_only,
+                    flag,
+                    "--write-bashrc",
+                    "--no-write-bashrc",
+                )?;
             }
             Long("env") => {
                 reject_run_only(parsing_provision, &mut run_only, "--env")?;
@@ -975,7 +1097,12 @@ where
         command,
         version,
         help,
-        no_default_mounts,
+        mount_sys_cache,
+        mount_mise,
+        mount_cwd,
+        mount_tmux_conf,
+        mount_agents_conf,
+        write_bashrc,
         env: env_vars,
         mounts,
         login_actions,
@@ -997,6 +1124,154 @@ fn create_cache_share(
 ) -> Result<DirectoryShare, Box<dyn std::error::Error>> {
     let (name, guest_path) = share.split_once(':').unwrap();
     DirectoryShare::new(cache_dir.join(name), guest_path.into(), false, true, false)
+}
+
+/// The cache directory shares to mount, in mount order: mise, the system
+/// caches, then the coding agent configuration directories.
+fn cache_share_specs(sys_cache: bool, mise: bool, agents_conf: bool) -> Vec<&'static str> {
+    let mut specs = Vec::new();
+    if mise {
+        specs.push(MISE_CACHE_SHARE);
+    }
+    if sys_cache {
+        specs.extend_from_slice(SYS_CACHE_SHARES);
+    }
+    if agents_conf {
+        specs.extend_from_slice(AGENT_CONF_SHARES);
+    }
+    specs
+}
+
+/// Creates (if needed) and shares the given cache directories.
+fn create_cache_shares(
+    cache_dir: &Path,
+    specs: &[&str],
+) -> Result<Vec<DirectoryShare>, Box<dyn std::error::Error>> {
+    specs
+        .iter()
+        .map(|spec| create_cache_share(cache_dir, spec))
+        .collect()
+}
+
+/// Err when run options cannot be applied to the implicit provision of the
+/// default image. The default image is shared by every project, so it is always
+/// provisioned with the shared caches mounted; a different layout has to be
+/// chosen explicitly with `vibe provision`.
+fn check_implicit_provision(
+    mount_sys_cache: bool,
+    mount_mise: bool,
+    default_raw: &Path,
+) -> Result<(), String> {
+    let given: Vec<&str> = [
+        (!mount_sys_cache).then_some("--no-mount-sys-cache"),
+        (!mount_mise).then_some("--no-mount-mise"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if given.is_empty() {
+        return Ok(());
+    }
+    let given = given.join(" ");
+    Err(format!(
+        "{given} cannot be used while the default image does not exist yet ({}).\n\
+The default image is created once and shared by all projects. Create it first, either:\n{}\n{}",
+        default_raw.display(),
+        format_args!("  - run `vibe` once without {given} to create it the default way, or"),
+        format_args!(
+            "  - run `vibe provision {given} [@script ...]` to create it explicitly (tools are then installed into the image itself)."
+        ),
+    ))
+}
+
+/// Host log of what a VM gets from the host: the directory shares and the
+/// files Vibe writes into it. `written` holds (guest path, source) pairs.
+fn describe_vm_files(stage: &str, shares: &[DirectoryShare], written: &[(&str, &str)]) -> String {
+    let mut text = format!("{stage}: directory shares:\n");
+    if shares.is_empty() {
+        text.push_str("  (none)\n");
+    }
+    for share in shares {
+        let mode = if share.read_only {
+            "read-only"
+        } else {
+            "read-write"
+        };
+        text.push_str(&format!(
+            "  {} -> {} ({mode})\n",
+            share.host.display(),
+            share.guest.display()
+        ));
+    }
+    text.push_str(&format!("{stage}: files written into the VM:\n"));
+    if written.is_empty() {
+        text.push_str("  (none)\n");
+    }
+    for (guest, source) in written {
+        text.push_str(&format!("  {guest} ({source})\n"));
+    }
+    text
+}
+
+/// Notes printed when running without the shared tool directories.
+fn run_share_notes(mount_sys_cache: bool, mount_mise: bool) -> Vec<&'static str> {
+    [
+        (!mount_mise).then_some(RUN_NO_MOUNT_MISE_NOTE),
+        (!mount_sys_cache).then_some(RUN_NO_MOUNT_SYS_CACHE_NOTE),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Notes printed when provisioning without the shared tool directories.
+fn provision_share_notes(mount_sys_cache: bool, mount_mise: bool) -> Vec<&'static str> {
+    [
+        (!mount_mise).then_some(PROVISION_NO_MOUNT_MISE_NOTE),
+        (!mount_sys_cache).then_some(PROVISION_NO_MOUNT_SYS_CACHE_NOTE),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// tmux configuration for `--mount-tmux-conf`: host `~/.tmux` shared read-only
+/// and the action that copies host `~/.tmux.conf` into the VM, each only when
+/// it exists on the host.
+#[allow(clippy::type_complexity)]
+fn tmux_conf_mounts(
+    home: &Path,
+) -> Result<(Option<DirectoryShare>, Option<(LoginAction, PathBuf)>), Box<dyn std::error::Error>> {
+    let tmux_dir = home.join(".tmux");
+    let share = if tmux_dir.is_dir() {
+        Some(DirectoryShare::new(
+            tmux_dir,
+            "/root/.tmux".into(),
+            true,
+            false,
+            false,
+        )?)
+    } else {
+        None
+    };
+
+    let tmux_conf = home.join(".tmux.conf");
+    let conf = if tmux_conf.is_file() {
+        let action = Send(write_file_into_vm(
+            "/root/.tmux.conf",
+            &fs::read_to_string(&tmux_conf)?,
+        )?);
+        Some((action, tmux_conf))
+    } else {
+        None
+    };
+
+    if share.is_none() && conf.is_none() {
+        eprintln!(
+            "Warning: --mount-tmux-conf: neither ~/.tmux nor ~/.tmux.conf exists on the host"
+        );
+    }
+    Ok((share, conf))
 }
 
 // Ensure the running binary has com.apple.security.virtualization entitlements by checking and, if not, signing and relaunching.
@@ -1282,7 +1557,12 @@ mod tests {
             "http://127.0.0.1:8080",
             "--git",
             "no",
-            "--no-default-mounts",
+            "--no-mount-cwd",
+            "--no-mount-sys-cache",
+            "--no-mount-mise",
+            "--mount-tmux-conf",
+            "--mount-agents-conf",
+            "--write-bashrc",
             "--env",
             "PATH",
             "--mount",
@@ -1304,7 +1584,12 @@ mod tests {
 
         assert_eq!(args.proxy.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(args.git_mode, GitMode::No);
-        assert!(args.no_default_mounts);
+        assert!(!args.mount_cwd);
+        assert!(!args.mount_sys_cache);
+        assert!(!args.mount_mise);
+        assert!(args.mount_tmux_conf);
+        assert!(args.mount_agents_conf);
+        assert!(args.write_bashrc);
         assert!(args.env.contains_key("PATH"));
         assert_eq!(args.mounts, ["/tmp:/mnt"]);
         assert_eq!(args.ssh_key, Some(PathBuf::from("/tmp/id.pub")));
@@ -1334,14 +1619,13 @@ mod tests {
         let cases = [
             (vec!["provision", "--mount", "/tmp:/mnt"], "--mount"),
             (vec!["--mount", "/tmp:/mnt", "provision"], "--mount"),
+            (vec!["provision", "--no-mount-cwd"], "--no-mount-cwd"),
+            (vec!["--mount-tmux-conf", "provision"], "--mount-tmux-conf"),
             (
-                vec!["provision", "--no-default-mounts"],
-                "--no-default-mounts",
+                vec!["provision", "--mount-agents-conf"],
+                "--mount-agents-conf",
             ),
-            (
-                vec!["--no-default-mounts", "provision"],
-                "--no-default-mounts",
-            ),
+            (vec!["--no-write-bashrc", "provision"], "--no-write-bashrc"),
             (vec!["provision", "--env", "PATH"], "--env"),
             (vec!["--env", "PATH", "provision"], "--env"),
             (vec!["provision", "--git", "rw"], "--git"),
@@ -1366,6 +1650,118 @@ mod tests {
                 "args {args:?} produced {err}"
             );
         }
+    }
+
+    #[test]
+    fn mount_defaults_and_the_last_form_wins() {
+        let run = parse(&[]).unwrap();
+        assert!(run.mount_sys_cache && run.mount_mise && run.mount_cwd);
+        assert!(!run.mount_tmux_conf && !run.mount_agents_conf && !run.write_bashrc);
+
+        let provisioned = parse(&["--no-mount-mise", "provision", "--no-mount-sys-cache"]).unwrap();
+        expect_provision(&provisioned);
+        assert!(!provisioned.mount_mise);
+        assert!(!provisioned.mount_sys_cache);
+
+        let last_wins = parse(&[
+            "--mount-agents-conf",
+            "--no-mount-agents-conf",
+            "--no-mount-mise",
+            "--mount-mise",
+            "--write-bashrc",
+            "--no-write-bashrc",
+            "--no-mount-cwd",
+            "--mount-cwd",
+        ])
+        .unwrap();
+        assert!(!last_wins.mount_agents_conf);
+        assert!(last_wins.mount_mise);
+        assert!(!last_wins.write_bashrc);
+        assert!(last_wins.mount_cwd);
+    }
+
+    #[test]
+    fn removed_no_default_mounts_is_an_unknown_option() {
+        assert!(parse_err(&["--no-default-mounts"]).contains("--no-default-mounts"));
+    }
+
+    #[test]
+    fn cache_share_specs_select_each_group_in_mount_order() {
+        assert_eq!(
+            cache_share_specs(true, true, false),
+            [
+                "mise-cache:/root/.local/share/mise",
+                "apt:/var/cache/apt",
+                "cargo:/root/.cargo",
+                "yarn:/root/.yarn",
+                "m2:/root/.m2",
+                "go:/root/go",
+            ]
+        );
+        assert_eq!(cache_share_specs(true, false, false), SYS_CACHE_SHARES);
+        assert_eq!(cache_share_specs(false, true, false), [MISE_CACHE_SHARE]);
+        assert!(cache_share_specs(false, false, false).is_empty());
+        let with_agents = cache_share_specs(true, true, true);
+        assert_eq!(with_agents.len(), 6 + AGENT_CONF_SHARES.len());
+        assert_eq!(&with_agents[6..], AGENT_CONF_SHARES);
+    }
+
+    #[test]
+    fn implicit_provision_rejects_only_the_given_no_mount_options() {
+        let raw = Path::new("/cache/vibe/default.raw");
+        assert_eq!(check_implicit_provision(true, true, raw), Ok(()));
+
+        let mise = check_implicit_provision(true, false, raw).unwrap_err();
+        assert!(mise.contains("--no-mount-mise"), "{mise}");
+        assert!(!mise.contains("--no-mount-sys-cache"), "{mise}");
+        assert!(mise.contains("/cache/vibe/default.raw"), "{mise}");
+        assert!(mise.contains("vibe provision --no-mount-mise"), "{mise}");
+
+        let both = check_implicit_provision(false, false, raw).unwrap_err();
+        assert!(
+            both.contains("vibe provision --no-mount-sys-cache --no-mount-mise"),
+            "{both}"
+        );
+    }
+
+    #[test]
+    fn describe_vm_files_lists_shares_and_written_files() {
+        let share = |host: &str, guest: &str, read_only| DirectoryShare {
+            host: host.into(),
+            guest: guest.into(),
+            read_only,
+            is_project_dir: false,
+        };
+        let text = describe_vm_files(
+            "Run",
+            &[
+                share("/home/me/proj", "/root/proj", false),
+                share("/home/me/.tmux", "/root/.tmux", true),
+            ],
+            &[
+                ("/root/.bash_logout", "built-in"),
+                ("/root/.tmux.conf", "from /home/me/.tmux.conf"),
+            ],
+        );
+        assert_eq!(
+            text,
+            [
+                "Run: directory shares:",
+                "  /home/me/proj -> /root/proj (read-write)",
+                "  /home/me/.tmux -> /root/.tmux (read-only)",
+                "Run: files written into the VM:",
+                "  /root/.bash_logout (built-in)",
+                "  /root/.tmux.conf (from /home/me/.tmux.conf)",
+                "",
+            ]
+            .join("\n")
+        );
+
+        let empty = describe_vm_files("Provision", &[], &[]);
+        assert_eq!(
+            empty,
+            "Provision: directory shares:\n  (none)\nProvision: files written into the VM:\n  (none)\n"
+        );
     }
 
     #[test]

@@ -16,13 +16,20 @@ use crate::networking::PreparedNetworkBackend;
 use crate::session::{
     DEFAULT_EXPECT_TIMEOUT,
     LoginAction::{self, *},
-    generate_http_proxy_env_export_cmds, shell_single_quote,
+    generate_http_proxy_env_export_cmds, shell_single_quote, write_bashrc_actions,
 };
 use crate::vm_run::run_vm;
 use crate::{
     BUILTIN_PROVISION_SCRIPTS, BYTES_PER_MB, DEFAULT_CPU_COUNT, DEFAULT_DISK_GB,
-    DEFAULT_PROVISION_RAM_BYTES, DirectoryShare, ProvisionScript,
+    DEFAULT_PROVISION_RAM_BYTES, DirectoryShare, ProvisionScript, cache_share_specs,
+    create_cache_shares, describe_vm_files,
 };
+
+/// Files every provisioning VM gets written into it, as (guest path, source).
+pub(crate) const PROVISION_WRITTEN_FILES: &[(&str, &str)] = &[
+    ("/root/.profile", "built-in"),
+    ("/root/.bash_logout", "built-in"),
+];
 
 /// Truncate the on-disk machine-id after systemd has committed it.
 /// A mount over `/etc/machine-id` means the commit has not happened yet, and
@@ -167,10 +174,13 @@ const PROVISION_SUCCESS_MARKER: &str = "VIBE_PROVISION_SUCCESS";
 const DEFAULT_DISK_SIZE: u64 = DEFAULT_DISK_GB * 1024 * BYTES_PER_MB;
 
 /// `default_raw` is the existing default image, or where to create it.
+/// The shared cache directories under `cache_dir` are created and mounted only
+/// when the image has to be provisioned; the default image is always
+/// provisioned with the system caches and mise mounted.
 pub(crate) fn ensure_default_image(
     dirs: &ImageDirs,
     default_raw: &Path,
-    directory_shares: &[DirectoryShare],
+    cache_dir: &Path,
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
     guest_proxy: &Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -200,6 +210,7 @@ pub(crate) fn ensure_default_image(
     }
     println!("If you want a lighter default image, see `vibe provision`");
 
+    let directory_shares = create_cache_shares(cache_dir, &cache_share_specs(true, true, false))?;
     provision_image(
         dirs,
         &base.raw,
@@ -207,7 +218,9 @@ pub(crate) fn ensure_default_image(
         false,
         false,
         &default_provisioning_scripts[..],
-        directory_shares,
+        &directory_shares,
+        "Provision (implicit, for the default image)",
+        &[],
         prepare_network_backend,
         guest_proxy,
         DEFAULT_CPU_COUNT,
@@ -247,6 +260,8 @@ fn build_provision_script(script: &ProvisionScript, guest_proxy: &Option<String>
     }
 }
 
+/// `stage` names the provision in the host log of shares and written files;
+/// `notes` are printed after that log, before the VM starts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn provision_image(
     dirs: &ImageDirs,
@@ -256,6 +271,8 @@ pub(crate) fn provision_image(
     repl: bool,
     extra_scripts: &[ProvisionScript],
     directory_shares: &[DirectoryShare],
+    stage: &str,
+    notes: &[&str],
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
     guest_proxy: &Option<String>,
     cpu_count: usize,
@@ -325,7 +342,9 @@ pub(crate) fn provision_image(
         .chain(extra_scripts.iter())
         .collect();
 
-        let mut login_actions = Vec::new();
+        // `.profile` sets up PATH and mise activation for the scripts, and is
+        // saved with the image.
+        let mut login_actions = write_bashrc_actions()?;
 
         let script_names = scripts
             .iter()
@@ -381,6 +400,14 @@ Type `exit` or run `systemctl poweroff` when you are done.",
             login_actions.push(Send(" systemctl poweroff; sleep 100".to_string()));
             None
         };
+
+        print!(
+            "{}",
+            describe_vm_files(stage, directory_shares, PROVISION_WRITTEN_FILES)
+        );
+        for note in notes {
+            println!("{note}");
+        }
 
         let outcome = run_vm(
             &tmp_raw,

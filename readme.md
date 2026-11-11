@@ -1,44 +1,6 @@
-The original repository:
+This is a fork of <https://github.com/lynaghk/vibe> that adds port forwarding, proxy and DNS options, SSH access, stricter project directory isolation, finer control over default mounts, and support for newer Debian base images.
 
-<https://github.com/lynaghk/vibe>
-
-This forked version introduces several core improvements, focusing on custom environment provisioning, host-guest connectivity, hardware resource customization, and advanced security isolation:
-
-1. **Port Forwarding Support**:
-    - Added the `-p` / `--publish` option to forward VM (guest) TCP/UDP ports to the host machine.
-    - Example usage: `-p 127.0.0.1:8080:80 -p udp:127.0.0.1:9002:9002`
-2. **Native Proxy Configuration**:
-    - Added the `--proxy` option to ensure network connections within the VM are routed through the specified SOCKS5/HTTP proxy.
-    - Added the `--proxy-udp` option (used in conjunction with `--proxy`) to ensure that outgoing UDP connections from within the VM are also routed through the specified SOCKS5 proxy.
-    - For `--network nat` (default network type), these proxies are implemented via code in helpers/vibe-usernet and are transparent to the VM. Loopback, link-local, and private destinations are dialed directly.
-    - For other `--network` types, the proxy is implemented via environment variables and `apt` configuration files within the VM.
-    - Example usage: `--proxy "socks5://127.0.0.1:1080" --proxy-udp`
-    - These networking options work with both `vibe` and `vibe provision`, before or after the `provision` command.
-3. **SSH Access Support**:
-    - Added the `--ssh-key <PUBLIC_KEY_FILE>` option to automatically inject the host's public key and start the SSH server inside the guest, facilitating direct connection from external tools and SSH clients.
-4. **Advanced Directory Isolation & Safety**:
-    - **Configurable Git Sharing**: Added the `--git <rw | ro | no>` flag to control access to the host's `.git` folder (defaults to read-only `ro` to prevent agents from corrupting repository history; `no` masks `.git` entirely via tmpfs).
-    - **`node_modules` Sandboxing**: Automatically mounts `node_modules` to a dedicated guest cache directory, improving disk I/O performance (bypassing slow VirtioFS translation) and keeping the host project clean.
-    - **Sensitive Data Masking**: Securely masks `.env` files and `.vibe` subfolders inside the VM via tmpfs mounts.
-    - **CLI Config Isolation**: Separates critical host configuration directories (for Claude, Codex, Gemini, etc.) from the guest VM to prevent credential leakage. Vibe keeps its own agent configuration directories in the cache directory; they are not mounted unless you pass `--mount-agents-conf`.
-5. **Custom Provisioning for Base System Images**:
-    - Use `vibe provision --repl` to provision the base image via commands inside the VM after the provisioning script finishes.
-6. **Guest Environment & I/O Optimizations**:
-    - Syncs host tmux configuration (`~/.tmux`, `~/.tmux.conf`) into the guest VM on boot with `--mount-tmux-conf`.
-    - Provisioning writes a clean `.profile` into the image; `--write-bashrc` rewrites it when running. `.bash_logout` (power off on `exit`) is written on every boot.
-    - Fine-grained control over the default mounts: `--no-mount-cwd`, `--no-mount-sys-cache`, and `--no-mount-mise` (see [Default mounts and files](#default-mounts-and-files)).
-
-### Breaking changes
-
-The version number is still 1.0.0, but these changes are not backward compatible:
-
-- `--no-default-mounts` was removed. Use `--no-mount-cwd`, `--no-mount-sys-cache`, and `--no-mount-mise` instead.
-  The `.vibe`/`.env`/`.git` masking and the `node_modules` share of project directories (the current directory and `--mount` shares) can no longer be turned off.
-- The agent configuration directories (codex, copilot, claude, gemini, pi, grok, opencode) and the tmux configuration are no longer mounted by default. Pass `--mount-agents-conf` and `--mount-tmux-conf`.
-- Running a VM no longer rewrites or sources `/root/.profile`. Pass `--write-bashrc` to rewrite it with Vibe's built-in configuration and source it right away. Provisioning still writes and sources it.
-- While `default.raw` does not exist yet, `vibe` refuses `--no-mount-sys-cache` and `--no-mount-mise`. Create the default image explicitly with `vibe provision` first.
-
-CLI parsing unit tests live in the `#[cfg(test)] mod tests` at the end of `src/main.rs` and run as part of `cargo test`.
+See [CHANGELOG.md](CHANGELOG.md) for everything that differs from the original repository, including breaking changes.
 
 ---
 

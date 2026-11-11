@@ -71,3 +71,8 @@ Vibe 是一款轻量级、零配置的工具，旨在 ARM 架构的 Mac 上启�
 - **更新客户机预配配置：** 编辑 `provisioning/base.sh`。注意，这仅在创建 `default.raw` 的*首次*运行时生效。
 - **调整网络设置：** 查看 `src/networking.rs` 和 `NetworkMode` 枚举。
 - **修复权限问题：** `main.rs` 包含一个 `ensure_signed()` 函数，用于处理自签名和重新执行。
+- **更新变更日志：** `CHANGELOG.md` 遵循 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/)，使用英文编写。readme 不再列出与原始仓库的差异，而是链接到 `CHANGELOG.md`。
+    - 将每一项用户可感知的变更（CLI 选项、默认值、客户机行为、预配脚本、用户会设置的环境变量、支持的镜像）添加到 `## [Unreleased]` 小节中的 `Added`、`Changed`、`Deprecated`、`Removed`、`Fixed` 或 `Security` 下；缺少对应子小节时新建。
+    - 破坏现有用法的变更以 `**Breaking:**` 开头，并说明替代用法。
+    - 不记录用户察觉不到的内部细节：重构、测试、模块结构、编辑器或工具配置、内部或仅用于测试的环境变量。
+    - 发布时，更新 `Cargo.toml` 中的 `version`，将 `[Unreleased]` 重命名为 `## [X.Y.Z] - YYYY-MM-DD`，在其上方新增一个空的 `## [Unreleased]`，并更新文件末尾的比较链接。

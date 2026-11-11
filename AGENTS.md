@@ -71,3 +71,8 @@ Vibe is a lightweight, zero-configuration tool designed to spin up Linux virtual
 - **Updating Guest Provisioning:** Edit `provisioning/base.sh`. Note that this only affects the *first* run when `default.raw` is created.
 - **Adjusting Networking:** Look into `src/networking.rs` and the `NetworkMode` enum.
 - **Fixing Entitlement Issues:** `main.rs` contains an `ensure_signed()` function that handles self-signing and re-execution.
+- **Updating the Changelog:** `CHANGELOG.md` follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) and is written in English. The readme does not list the differences from the original repository; it links to `CHANGELOG.md` instead.
+    - Add every user-visible change (CLI options, defaults, guest behavior, provisioning scripts, environment variables users set, supported images) to the `## [Unreleased]` section, under `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security`. Create the subsection if it is missing.
+    - Prefix changes that break existing usage with `**Breaking:**` and say what to use instead.
+    - Skip internal details users do not notice: refactors, tests, module layout, editor or tooling config, internal or test-only environment variables.
+    - When releasing, bump `version` in `Cargo.toml`, rename `[Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a new empty `## [Unreleased]` above it, and update the compare links at the bottom of the file.

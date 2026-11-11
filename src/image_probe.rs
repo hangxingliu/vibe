@@ -468,16 +468,7 @@ mod tests {
     }
 
     fn gunzip(name: &str) -> Vec<u8> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures")
-            .join(name);
-        let output = std::process::Command::new("/usr/bin/gzip")
-            .arg("-dc")
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{name}");
-        output.stdout
+        crate::ext4ro::gunzip_ext4_fixture(name)
     }
 
     fn wrap(ext4: &[u8], root_unique: &'static str) -> TempDisk {

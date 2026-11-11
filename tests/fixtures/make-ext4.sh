@@ -1,9 +1,10 @@
 #!/bin/sh
 # Rebuild the small ext4 fixtures used by ext4ro and image_probe tests.
 #
-# The generated images are committed. Rerun this script only when a fixture
-# needs to change. It uses the same mkfs.ext4 / debugfs / e2fsck commands as
-# the Alpine maintenance image.
+# The generated images are gitignored. The Rust tests run this script when
+# any required image is missing. Run it by hand after the fixture layout
+# changes. It uses the same mkfs.ext4 / debugfs / e2fsck commands as the
+# Alpine maintenance image.
 # Tool lookup order: $MKFS_EXT4 (mkfs.ext4 only), /tmp/e2fs-install, Homebrew, PATH.
 #
 # Usage: tests/fixtures/make-ext4.sh

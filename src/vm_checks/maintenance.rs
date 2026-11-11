@@ -19,6 +19,7 @@ use crate::{
     control::{FrameReader, new_nonce},
     ext4ro::{Ext4Ro, FileMeta, FileRead},
     gpt::{self, Layout},
+    image_dirs::ImageDirs,
     image_probe::{self, ImageClass},
     maintenance::process_disk,
     networking::PreparedNetworkBackend,
@@ -115,9 +116,10 @@ fn check_all(alpine: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn check_download() -> Result<(), Box<dyn std::error::Error>> {
     let cache = work_dir("download")?.join("cache");
     fs::create_dir_all(&cache)?;
+    let dirs = ImageDirs::single(cache.clone());
     let saved = proxy_env();
     set_proxy("http://127.0.0.1:9");
-    let offline = alpine::ensure_alpine_image(&cache).unwrap_err();
+    let offline = alpine::ensure_alpine_image(&dirs).unwrap_err();
     let text = offline.to_string();
     for needle in [
         "[download]",
@@ -135,7 +137,7 @@ fn check_download() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("maintenance download: offline error names the URL, SHA-512, and manual path");
     restore_proxy(&saved);
 
-    let raw = alpine::ensure_alpine_image(&cache)?;
+    let raw = alpine::ensure_alpine_image(&dirs)?;
     let sha = sha256_file(&raw)?;
     if sha != RAW_SHA256 {
         return Err(format!("downloaded raw SHA-256 is {sha}").into());
@@ -144,7 +146,7 @@ fn check_download() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("maintenance download: fetched and extracted via the ambient proxy");
 
     set_proxy("http://127.0.0.1:9");
-    let again = alpine::ensure_alpine_image(&cache)?;
+    let again = alpine::ensure_alpine_image(&dirs)?;
     if fs::metadata(&again)?.modified()? != mtime || sha256_file(&again)? != RAW_SHA256 {
         return Err("cache hit rewrote the Alpine raw".into());
     }
@@ -158,7 +160,7 @@ fn check_download() -> Result<(), Box<dyn std::error::Error>> {
     }
     bytes[0] ^= 0xff;
     fs::write(&archive, &bytes)?;
-    alpine::ensure_alpine_image(&cache)?;
+    alpine::ensure_alpine_image(&dirs)?;
     crate::images::verify_sha512(&archive, ALPINE_ARCHIVE_SHA512)?;
     if sha256_file(&raw)? != RAW_SHA256 {
         return Err("re-download changed a valid raw".into());
@@ -167,7 +169,7 @@ fn check_download() -> Result<(), Box<dyn std::error::Error>> {
 
     fs::remove_file(&raw)?;
     set_proxy("http://127.0.0.1:9");
-    let extracted = alpine::ensure_alpine_image(&cache)?;
+    let extracted = alpine::ensure_alpine_image(&dirs)?;
     if sha256_file(&extracted)? != RAW_SHA256 {
         return Err("extract-only raw does not match".into());
     }
@@ -217,7 +219,7 @@ fn check_prepare(
     clone_disk(&source, &disk)?;
     let cache = work.join("cache");
     let before = snapshot(&disk)?;
-    process_disk(&disk, alpine, &cache)?;
+    process_disk(&disk, alpine, &cache, &cache)?;
     check_processed(&disk, &before)?;
     eprintln!("maintenance prepare: {env_name} processed");
     if boot {
@@ -235,7 +237,7 @@ fn check_again(alpine: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn check_again_on(alpine: &Path, disk: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cache = disk.parent().unwrap().join("cache-again");
     let shadow = read_regular(disk, "/etc/shadow")?;
-    process_disk(disk, alpine, &cache)?;
+    process_disk(disk, alpine, &cache, &cache)?;
     let again = read_regular(disk, "/etc/shadow")?;
     if shadow != again {
         return Err("second preparation changed /etc/shadow".into());
@@ -303,7 +305,7 @@ fn check_recovery(alpine: &Path) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("dirty disk reason is {reason}").into());
     }
     eprintln!("maintenance recovery: probe is unknown ({reason})");
-    process_disk(&disk, alpine, &work.join("cache"))?;
+    process_disk(&disk, alpine, &work.join("cache"), &work.join("cache"))?;
     eprintln!("maintenance recovery: e2fsck replay then preparation succeeded");
     Ok(())
 }
@@ -414,7 +416,13 @@ fn check_logs(alpine: &Path) -> Result<(), Box<dyn std::error::Error>> {
     clone_disk(&source, &disk)?;
     let layout = layout_of(&disk)?;
     set_ext4_label(&disk, layout.root.first_lba, "/")?;
-    let err = process_disk(&disk, alpine, &work.join("cache-label")).unwrap_err();
+    let err = process_disk(
+        &disk,
+        alpine,
+        &work.join("cache-label"),
+        &work.join("cache-label"),
+    )
+    .unwrap_err();
     let text = err.to_string();
     if !text.contains("[prepare] safety:") || !text.contains("tune2fs -L") {
         return Err(format!("label error was {text}").into());
@@ -428,7 +436,7 @@ fn check_logs(alpine: &Path) -> Result<(), Box<dyn std::error::Error>> {
         "VIBE_MAINT_TEST_PARTUUID",
         "11111111-2222-3333-4444-555555555555",
     );
-    let err = process_disk(&disk, alpine, &cache).unwrap_err();
+    let err = process_disk(&disk, alpine, &cache, &cache).unwrap_err();
     drop(_guard);
     assert_failure_log(
         &err,
@@ -486,7 +494,7 @@ fn reject_label(source: &Path, alpine: &Path) -> Result<(), Box<dyn std::error::
     let layout = layout_of(&disk)?;
     set_ext4_label(&disk, layout.root.first_lba, "/")?;
     let hash = sha256_file(&disk)?;
-    let err = process_disk(&disk, alpine, &work.join("cache")).unwrap_err();
+    let err = process_disk(&disk, alpine, &work.join("cache"), &work.join("cache")).unwrap_err();
     if !err.to_string().contains("tune2fs -L") {
         return Err(format!("label rejection was {}", err).into());
     }
@@ -504,7 +512,7 @@ fn reject_blank(alpine: &Path) -> Result<(), Box<dyn std::error::Error>> {
     file.set_len(8 * 1024 * 1024)?;
     drop(file);
     fs::set_permissions(&disk, fs::Permissions::from_mode(0o644))?;
-    let err = process_disk(&disk, alpine, &work.join("cache")).unwrap_err();
+    let err = process_disk(&disk, alpine, &work.join("cache"), &work.join("cache")).unwrap_err();
     if err.stage != "safety" {
         return Err(format!("blank disk error was {err}").into());
     }
@@ -523,7 +531,7 @@ fn reject_partition_type(source: &Path, alpine: &Path) -> Result<(), Box<dyn std
         "11111111-1111-1111-1111-111111111111",
     )?;
     let hash = sha256_file(&disk)?;
-    let err = process_disk(&disk, alpine, &work.join("cache")).unwrap_err();
+    let err = process_disk(&disk, alpine, &work.join("cache"), &work.join("cache")).unwrap_err();
     if !err.to_string().contains("no Linux root") {
         return Err(format!("type change error was {err}").into());
     }
@@ -543,7 +551,7 @@ fn reject_partuuid(source: &Path, alpine: &Path) -> Result<(), Box<dyn std::erro
         "VIBE_MAINT_TEST_PARTUUID",
         "11111111-2222-3333-4444-555555555555",
     );
-    let err = process_disk(&disk, alpine, &work.join("cache")).unwrap_err();
+    let err = process_disk(&disk, alpine, &work.join("cache"), &work.join("cache")).unwrap_err();
     assert_failure_log(
         &err,
         "target",
@@ -583,7 +591,7 @@ fn reject_debugfs(
     }
     let machine = read_any(&disk, "/etc/machine-id")?;
     let shadow = read_regular(&disk, "/etc/shadow")?;
-    let err = process_disk(&disk, alpine, &work.join("cache")).unwrap_err();
+    let err = process_disk(&disk, alpine, &work.join("cache"), &work.join("cache")).unwrap_err();
     assert_failure_log(
         &err,
         stage,
@@ -623,7 +631,7 @@ fn reject_shadow_file(
     })?;
     let shadow = read_regular(&disk, "/etc/shadow")?;
     let machine = read_any(&disk, "/etc/machine-id")?;
-    let err = process_disk(&disk, alpine, &work.join("cache")).unwrap_err();
+    let err = process_disk(&disk, alpine, &work.join("cache"), &work.join("cache")).unwrap_err();
     assert_failure_log(
         &err,
         "inspect",
@@ -660,7 +668,7 @@ fn reject_passwd(source: &Path, alpine: &Path) -> Result<(), Box<dyn std::error:
         Ok(())
     })?;
     let machine = read_any(&disk, "/etc/machine-id")?;
-    let err = process_disk(&disk, alpine, &work.join("cache")).unwrap_err();
+    let err = process_disk(&disk, alpine, &work.join("cache"), &work.join("cache")).unwrap_err();
     assert_failure_log(
         &err,
         "inspect",
@@ -701,7 +709,7 @@ fn reject_sshd(source: &Path, alpine: &Path) -> Result<(), Box<dyn std::error::E
     })?;
     let machine = read_any(&disk, "/etc/machine-id")?;
     let shadow = read_regular(&disk, "/etc/shadow")?;
-    let err = process_disk(&disk, alpine, &work.join("cache")).unwrap_err();
+    let err = process_disk(&disk, alpine, &work.join("cache"), &work.join("cache")).unwrap_err();
     assert_failure_log(
         &err,
         "inspect",
@@ -737,7 +745,7 @@ fn reject_fsck(source: &Path, alpine: &Path) -> Result<(), Box<dyn std::error::E
     })?;
     let machine = read_any(&disk, "/etc/machine-id")?;
     let shadow = read_regular(&disk, "/etc/shadow")?;
-    let err = process_disk(&disk, alpine, &work.join("cache")).unwrap_err();
+    let err = process_disk(&disk, alpine, &work.join("cache"), &work.join("cache")).unwrap_err();
     assert_failure_log(
         &err,
         "fsck",

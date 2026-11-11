@@ -3,6 +3,10 @@
 //! The cached raw is a read-only input. Every maintenance run clones it.
 //! A valid raw plus a valid archive does not touch the network. A corrupt
 //! archive is deleted and downloaded again even when the raw is still good.
+//!
+//! The preferred image directory is the managed copy: it is locked, repaired,
+//! and downloaded into. A raw in any other image directory is only reused when
+//! its partition UUID checks out; it is never locked, deleted, or re-extracted.
 
 use std::{
     fs, io,
@@ -12,6 +16,7 @@ use std::{
 use crate::{
     cache::FileLock,
     gpt::{self, FsKind},
+    image_dirs::ImageDirs,
     images::{self, FetchError},
 };
 
@@ -87,13 +92,51 @@ impl From<io::Error> for AlpineError {
     }
 }
 
-pub(crate) fn ensure_alpine_image(cache_dir: &Path) -> Result<PathBuf, AlpineError> {
-    ensure_alpine_image_at(
-        cache_dir,
+pub(crate) fn ensure_alpine_image(dirs: &ImageDirs) -> Result<PathBuf, AlpineError> {
+    let others: Vec<&Path> = dirs
+        .existing()
+        .filter(|dir| *dir != dirs.preferred())
+        .collect();
+    ensure_alpine_image_in(
+        dirs.preferred(),
+        &others,
         ALPINE_ARCHIVE_URL,
         ALPINE_ARCHIVE_SHA512,
         ALPINE_IMAGE_NAME,
     )
+}
+
+/// A raw in `preferred` goes through [`ensure_alpine_image_at`]. Without one,
+/// the first valid raw in `others` is used as-is. Otherwise `preferred` is
+/// filled by [`ensure_alpine_image_at`].
+fn ensure_alpine_image_in(
+    preferred: &Path,
+    others: &[&Path],
+    url: &str,
+    sha512: &str,
+    name: &str,
+) -> Result<PathBuf, AlpineError> {
+    let file_name = format!("{name}.raw");
+    if !preferred.join(&file_name).exists() {
+        for dir in others {
+            let raw = dir.join(&file_name);
+            if !raw.is_file() {
+                continue;
+            }
+            match alpine_root_uuid_matches(&raw) {
+                Ok(true) => return Ok(raw),
+                Ok(false) => eprintln!(
+                    "Warning: skipping the Alpine maintenance image {}: partition {ALPINE_ROOT_PART} ext4 UUID is not {ALPINE_ROOT_FS_UUID}. The file was not modified.",
+                    raw.display()
+                ),
+                Err(err) => eprintln!(
+                    "Warning: skipping the Alpine maintenance image {}: {err}. The file was not modified.",
+                    raw.display()
+                ),
+            }
+        }
+    }
+    ensure_alpine_image_at(preferred, url, sha512, name)
 }
 
 /// `name` is the cache stem: `{name}.raw` and `{name}.raw.tar.gz`.
@@ -302,6 +345,57 @@ mod tests {
         fs::copy(&archive, cache.join(format!("{name}.raw.tar.gz"))).unwrap();
         let got = ensure_alpine_image_at(&cache, "http://127.0.0.1:9/nope", &sha, name).unwrap();
         assert_eq!(fs::read(&got).unwrap(), raw_bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn valid_raw_in_another_directory_is_reused_without_touching_preferred() {
+        let dir = temp_dir("other-hit");
+        let raw_bytes = synthetic_raw();
+        let preferred = dir.join("preferred");
+        let other = dir.join("other");
+        fs::create_dir_all(&preferred).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let name = "alpine-test";
+        fs::write(other.join(format!("{name}.raw")), &raw_bytes).unwrap();
+        let got = ensure_alpine_image_in(
+            &preferred,
+            &[other.as_path()],
+            "http://127.0.0.1:9/nope",
+            "abc",
+            name,
+        )
+        .unwrap();
+        assert_eq!(got, other.join(format!("{name}.raw")));
+        assert_eq!(fs::read_dir(&preferred).unwrap().count(), 0);
+        assert!(!other.join("alpine.lock").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_raw_in_another_directory_is_kept_and_skipped() {
+        let dir = temp_dir("other-bad");
+        let raw_bytes = synthetic_raw();
+        let (archive, sha) = write_archive(&dir, &raw_bytes);
+        let preferred = dir.join("preferred");
+        let other = dir.join("other");
+        fs::create_dir_all(&preferred).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let name = "alpine-test";
+        let bad = other.join(format!("{name}.raw"));
+        fs::write(&bad, b"not-an-alpine-disk").unwrap();
+        fs::copy(&archive, preferred.join(format!("{name}.raw.tar.gz"))).unwrap();
+        let got = ensure_alpine_image_in(
+            &preferred,
+            &[other.as_path()],
+            "http://127.0.0.1:9/nope",
+            &sha,
+            name,
+        )
+        .unwrap();
+        assert_eq!(got, preferred.join(format!("{name}.raw")));
+        assert_eq!(fs::read(&got).unwrap(), raw_bytes);
+        assert_eq!(fs::read(&bad).unwrap(), b"not-an-alpine-disk");
         let _ = fs::remove_dir_all(&dir);
     }
 

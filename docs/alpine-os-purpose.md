@@ -32,7 +32,7 @@ The pin (surveyed 2026-10-14, still the constants in `src/alpine.rs`):
 | Kernel | `6.18.54-0-virt`. `limine.conf` has `timeout: 10` and `root=LABEL=/`. Serial input does not skip the menu. Kernel log lines do not appear on hvc0. |
 | tiny-cloud | 3.4.1-r2. `user-data` runs in the final stage, which does not wait for a network. |
 
-`expand_root` grows Alpine's own root on every boot. `run_maintenance` therefore clones the cached raw (`cache::clone_file`: APFS clone, copy as fallback) into `maint/<pid>-<nonce>/alpine.raw` and boots the clone. The file under `~/.cache/vibe/` stays a read-only input. The maintenance checks require its SHA-256 to be unchanged after a run.
+`expand_root` grows Alpine's own root on every boot. `run_maintenance` therefore clones the cached raw (`cache::clone_file`: APFS clone, copy as fallback) into `maint/<pid>-<nonce>/alpine.raw` and boots the clone. `maint/` is created next to the Alpine raw in use, so the clone stays on the same file system; when that directory is not writable, `maint/` goes to the preferred image directory instead. The cached raw stays a read-only input. The maintenance checks require its SHA-256 to be unchanged after a run.
 
 ## When it starts
 
@@ -53,7 +53,15 @@ The original base file and a `--base` path are only read. `provision --repl` on 
 
 ### Cache
 
-`ensure_alpine_image` holds `alpine.lock`, then `ensure_locked`:
+`ensure_alpine_image` takes the `ImageDirs` (see `VIBE_EXTRA_IMAGE_DIR` and `VIBE_PREFERRED_IMAGE_DIR` in `vibe --help`):
+
+- When the preferred directory holds `{name}.raw`, the steps below run there.
+- Otherwise the other existing image directories are checked in lookup order. A `{name}.raw` there is used only if `alpine_root_uuid_matches` accepts it. It is read without a lock and is never deleted, repaired, or re-downloaded; a mismatch or read error prints a warning naming the file and moves on.
+- When no directory qualifies, the steps below run in the preferred directory, which downloads the image there.
+
+Each run prints `Using Alpine maintenance image <path>`, and the maintenance log header records the same path.
+
+In the preferred directory `ensure_alpine_image` holds `alpine.lock`, then `ensure_locked`:
 
 1. A cached archive whose SHA-512 does not match `ALPINE_ARCHIVE_SHA512` is deleted and fetched again (`images::fetch_verified`: download to `.part`, check the digest, rename).
 2. A missing `{name}.raw` is extracted with `extract_disk_raw` (the archive member is `disk.raw`).
@@ -178,7 +186,7 @@ Re-measure the disk in the same change as the URL. Alpine 3.24 replaced GRUB wit
    - `gpt::tests::real_disk_layouts` (index, label `/`, UUID)
    - the cache stem `alpine-3.24.2-aarch64-tiny-r1` in `tests/disk_prepare.rs` when the file name changes
    - the image name in `docs/how-vm-boot.md` and `docs/how-vm-boot.zh-Hans.md`
-8. Remove the previous `<name>.raw` and `<name>.raw.tar.gz` from the cache (`$XDG_CACHE_HOME/vibe`, or `~/.cache/vibe`). A raw that still matches the old UUID stays in use and is never re-downloaded. `ensure_alpine_image` keys files on `ALPINE_IMAGE_NAME`, so a renamed pin is a new pair of files; delete the old pair in the same change.
+8. Remove the previous `<name>.raw` and `<name>.raw.tar.gz` from the cache (`$XDG_CACHE_HOME/vibe`, or `~/.cache/vibe`) and from any extra image directory (`VIBE_EXTRA_IMAGE_DIR`). A raw that still matches the old UUID stays in use and is never re-downloaded. `ensure_alpine_image` keys files on `ALPINE_IMAGE_NAME`, so a renamed pin is a new pair of files; delete the old pair in the same change.
 9. `cargo test`. On a Mac, run `VIBE_VM_CHECK=maintenance-all` (`tests/alpine_maintenance.rs`) and `VIBE_VM_CHECK=prepare` (`tests/disk_prepare.rs`) with `VIBE_TEST_ALPINE_RAW` pointing at the new raw and the archive beside it as `<raw>.tar.gz`. Boot the helper once against a new Debian work copy and confirm `PREP-RESULT ok 0 done`, an empty machine-id, an empty root password field, and an unchanged SHA-256 on the cached raw.
 
 If limine's `timeout` grows, compare a measured boot with `MAINT_FIRST_OUTPUT_TIMEOUT` (90 seconds). The current menu costs about 10 seconds and fits that budget. Direct kernel boot (`VZLinuxBootLoader`, about 8.5 seconds in the original survey) is not implemented; the maintenance VM still uses EFI so the host does not have to unpack the FAT ESP or the zboot kernel.

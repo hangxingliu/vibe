@@ -33,6 +33,8 @@ mod control;
 mod disk_prepare;
 mod ext4ro;
 mod gpt;
+mod image_dirs;
+use image_dirs::ImageDirs;
 mod image_probe;
 mod maintenance;
 mod seed;
@@ -203,6 +205,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
+    let image_dirs = ImageDirs::from_env(cache_dir.clone())?;
+
     if args.help {
         println!("Vibe is a quick way to spin up a Linux virtual machine on Mac to sandbox LLM agents.
 
@@ -275,24 +279,35 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
 A new Debian base is first prepared once in a headless Alpine maintenance VM; older bases and Vibe images are used as-is.
 Set the environment variable VIBE_KEEP_FAILED_WORK=1 to keep the work copy and maintenance files of a failed provision for debugging.
 
+Image directories:
+
+  Image names (`--image NAME`, `--base NAME`, the `default` image) and the Debian and Alpine base images are looked up
+  in the image directories, in order; the first match is used. Paths given with `/` are used as-is.
+  The default image directory is the cache directory. Two optional environment variables add more:
+
+  VIBE_EXTRA_IMAGE_DIR=DIR[:DIR ...]                        Extra image directories (absolute paths, `:` separated), searched after the default one.
+                                                            Directories that do not exist are listed as skipped.
+  VIBE_PREFERRED_IMAGE_DIR=DIR                              Preferred directory: the default directory or an entry of VIBE_EXTRA_IMAGE_DIR.
+                                                            It is searched first and must exist. Downloads and new images are written here;
+                                                            an existing image is replaced where it was found.
+
+  Shared caches (apt, cargo, ...), agent configuration, and maintenance logs always stay in the cache directory.
+  The lookup order is printed when a VM is run or provisioned.
+
 {}
   
 Cache directory:
 
   {}
+
+{}
 ",
                  provisioning_scripts_banner(),
                  cache_dir.to_string_lossy().into_owned(),
+                 image_dirs.describe(),
         );
         std::process::exit(0);
     }
-
-    let basename_compressed = DEBIAN_COMPRESSED_DISK_URL.rsplit('/').next().unwrap();
-    let base_compressed = cache_dir.join(basename_compressed);
-    let base_raw = cache_dir.join(format!(
-        "{}.raw",
-        basename_compressed.trim_end_matches(".tar.xz")
-    ));
 
     // Prepare system-wide directories
     fs::create_dir_all(&cache_dir)?;
@@ -303,6 +318,8 @@ Cache directory:
         .collect::<Result<Vec<_>, _>>()?;
 
     ensure_signed();
+
+    println!("{}", image_dirs.describe());
 
     let usernet_helper_path = cache_dir.join("vibe-usernet");
     let publish = args.publish.clone();
@@ -340,17 +357,17 @@ Cache directory:
             cpu_count,
             ram_bytes,
         } => {
-            let target_image_raw = image_path(&cache_dir, &image);
+            let existing_image_raw = find_named_image(&image_dirs, &image);
 
             // --repl with an existing image and no --replace: boot the image interactively
             // without re-running any provisioning scripts.
-            if repl && target_image_raw.exists() && !replace {
+            if let Some(existing) = existing_image_raw.as_ref().filter(|_| repl && !replace) {
                 println!(
-                    "Image '{}' already exists; booting it for interactive use (--repl).",
-                    image
+                    "Image '{image}' already exists at {}; booting it for interactive use (--repl).",
+                    existing.display()
                 );
                 return run_vm(
-                    &target_image_raw,
+                    existing,
                     Some(&DiskSource::CachedImage(image.clone())),
                     None,
                     &[],
@@ -364,19 +381,35 @@ Cache directory:
                 .map(|_| ());
             }
 
+            // An existing image is replaced in the directory where it was found;
+            // a new one is created in the preferred directory.
+            let target_image_raw =
+                existing_image_raw.unwrap_or_else(|| new_image_path(&image_dirs, &image));
+
             let base_raw = match base {
                 Some(base) if base.contains('/') => PathBuf::from(base),
-                Some(base) => image_path(&cache_dir, &base),
+                Some(base) => {
+                    let found = find_named_image(&image_dirs, &base).ok_or_else(|| {
+                        format!(
+                            "Base image '{base}' not found in: {}",
+                            image_dirs.searched_list()
+                        )
+                    })?;
+                    println!("Using base image {}", found.display());
+                    found
+                }
                 None => {
-                    ensure_base_image(&base_raw, &base_compressed)?;
-                    base_raw
+                    let debian = locate_debian_base(&image_dirs);
+                    ensure_base_image(&debian.raw, &debian.compressed)?;
+                    println!("Using base image {}", debian.raw.display());
+                    debian.raw
                 }
             };
             if !base_raw.exists() {
                 return Err(format!("Base image does not exist: {}", base_raw.display()).into());
             }
             provision_image(
-                &cache_dir,
+                &image_dirs,
                 &base_raw,
                 &target_image_raw,
                 replace,
@@ -416,24 +449,25 @@ Cache directory:
                 if image != DEFAULT_IMAGE_NAME && instance_raw.exists() {
                     eprintln!("Ignoring --image {image}, using {}", instance_raw.display());
                 }
-                let template_raw = image_path(&cache_dir, &image);
-                if image == DEFAULT_IMAGE_NAME {
+                let template_raw = if image == DEFAULT_IMAGE_NAME {
+                    let default_raw = find_named_image(&image_dirs, &image)
+                        .unwrap_or_else(|| new_image_path(&image_dirs, &image));
                     ensure_default_image(
-                        &cache_dir,
-                        &base_raw,
-                        &base_compressed,
-                        &template_raw,
+                        &image_dirs,
+                        &default_raw,
                         &default_shares,
                         prepare_network_backend,
                         &guest_proxy,
                     )?;
-                } else if !template_raw.exists() {
-                    return Err(format!(
-                        "Template image does not exist: {}",
-                        template_raw.display()
-                    )
-                    .into());
-                }
+                    default_raw
+                } else {
+                    find_named_image(&image_dirs, &image).ok_or_else(|| {
+                        format!(
+                            "Template image '{image}' not found in: {}",
+                            image_dirs.searched_list()
+                        )
+                    })?
+                };
                 ensure_instance_disk(&instance_raw, &template_raw)?;
 
                 instance_raw

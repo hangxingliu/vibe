@@ -29,23 +29,28 @@ Virtualization.framework completion handlers run on the process main thread. `ma
 
 ## Disk files
 
-`run_main` puts every cache file under `$XDG_CACHE_HOME/vibe`, or `~/.cache/vibe` when `XDG_CACHE_HOME` is unset.
+The cache directory, called the default directory below, is `$XDG_CACHE_HOME/vibe`, or `~/.cache/vibe` when `XDG_CACHE_HOME` is unset.
 
-| File | Who creates it | Role |
-| --- | --- | --- |
-| `debian-13-nocloud-arm64-20261001-2618.tar.xz` | `ensure_base_image` | Downloaded Debian base archive. |
-| `debian-13-nocloud-arm64-20261001-2618.raw` | `extract_disk_raw` | Unpacked base. The member inside the archive is `disk.raw`. This file is never modified. |
-| `alpine-3.24.2-aarch64-tiny-r1.raw.tar.gz` and `.raw` | `ensure_alpine_image` | Pinned Alpine maintenance image. Downloaded only when a work copy needs preparation. |
-| `alpine.lock` | `FileLock::acquire` | Serializes Alpine download and extract. |
-| `<name>.raw` | `provision_image` | Published template. `default.raw` is the template used when `--image` is omitted. |
-| `<name>.tmp.<pid>` | `provision_image` | Private work copy. Renamed onto `<name>.raw` only after a successful provision. |
-| `<name>.tmp.<pid>.lock` | `FileLock::try_acquire_existing` | Sibling lock for the maintenance VM. The disk image itself is not flocked, because Virtualization.framework then refuses the attachment. |
-| `maint/<pid>-<nonce>/` | `process_disk` | One maintenance run: Alpine clone, seed ISO, EFI variable store, console log. |
-| `logs/maint-<unix>-<pid>.log` | `publish_log` | Published maintenance console. The newest five logs are kept. |
-| `vibe-usernet` | `ensure_usernet_helper_extracted` | Bundled user-mode network helper, written out when the cached bytes differ. |
-| `.vibe/instance.raw` | `ensure_instance_disk` | Per-project disk, copied once from a template. This is the file a normal `vibe` boots. |
-| `.vibe/vibe-usernet.log` | `NetworkMode::prepare` | Helper log for a project instance. An external `path/to/disk.raw` does not get one. |
-| `$TMPDIR/efi_variable_store_<pid>.efivars` | `default_efi_vars_path` | EFI variable store for an interactive VM. Recreated with `AllowOverwrite` on each start. |
+`run_main` builds `ImageDirs::from_env` (`src/image_dirs.rs`) right after `--version` and before `--help`, so a bad configuration fails every command except `--version`. `VIBE_EXTRA_IMAGE_DIR` (`:` separated absolute paths) adds image directories and `VIBE_PREFERRED_IMAGE_DIR` names the preferred one, which must be the default directory or an extra entry and must exist. Lookup order is the preferred directory, the default directory, then the other extra directories in written order. Entries are compared after removing trailing `/` and, when they exist, after `canonicalize`; duplicates are dropped. Extra directories that do not exist are marked `(missing, skipped)`. Run and provision print `ImageDirs::describe` once after `ensure_signed`; `--help` prints it after `Cache directory:`.
+
+Image names (`--image`, `--base NAME`, `default`) go through `find_named_image`, and the Debian base through `locate_debian_base`. Positional `path/to/disk.raw`, `--base` with a `/`, and `.vibe/instance.raw` are not looked up. The Location column below says where each file lives.
+
+| File | Location | Who creates it | Role |
+| --- | --- | --- | --- |
+| `debian-13-nocloud-arm64-20261001-2618.tar.xz` | Preferred | `ensure_base_image` | Downloaded Debian base archive. Only needed when no image directory has the `.raw`; an archive in another directory is not reused. |
+| `debian-13-nocloud-arm64-20261001-2618.raw` | First match, else preferred | `extract_disk_raw` | Unpacked base. The member inside the archive is `disk.raw`. This file is never modified. |
+| `alpine-3.24.2-aarch64-tiny-r1.raw.tar.gz` and `.raw` | First match, else preferred | `ensure_alpine_image` | Pinned Alpine maintenance image. Downloaded only when a work copy needs preparation. A `.raw` outside the preferred directory is only reused read-only when its UUID checks out. |
+| `alpine.lock` | Preferred | `FileLock::acquire` | Serializes Alpine download and extract. |
+| `<name>.raw` | First match, else preferred | `provision_image` | Published template. `default.raw` is the template used when `--image` is omitted. `--replace` replaces it where it was found. |
+| `<name>.tmp.<pid>` | Next to `<name>.raw` | `provision_image` | Private work copy. Renamed onto `<name>.raw` only after a successful provision. |
+| `<name>.tmp.<pid>.lock` | Next to `<name>.raw` | `FileLock::try_acquire_existing` | Sibling lock for the maintenance VM. The disk image itself is not flocked, because Virtualization.framework then refuses the attachment. |
+| `maint/<pid>-<nonce>/` | Next to the Alpine `.raw`, else preferred | `process_disk` | One maintenance run: Alpine clone, seed ISO, EFI variable store, console log. |
+| `logs/maint-<unix>-<pid>.log` | Default | `publish_log` | Published maintenance console with a header of full paths. The newest five logs are kept. |
+| `apt/`, `cargo/`, agent configuration, `guest_node_modules/` | Default | `create_cache_share` | VirtioFS share sources. |
+| `vibe-usernet` | Default | `ensure_usernet_helper_extracted` | Bundled user-mode network helper, written out when the cached bytes differ. |
+| `.vibe/instance.raw` | Project | `ensure_instance_disk` | Per-project disk, copied once from a template. This is the file a normal `vibe` boots. |
+| `.vibe/vibe-usernet.log` | Project | `NetworkMode::prepare` | Helper log for a project instance. An external `path/to/disk.raw` does not get one. |
+| `$TMPDIR/efi_variable_store_<pid>.efivars` | `$TMPDIR` | `default_efi_vars_path` | EFI variable store for an interactive VM. Recreated with `AllowOverwrite` on each start. |
 
 ### Debian base
 
@@ -211,7 +216,7 @@ An unprocessed current Debian disk produces no console output (it sits in the fi
 `process_disk` (`src/maintenance.rs`):
 
 1. `prepare_target` requires a regular, writable file. It opens the disk read-write only to prove it can write, then takes a non-blocking flock on the sibling `{disk}.lock`. It reads the GPT, selects the layout, and `scan_labels`. `label_block_reason` rejects an ext4 UUID equal to `ALPINE_ROOT_FS_UUID`, and a filesystem label `/` or `cidata` (any case). It records `ProbeFacts` for the later re-check.
-2. `cache::sweep_stale` removes `maint/` directories whose `<pid>-<nonce>` pid is dead. `cache::private_dir` creates `maint/<pid>-<nonce>` mode `0700`.
+2. `create_work_dir`: `cache::private_dir` creates `maint/<pid>-<nonce>` mode `0700` in the directory of the Alpine `.raw`, so the clone stays on one file system. When that fails (for example a read-only volume), it prints a line and uses `maint/` in the preferred directory instead. `cache::sweep_stale` then removes directories under the `maint/` root in use whose `<pid>-<nonce>` pid is dead.
 3. `run_maintenance`:
    - `control::new_nonce` (32 lowercase hex digits).
    - Clone the Alpine raw to `alpine.raw` in that directory.
@@ -220,7 +225,7 @@ An unprocessed current Debian disk produces no console output (it sits in the fi
    - `VmSpec` disks, in guest order: `vda` the Alpine clone (writable), `vdb` the Debian work copy (writable), `vdc` `seed.iso` (read-only). `network` is `None`. There are no share devices and no keyboard serial port. `hvc0` is `SerialRole::Log`, `hvc1` is `SerialRole::Control` (`output_serial` keeps the host read end). EFI variables live at `efivars` inside the work directory. CPU count is 2 and RAM is 1 GiB (`MAINT_CPU`, `MAINT_RAM_BYTES`).
    - `run_headless` starts that spec. The log worker copies `hvc0` to `hvc0.log`. The control worker feeds `hvc1` to `FrameReader::new(nonce)`. Each accepted frame goes to `observe_frame`.
 4. On success, `image_probe::verify_processed` re-reads the work copy. It requires an unchanged GPT layout, `/etc/machine-id` as an empty regular file, exactly one root shadow line with an empty password field, a dbus machine-id that is missing, empty, or a symlink to `/etc/machine-id`, and `classify` == `LegacyCompatible`. A failure is `[verify] host-verify`.
-5. `publish_log` moves the console log to `~/.cache/vibe/logs/maint-<unix>-<pid>.log` and `retain_newest_logs` keeps `LOGS_TO_KEEP` (5). The work directory is removed unless `VIBE_KEEP_FAILED_WORK=1`, in which case its path is printed. The next `process_disk` still deletes a kept directory once that pid is gone. `ensure_bootable` unlinks the sibling `.lock` file afterward, unless the error was that another Vibe process holds it.
+5. `publish_log` writes the console log to `logs/maint-<unix>-<pid>.log` in the default directory, after a `log_header` that lists the full paths of the disk, the Alpine source `.raw`, the Alpine clone, the seed ISO, and the work directory, and `retain_newest_logs` keeps `LOGS_TO_KEEP` (5). The work directory is removed unless `VIBE_KEEP_FAILED_WORK=1`, in which case its path is printed. The next `process_disk` still deletes a kept directory once that pid is gone. `ensure_bootable` unlinks the sibling `.lock` file afterward, unless the error was that another Vibe process holds it.
 
 `PrepareError` prints `[prepare] <stage> (last PREP-STEP: ...)` plus the log path. The host re-check uses `[verify]`.
 
@@ -329,4 +334,4 @@ Booting a VM from `cargo test` is not possible on a worker thread. The `#[ignore
 | `tests/alpine_maintenance.rs` | `maintenance-all` | `src/vm_checks/maintenance.rs`: download, shadow edit, prepare new and old, prepare again, negative disks, needs-recovery, SSH `PermitEmptyPasswords`, and log retention. The cached Alpine raw's SHA-256 must be unchanged. `maintenance-<name>` runs one of those checks. |
 | `src/vm_checks/prepare.rs` | `probe` | `probe_disk` on `VIBE_VM_CHECK_DISK`. Prints the class, machine-id fact, and whether the root password field is empty. Shadow bytes are not printed. |
 
-The ignored tests need `VIBE_TEST_DEBIAN_NEW_RAW`, `VIBE_TEST_DEBIAN_OLD_RAW`, and `VIBE_TEST_ALPINE_RAW`. Maintenance image edits use e2fsprogs from `VIBE_E2FS_SBIN` or `PATH`. `tests/fixtures/make-ext4.sh` rebuilds the small gzip ext4 images used by the in-process ext4 and probe tests. `VIBE_VM_CHECK_DISK` and `VIBE_VM_CHECK_CACHE` select the disk and the Alpine cache for `probe` and `prepare`. `VIBE_MAINT_TEST_PARTUUID`, when set, replaces the PARTUUID written into the manifest so a negative check can force a target mismatch.
+The ignored tests need `VIBE_TEST_DEBIAN_NEW_RAW`, `VIBE_TEST_DEBIAN_OLD_RAW`, and `VIBE_TEST_ALPINE_RAW`. Maintenance image edits use e2fsprogs from `VIBE_E2FS_SBIN` or `PATH`. `tests/fixtures/make-ext4.sh` rebuilds the small gzip ext4 images used by the in-process ext4 and probe tests. The images are gitignored, and those tests run the script when a required image is missing. `VIBE_VM_CHECK_DISK` and `VIBE_VM_CHECK_CACHE` select the disk and the Alpine cache for `probe` and `prepare`. `VIBE_MAINT_TEST_PARTUUID`, when set, replaces the PARTUUID written into the manifest so a negative check can force a target mismatch.

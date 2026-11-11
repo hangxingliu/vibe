@@ -6,7 +6,8 @@
 //! Provision calls [`process_disk`] from `ensure_bootable`. The run path does not.
 
 use std::{
-    env, fs, io,
+    env, fs,
+    io::{self, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -247,16 +248,17 @@ struct PreparedDisk {
 }
 
 /// Edit `disk` from the Alpine maintenance VM, then re-check it.
-/// `alpine_raw` is the cached read-only input. Work files live under `cache_dir`.
+/// `alpine_raw` is the cached read-only input. Work files live under `maint/`
+/// next to `alpine_raw`, or under `fallback_root/maint/` when that directory
+/// cannot be created. The console log is published to `log_dir/logs/`.
 pub(crate) fn process_disk(
     disk: &Path,
     alpine_raw: &Path,
-    cache_dir: &Path,
+    fallback_root: &Path,
+    log_dir: &Path,
 ) -> Result<(), PrepareError> {
     let prepared = prepare_target(disk)?;
-    let maint_root = cache_dir.join("maint");
-    cache::sweep_stale(&maint_root).map_err(io_prepare)?;
-    let work = cache::private_dir(&maint_root, "").map_err(io_prepare)?;
+    let work = create_work_dir(alpine_raw, fallback_root)?;
     let keep_failed = env::var("VIBE_KEEP_FAILED_WORK").ok().as_deref() == Some("1");
     let mut guard = WorkGuard {
         dir: work.clone(),
@@ -265,7 +267,8 @@ pub(crate) fn process_disk(
     let log_inside = work.join("hvc0.log");
     let result = run_maintenance(&work, disk, alpine_raw, &prepared, &log_inside);
     let published = if log_inside.exists() {
-        match publish_log(&log_inside, cache_dir) {
+        let header = log_header(disk, alpine_raw, &work);
+        match publish_log(&log_inside, log_dir, &header) {
             Ok(path) => Some(path),
             Err(err) => {
                 guard.keep = keep_failed;
@@ -299,6 +302,60 @@ pub(crate) fn process_disk(
             Err(error)
         }
     }
+}
+
+/// Create `maint/<pid>-<nonce>/` next to `alpine_raw` so the clone stays on
+/// one file system, falling back to `fallback_root/maint/`. Only the `maint/`
+/// root that is used is swept.
+fn create_work_dir(alpine_raw: &Path, fallback_root: &Path) -> Result<PathBuf, PrepareError> {
+    let fallback = fallback_root.join("maint");
+    let primary = alpine_raw
+        .parent()
+        .map(|dir| dir.join("maint"))
+        .unwrap_or_else(|| fallback.clone());
+    let (root, work) = match cache::private_dir(&primary, "") {
+        Ok(work) => (primary, work),
+        Err(err) if primary != fallback => {
+            println!(
+                "Cannot create the maintenance work directory under {}: {err}. Using {} instead.",
+                primary.display(),
+                fallback.display()
+            );
+            let work = cache::private_dir(&fallback, "").map_err(io_prepare)?;
+            (fallback, work)
+        }
+        Err(err) => return Err(io_prepare(err)),
+    };
+    if let Err(err) = cache::sweep_stale(&root) {
+        let _ = fs::remove_dir_all(&work);
+        return Err(io_prepare(err));
+    }
+    Ok(work)
+}
+
+/// Host-written lines at the top of a published log. The maintenance files
+/// may live in different image directories, so every path is absolute.
+pub(crate) fn log_header(disk: &Path, alpine_raw: &Path, work: &Path) -> String {
+    let absolute = |path: &Path| {
+        std::path::absolute(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string()
+    };
+    format!(
+        "# Vibe maintenance log\n\
+# disk: {}\n\
+# alpine source: {}\n\
+# alpine clone: {}\n\
+# seed iso: {}\n\
+# work directory: {} (removed afterwards; kept after a failure when VIBE_KEEP_FAILED_WORK=1)\n\
+# hvc0 console output follows\n",
+        absolute(disk),
+        absolute(alpine_raw),
+        absolute(&work.join("alpine.raw")),
+        absolute(&work.join("seed.iso")),
+        absolute(work),
+    )
 }
 
 struct WorkGuard {
@@ -518,15 +575,26 @@ fn attach_log(mut error: PrepareError, log_error: Option<io::Error>) -> PrepareE
     error
 }
 
-pub(crate) fn publish_log(src: &Path, cache_dir: &Path) -> io::Result<PathBuf> {
-    let logs = cache_dir.join("logs");
+/// Write `header` and then the bytes of `src` to `log_dir/logs/`, and remove `src`.
+pub(crate) fn publish_log(src: &Path, log_dir: &Path, header: &str) -> io::Result<PathBuf> {
+    let logs = log_dir.join("logs");
     fs::create_dir_all(&logs)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let dest = logs.join(format!("maint-{stamp}-{}.log", std::process::id()));
-    fs::rename(src, &dest)?;
+    let written = (|| -> io::Result<()> {
+        let mut out = fs::File::create(&dest)?;
+        out.write_all(header.as_bytes())?;
+        io::copy(&mut fs::File::open(src)?, &mut out)?;
+        out.sync_all()
+    })();
+    if let Err(err) = written {
+        let _ = fs::remove_file(&dest);
+        return Err(err);
+    }
+    fs::remove_file(src)?;
     retain_newest_logs(&logs, LOGS_TO_KEEP)?;
     Ok(dest)
 }
@@ -690,6 +758,39 @@ mod tests {
 
         let safety = PrepareError::new("safety", "not a regular file");
         assert_eq!(safety.to_string(), "[prepare] safety: not a regular file");
+    }
+
+    #[test]
+    fn published_log_starts_with_the_maintenance_paths() {
+        let dir = std::env::temp_dir().join(format!("vibe-publish-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("hvc0.log");
+        fs::write(&src, "maint: seed ok\n").unwrap();
+        let work = PathBuf::from("/images/a/maint/1-abc");
+        let header = log_header(
+            Path::new("/images/b/t1.tmp.1"),
+            Path::new("/images/a/alpine.raw"),
+            &work,
+        );
+        let dest = publish_log(&src, &dir.join("default"), &header).unwrap();
+        assert_eq!(dest.parent(), Some(dir.join("default/logs").as_path()));
+        assert!(!src.exists());
+        let body = fs::read_to_string(&dest).unwrap();
+        let (head, rest) = body.split_at(header.len());
+        assert_eq!(head, header);
+        assert_eq!(rest, "maint: seed ok\n");
+        for path in [
+            "/images/b/t1.tmp.1",
+            "/images/a/alpine.raw",
+            "/images/a/maint/1-abc/alpine.raw",
+            "/images/a/maint/1-abc/seed.iso",
+            "/images/a/maint/1-abc (removed afterwards",
+        ] {
+            assert!(head.contains(path), "{head}");
+        }
+        assert!(head.lines().all(|line| line.starts_with("# ")), "{head}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

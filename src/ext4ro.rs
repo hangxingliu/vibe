@@ -957,20 +957,106 @@ fn open_sample(img: &[u8]) -> Ext4Ro<MemReader<'_>> {
     Ext4Ro::open(MemReader(img), 0, img.len() as u64).unwrap()
 }
 
+/// Gzip images written by `tests/fixtures/make-ext4.sh`.
+/// Keep this list aligned with the names that script publishes.
 #[cfg(test)]
-fn gunzip_fixture(name: &str) -> Vec<u8> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name);
+const EXT4_FIXTURE_NAMES: &[&str] = &[
+    "ext4-new.img.gz",
+    "ext4-old.img.gz",
+    "ext4-mid-nonempty.img.gz",
+    "ext4-mid-symlink.img.gz",
+    "ext4-shadow-locked.img.gz",
+    "ext4-shadow-two.img.gz",
+    "ext4-shadow-none.img.gz",
+    "ext4-dbus-outside.img.gz",
+];
+
+#[cfg(test)]
+fn ext4_fixture_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+/// Fixture names that are not regular files in `dir`.
+#[cfg(test)]
+fn missing_ext4_fixtures(dir: &std::path::Path) -> Vec<&'static str> {
+    EXT4_FIXTURE_NAMES
+        .iter()
+        .copied()
+        .filter(|name| !dir.join(name).is_file())
+        .collect()
+}
+
+/// Run `run_script` when any required gzip image is absent.
+/// A present regular file is left as it is.
+#[cfg(test)]
+fn prepare_ext4_fixtures(
+    dir: &std::path::Path,
+    run_script: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if missing_ext4_fixtures(dir).is_empty() {
+        return Ok(());
+    }
+    run_script()?;
+    let missing = missing_ext4_fixtures(dir);
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "tests/fixtures/make-ext4.sh did not create {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+#[cfg(test)]
+fn run_make_ext4(script: &std::path::Path) -> Result<(), String> {
+    let output = std::process::Command::new("/bin/sh")
+        .arg(script)
+        .output()
+        .map_err(|err| format!("cannot run {}: {err}", script.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} exited {}\n{}{}",
+        script.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+/// Build the gitignored ext4 fixtures once per process when any one is missing.
+#[cfg(test)]
+fn ensure_ext4_fixtures() {
+    use std::sync::OnceLock;
+    static READY: OnceLock<Result<(), String>> = OnceLock::new();
+    let result = READY.get_or_init(|| {
+        let dir = ext4_fixture_dir();
+        let script = dir.join("make-ext4.sh");
+        prepare_ext4_fixtures(&dir, || {
+            eprintln!("ext4 fixtures missing; running {}", script.display());
+            run_make_ext4(&script)
+        })
+    });
+    if let Err(err) = result {
+        panic!("ext4 fixtures: {err}");
+    }
+}
+
+/// Gunzip one image from `tests/fixtures`, building the set first when needed.
+#[cfg(test)]
+pub(crate) fn gunzip_ext4_fixture(name: &str) -> Vec<u8> {
+    ensure_ext4_fixtures();
+    let path = ext4_fixture_dir().join(name);
     let output = std::process::Command::new("/usr/bin/gzip")
         .arg("-dc")
         .arg(&path)
         .output()
-        .unwrap();
+        .unwrap_or_else(|err| panic!("gzip {name}: {err}"));
     assert!(
         output.status.success(),
-        "gzip {}: {}",
-        name,
+        "gzip {name}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
@@ -1114,7 +1200,7 @@ mod tests {
 
     #[test]
     fn mkfs_fixtures_match_old_and_new_features() {
-        let new = gunzip_fixture("ext4-new.img.gz");
+        let new = gunzip_ext4_fixture("ext4-new.img.gz");
         let fs = Ext4Ro::open(MemReader(&new), 0, new.len() as u64).unwrap();
         assert_eq!(
             fs.read_file("/etc/os-release", 4096).unwrap(),
@@ -1149,7 +1235,7 @@ mod tests {
             FileRead::Regular(_)
         ));
 
-        let old = gunzip_fixture("ext4-old.img.gz");
+        let old = gunzip_ext4_fixture("ext4-old.img.gz");
         let fs = Ext4Ro::open(MemReader(&old), 0, old.len() as u64).unwrap();
         match fs.read_file("/etc/debian_version", 64).unwrap() {
             FileRead::Regular(bytes) => assert_eq!(bytes, b"13.3\n"),
@@ -1216,7 +1302,7 @@ mod tests {
 
     #[test]
     fn fuzz_rewrites_do_not_panic_or_hang() {
-        let base = gunzip_fixture("ext4-new.img.gz");
+        let base = gunzip_ext4_fixture("ext4-new.img.gz");
         let mut state = 0x1234_5678_9abc_def0u64;
         for _ in 0..24 {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -1232,6 +1318,88 @@ mod tests {
             let _ = fs.read_file("/usr/lib/os-release", 64 * 1024);
             let _ = fs.read_file("/etc/shadow", 1024 * 1024);
             let _ = fs.read_file("/many/f010", 64);
+        }
+    }
+
+    fn scratch_fixtures(label: &str) -> ScratchDir {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "vibe-ext4-fix-{label}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        ScratchDir(path)
+    }
+
+    struct ScratchDir(std::path::PathBuf);
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn missing_ext4_fixtures_lists_absent_names() {
+        let dir = scratch_fixtures("missing");
+        assert_eq!(missing_ext4_fixtures(&dir.0).as_slice(), EXT4_FIXTURE_NAMES);
+        std::fs::write(dir.0.join("ext4-new.img.gz"), b"gz").unwrap();
+        std::fs::create_dir(dir.0.join("ext4-old.img.gz")).unwrap();
+        let missing = missing_ext4_fixtures(&dir.0);
+        assert!(!missing.contains(&"ext4-new.img.gz"));
+        assert!(missing.contains(&"ext4-old.img.gz"));
+        assert!(missing.contains(&"ext4-shadow-none.img.gz"));
+    }
+
+    #[test]
+    fn prepare_ext4_fixtures_runs_the_script_only_when_one_is_missing() {
+        let dir = scratch_fixtures("prepare");
+        let mut calls = 0;
+        prepare_ext4_fixtures(&dir.0, || {
+            calls += 1;
+            for name in EXT4_FIXTURE_NAMES {
+                std::fs::write(dir.0.join(name), b"gz").unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+
+        prepare_ext4_fixtures(&dir.0, || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn prepare_ext4_fixtures_reports_a_script_that_leaves_files_missing() {
+        let dir = scratch_fixtures("still-missing");
+        let err = prepare_ext4_fixtures(&dir.0, || Ok(())).unwrap_err();
+        assert!(err.contains("ext4-new.img.gz"), "{err}");
+        assert!(err.contains("ext4-dbus-outside.img.gz"), "{err}");
+    }
+
+    #[test]
+    fn prepare_ext4_fixtures_returns_the_script_error() {
+        let dir = scratch_fixtures("script-error");
+        let err = prepare_ext4_fixtures(&dir.0, || Err("mkfs.ext4 missing".into())).unwrap_err();
+        assert_eq!(err, "mkfs.ext4 missing");
+    }
+
+    #[test]
+    fn fixture_names_match_make_ext4_script() {
+        let script = ext4_fixture_dir().join("make-ext4.sh");
+        let text = std::fs::read_to_string(&script).unwrap();
+        for name in EXT4_FIXTURE_NAMES {
+            assert!(
+                text.contains(&format!("\"{name}\"")),
+                "{name} is not published by {}",
+                script.display()
+            );
         }
     }
 }

@@ -9,6 +9,7 @@ use std::{env, path::PathBuf};
 
 use crate::{
     disk_prepare::ensure_bootable,
+    image_dirs::ImageDirs,
     image_probe::{self, MachineIdFact},
 };
 
@@ -44,7 +45,7 @@ pub(super) fn check_probe() -> Result<(), Box<dyn std::error::Error>> {
 pub(super) fn check_prepare() -> Result<(), Box<dyn std::error::Error>> {
     let disk = required("VIBE_VM_CHECK_DISK")?;
     let cache = required("VIBE_VM_CHECK_CACHE")?;
-    let kind = ensure_bootable(&disk, &cache)?;
+    let kind = ensure_bootable(&disk, &ImageDirs::single(cache))?;
     println!("kind={kind}");
     Ok(())
 }

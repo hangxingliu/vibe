@@ -32,7 +32,7 @@ Vibe 不会驱动该向导，不会对目标执行 `chroot`，也不会运行目
 | 内核 | `6.18.54-0-virt`。`limine.conf` 包含 `timeout: 10` 和 `root=LABEL=/`。串口输入不会跳过菜单。内核日志行不会出现在 hvc0 上。 |
 | tiny-cloud | 3.4.1-r2。`user-data` 在最终阶段运行，该阶段不等待网络连接。 |
 
-`expand_root` 在每次启动时都会扩展 Alpine 自身的根目录。因此，`run_maintenance` 会将缓存的 raw 文件克隆（`cache::clone_file`：优先使用 APFS 克隆，回退为普通复制）到 `maint/<pid>-<nonce>/alpine.raw` 并启动该克隆副本。`~/.cache/vibe/` 下的文件始终保持只读输入状态。维护校验要求运行后其 SHA-256 保持不变。
+`expand_root` 在每次启动时都会扩展 Alpine 自身的根目录。因此，`run_maintenance` 会将缓存的 raw 文件克隆（`cache::clone_file`：优先使用 APFS 克隆，回退为普通复制）到 `maint/<pid>-<nonce>/alpine.raw` 并启动该克隆副本。`maint/` 创建在所用 Alpine raw 的同一目录下，使克隆留在同一文件系统内；该目录不可写时，改用首选镜像目录下的 `maint/`。缓存的 raw 文件始终保持只读输入状态。维护校验要求运行后其 SHA-256 保持不变。
 
 ## 启动时机
 
@@ -53,7 +53,15 @@ Vibe 不会驱动该向导，不会对目标执行 `chroot`，也不会运行目
 
 ### 缓存
 
-`ensure_alpine_image` 获取 `alpine.lock`，随后执行 `ensure_locked`：
+`ensure_alpine_image` 接收 `ImageDirs`（参见 `vibe --help` 中的 `VIBE_EXTRA_IMAGE_DIR` 与 `VIBE_PREFERRED_IMAGE_DIR`）：
+
+- 首选目录中存在 `{name}.raw` 时，在该目录执行下面的步骤。
+- 否则按查找顺序检查其他已存在的镜像目录。其中的 `{name}.raw` 只有通过 `alpine_root_uuid_matches` 才会被使用。读取时不加锁，也从不删除、修复或重新下载；UUID 不符或读取失败时打印一条指明文件的警告，然后继续查找。
+- 没有任何目录符合条件时，在首选目录执行下面的步骤，镜像会被下载到首选目录。
+
+每次运行都会打印 `Using Alpine maintenance image <path>`，维护日志头部也记录同一路径。
+
+在首选目录中，`ensure_alpine_image` 获取 `alpine.lock`，随后执行 `ensure_locked`：
 
 1. 如果缓存归档文件的 SHA-512 与 `ALPINE_ARCHIVE_SHA512` 不匹配，则将其删除并重新获取（`images::fetch_verified`：下载到 `.part`，校验摘要，重命名）。
 2. 若缺少 `{name}.raw`，则使用 `extract_disk_raw` 进行解压（归档成员为 `disk.raw`）。
@@ -178,7 +186,7 @@ dd if=disk.raw bs=1 skip=$((380928 * 512 + 1024 + 0x68)) count=16 2>/dev/null | 
    - `gpt::tests::real_disk_layouts`（索引、标签 `/`、UUID）
    - 当文件名改变时，修改 `tests/disk_prepare.rs` 中的缓存主体名称 `alpine-3.24.2-aarch64-tiny-r1`
    - `docs/how-vm-boot.md` 和 `docs/how-vm-boot.zh-Hans.md` 中的镜像名称
-8. 从缓存（`$XDG_CACHE_HOME/vibe` 或 `~/.cache/vibe`）中删除旧的 `<name>.raw` 和 `<name>.raw.tar.gz`。仍符合旧 UUID 的 raw 文件会被持续使用且不会重新下载。`ensure_alpine_image` 根据 `ALPINE_IMAGE_NAME` 建立文件索引，因此重命名的锁定版本代表一组新文件；请在同一次提交中清理旧文件。
+8. 从缓存（`$XDG_CACHE_HOME/vibe` 或 `~/.cache/vibe`）以及所有 extra 镜像目录（`VIBE_EXTRA_IMAGE_DIR`）中删除旧的 `<name>.raw` 和 `<name>.raw.tar.gz`。仍符合旧 UUID 的 raw 文件会被持续使用且不会重新下载。`ensure_alpine_image` 根据 `ALPINE_IMAGE_NAME` 建立文件索引，因此重命名的锁定版本代表一组新文件；请在同一次提交中清理旧文件。
 9. 运行 `cargo test`。在 Mac 上，运行 `VIBE_VM_CHECK=maintenance-all`（`tests/alpine_maintenance.rs`）和 `VIBE_VM_CHECK=prepare`（`tests/disk_prepare.rs`），同时将 `VIBE_TEST_ALPINE_RAW` 指向新的 raw 文件，并将归档文件作为 `<raw>.tar.gz` 放置在同级目录下。针对新的 Debian 工作副本启动一次辅助镜像，验证 `PREP-RESULT ok 0 done`、空 machine-id、空的 root 密码字段，且缓存 raw 文件的 SHA-256 保持不变。
 
 若 limine 的 `timeout` 变长，请将实测启动时间与 `MAINT_FIRST_OUTPUT_TIMEOUT`（90 秒）进行对比。当前菜单等待耗时约 10 秒，在预算范围内。内核直接启动功能（`VZLinuxBootLoader`，在最初的调研中约为 8.5 秒）目前未实现；维护虚拟机仍然使用 EFI，以便宿主机无需解包 FAT ESP 或 zboot 内核。

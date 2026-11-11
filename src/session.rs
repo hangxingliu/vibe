@@ -201,7 +201,7 @@ pub(crate) enum DiskSource {
     External,
     /// The project instance disk in `.vibe/`.
     Instance,
-    /// A named image in the cache, booted directly.
+    /// A named image from an image directory, booted directly.
     CachedImage(String),
 }
 
@@ -226,7 +226,7 @@ The original disk is not modified.";
     let steps = match source {
         DiskSource::External => format!(
             "  vibe provision --base {base} --image <name>\n\
-Then run `vibe --image <name>` in a project, or boot <name>.raw from the Vibe cache directory (see `vibe --help`)."
+Then run `vibe --image <name>` in a project, or boot <name>.raw from one of the Vibe image directories (see `vibe --help`)."
         ),
         DiskSource::Instance => format!(
             "  vibe provision --base {base} --image <name>\n\
@@ -838,6 +838,7 @@ mod tests {
         let external = needs_provision_hint(Path::new("/tmp/disk.raw"), &DiskSource::External);
         assert!(external.contains("vibe provision --base /tmp/disk.raw --image <name>"));
         assert!(external.contains("vibe --image <name>"));
+        assert!(external.contains("one of the Vibe image directories (see `vibe --help`)"));
 
         let relative = needs_provision_hint(Path::new("disk.raw"), &DiskSource::External);
         let expected = std::env::current_dir().unwrap().join("disk.raw");

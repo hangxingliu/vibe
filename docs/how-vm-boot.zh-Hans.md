@@ -29,23 +29,28 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 ## 磁盘文件
 
-`run_main` 将所有缓存文件存放在 `$XDG_CACHE_HOME/vibe` 下；如果未设置 `XDG_CACHE_HOME`，则存放在 `~/.cache/vibe` 下。
+缓存目录（下文称“默认目录”）为 `$XDG_CACHE_HOME/vibe`；如果未设置 `XDG_CACHE_HOME`，则为 `~/.cache/vibe`。
 
-| 文件 | 创建者 | 作用 |
-| --- | --- | --- |
-| `debian-13-nocloud-arm64-20261001-2618.tar.xz` | `ensure_base_image` | 已下载的 Debian 基础归档包。 |
-| `debian-13-nocloud-arm64-20261001-2618.raw` | `extract_disk_raw` | 解压后的基础镜像。归档内的成员文件为 `disk.raw`。该文件从不被修改。 |
-| `alpine-3.24.2-aarch64-tiny-r1.raw.tar.gz` 与 `.raw` | `ensure_alpine_image` | 固定版本的 Alpine 维护镜像。仅在工作副本需要预处理时下载。 |
-| `alpine.lock` | `FileLock::acquire` | 串行化 Alpine 的下载和解压流程。 |
-| `<name>.raw` | `provision_image` | 已发布的模板。省略 `--image` 时使用的模板为 `default.raw`。 |
-| `<name>.tmp.<pid>` | `provision_image` | 专用工作副本。仅在配置（provision）成功后才会重命名覆盖为 `<name>.raw`。 |
-| `<name>.tmp.<pid>.lock` | `FileLock::try_acquire_existing` | 维护虚拟机的同级锁文件。磁盘镜像本身不加 flock 锁，否则 Virtualization.framework 会拒绝附加该磁盘。 |
-| `maint/<pid>-<nonce>/` | `process_disk` | 单次维护运行环境：Alpine 克隆、seed ISO、EFI 变量存储、控制台日志。 |
-| `logs/maint-<unix>-<pid>.log` | `publish_log` | 已发布的维护控制台日志。仅保留最新的 5 个日志。 |
-| `vibe-usernet` | `ensure_usernet_helper_extracted` | 内置的用户态网络辅助程序，在缓存字节不一致时写出。 |
-| `.vibe/instance.raw` | `ensure_instance_disk` | 项目专属磁盘，从模板复制一次生成。这是常规 `vibe` 启动的文件。 |
-| `.vibe/vibe-usernet.log` | `NetworkMode::prepare` | 项目实例的辅助程序日志。外部的 `path/to/disk.raw` 不会生成此日志。 |
-| `$TMPDIR/efi_variable_store_<pid>.efivars` | `default_efi_vars_path` | 交互式虚拟机的 EFI 变量存储。每次启动时以 `AllowOverwrite` 重新创建。 |
+`run_main` 在处理 `--version` 之后、`--help` 之前构造 `ImageDirs::from_env`（`src/image_dirs.rs`），因此除 `--version` 外，配置错误会让所有命令报错退出。`VIBE_EXTRA_IMAGE_DIR`（`:` 分隔的绝对路径）增加镜像目录，`VIBE_PREFERRED_IMAGE_DIR` 指定首选目录，它必须是默认目录或 extra 中的某一项，并且必须已经存在。查找顺序为：首选目录、默认目录、其余 extra 目录（按书写顺序）。比较时先去掉尾部 `/`，目录存在时再用 `canonicalize` 比较；重复项会被去掉。不存在的 extra 目录标注为 `(missing, skipped)`。run 与 provision 在 `ensure_signed` 之后打印一次 `ImageDirs::describe`；`--help` 在 `Cache directory:` 之后打印它。
+
+镜像名（`--image`、`--base NAME`、`default`）通过 `find_named_image` 查找，Debian 基础镜像通过 `locate_debian_base` 查找。位置参数 `path/to/disk.raw`、含 `/` 的 `--base` 以及 `.vibe/instance.raw` 不参与查找。下表的“位置”列说明每个文件所在的目录。
+
+| 文件 | 位置 | 创建者 | 作用 |
+| --- | --- | --- | --- |
+| `debian-13-nocloud-arm64-20261001-2618.tar.xz` | 首选目录 | `ensure_base_image` | 已下载的 Debian 基础归档包。仅在所有镜像目录都没有 `.raw` 时需要；不复用其他目录中的归档包。 |
+| `debian-13-nocloud-arm64-20261001-2618.raw` | 第一个命中的目录，否则首选目录 | `extract_disk_raw` | 解压后的基础镜像。归档内的成员文件为 `disk.raw`。该文件从不被修改。 |
+| `alpine-3.24.2-aarch64-tiny-r1.raw.tar.gz` 与 `.raw` | 第一个命中的目录，否则首选目录 | `ensure_alpine_image` | 固定版本的 Alpine 维护镜像。仅在工作副本需要预处理时下载。首选目录之外的 `.raw` 只有在 UUID 校验通过时才以只读方式复用。 |
+| `alpine.lock` | 首选目录 | `FileLock::acquire` | 串行化 Alpine 的下载和解压流程。 |
+| `<name>.raw` | 第一个命中的目录，否则首选目录 | `provision_image` | 已发布的模板。省略 `--image` 时使用的模板为 `default.raw`。`--replace` 在命中的目录原地替换。 |
+| `<name>.tmp.<pid>` | 与 `<name>.raw` 同目录 | `provision_image` | 专用工作副本。仅在配置（provision）成功后才会重命名覆盖为 `<name>.raw`。 |
+| `<name>.tmp.<pid>.lock` | 与 `<name>.raw` 同目录 | `FileLock::try_acquire_existing` | 维护虚拟机的同级锁文件。磁盘镜像本身不加 flock 锁，否则 Virtualization.framework 会拒绝附加该磁盘。 |
+| `maint/<pid>-<nonce>/` | Alpine `.raw` 所在目录，否则首选目录 | `process_disk` | 单次维护运行环境：Alpine 克隆、seed ISO、EFI 变量存储、控制台日志。 |
+| `logs/maint-<unix>-<pid>.log` | 默认目录 | `publish_log` | 已发布的维护控制台日志，开头带有列出完整路径的头部。仅保留最新的 5 个日志。 |
+| `apt/`、`cargo/`、agent 配置、`guest_node_modules/` | 默认目录 | `create_cache_share` | VirtioFS 共享的源目录。 |
+| `vibe-usernet` | 默认目录 | `ensure_usernet_helper_extracted` | 内置的用户态网络辅助程序，在缓存字节不一致时写出。 |
+| `.vibe/instance.raw` | 项目目录 | `ensure_instance_disk` | 项目专属磁盘，从模板复制一次生成。这是常规 `vibe` 启动的文件。 |
+| `.vibe/vibe-usernet.log` | 项目目录 | `NetworkMode::prepare` | 项目实例的辅助程序日志。外部的 `path/to/disk.raw` 不会生成此日志。 |
+| `$TMPDIR/efi_variable_store_<pid>.efivars` | `$TMPDIR` | `default_efi_vars_path` | 交互式虚拟机的 EFI 变量存储。每次启动时以 `AllowOverwrite` 重新创建。 |
 
 ### Debian 基础镜像
 
@@ -211,7 +216,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 `process_disk`（`src/maintenance.rs`）：
 
 1. `prepare_target` 要求目标为常规可写文件。它以读写模式打开磁盘仅为验证其可写性，随后获取同级 `{disk}.lock` 上的非阻塞 flock。它读取 GPT、选择布局并执行 `scan_labels`。`label_block_reason` 会拒绝 ext4 UUID 等于 `ALPINE_ROOT_FS_UUID` 以及文件系统标签为 `/` 或 `cidata`（不区分大小写）的磁盘。它会记录 `ProbeFacts` 以供后续复检。
-2. `cache::sweep_stale` 清理 `maint/` 目录下 `<pid>-<nonce>` 对应 pid 已不存在的废弃目录。`cache::private_dir` 以权限 `0700` 创建 `maint/<pid>-<nonce>`。
+2. `create_work_dir`：`cache::private_dir` 在 Alpine `.raw` 所在目录下以权限 `0700` 创建 `maint/<pid>-<nonce>`，让克隆在同一文件系统内完成。创建失败时（例如只读卷）打印一行说明，改用首选目录下的 `maint/`。随后 `cache::sweep_stale` 只清理实际使用的 `maint/` 根目录下 `<pid>-<nonce>` 对应 pid 已不存在的废弃目录。
 3. `run_maintenance`：
    - 生成 `control::new_nonce`（32 位小写十六进制数字）。
    - 将 Alpine raw 克隆到该目录下的 `alpine.raw`。
@@ -220,7 +225,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
    - 按照客户机顺序配置 `VmSpec` 磁盘：`vda` 为 Alpine 克隆（可写），`vdb` 为 Debian 工作副本（可写），`vdc` 为 `seed.iso`（只读）。`network` 设为 `None`。无共享设备，无键盘串口。`hvc0` 为 `SerialRole::Log`，`hvc1` 为 `SerialRole::Control`（`output_serial` 保留宿主机读取端）。EFI 变量保存在工作目录下的 `efivars`。配置为 2 核 CPU 和 1 GiB 内存（`MAINT_CPU`，`MAINT_RAM_BYTES`）。
    - `run_headless` 启动该规格。日志工作线程将 `hvc0` 复制到 `hvc0.log`。控制工作线程将 `hvc1` 传递给 `FrameReader::new(nonce)`。接收到的每个有效帧都会传递给 `observe_frame`。
 4. 成功后，`image_probe::verify_processed` 重新读取工作副本。要求 GPT 布局未改变、`/etc/machine-id` 为空常规文件、恰好有一行密码字段为空的 root shadow 记录、dbus machine-id 缺失、为空或者是指向 `/etc/machine-id` 的符号链接，且 `classify` == `LegacyCompatible`。失败则报错 `[verify] host-verify`。
-5. `publish_log` 将控制台日志移动到 `~/.cache/vibe/logs/maint-<unix>-<pid>.log`，`retain_newest_logs` 保留 `LOGS_TO_KEEP`（5 个）。除非设置了 `VIBE_KEEP_FAILED_WORK=1`（此时会打印路径），否则工作目录会被删除。保留的目录在对应 pid 退出后，仍会被下一次 `process_disk` 删除。随后 `ensure_bootable` 会解绑并删除同级 `.lock` 文件，除非错误原因是另一个 Vibe 进程正持有该锁。
+5. `publish_log` 将控制台日志写入默认目录下的 `logs/maint-<unix>-<pid>.log`，并在前面加上 `log_header`，列出被处理磁盘、Alpine 源 `.raw`、Alpine 克隆、seed ISO 和工作目录的完整路径；`retain_newest_logs` 保留 `LOGS_TO_KEEP`（5 个）。除非设置了 `VIBE_KEEP_FAILED_WORK=1`（此时会打印路径），否则工作目录会被删除。保留的目录在对应 pid 退出后，仍会被下一次 `process_disk` 删除。随后 `ensure_bootable` 会解绑并删除同级 `.lock` 文件，除非错误原因是另一个 Vibe 进程正持有该锁。
 
 发生 `PrepareError` 时会打印 `[prepare] <stage> (last PREP-STEP: ...)` 以及日志路径。宿主机复检失败使用 `[verify]` 前缀。
 
@@ -329,4 +334,4 @@ Debian 的 SSH 服务端默认拒绝空密码（`PermitEmptyPasswords no`）。�
 | `tests/alpine_maintenance.rs` | `maintenance-all` | 运行 `src/vm_checks/maintenance.rs`：下载、shadow 编辑、新旧镜像预处理、重复预处理、反向异常磁盘用例、needs-recovery、SSH `PermitEmptyPasswords` 以及日志保留。缓存的 Alpine raw 的 SHA-256 必须保持不变。`maintenance-<name>` 运行其中某一项检查。 |
 | `src/vm_checks/prepare.rs` | `probe` | 对 `VIBE_VM_CHECK_DISK` 执行 `probe_disk`。打印分类、machine-id 状态以及 root 密码字段是否为空。不打印 shadow 字节。 |
 
-被忽略的测试依赖于 `VIBE_TEST_DEBIAN_NEW_RAW`、`VIBE_TEST_DEBIAN_OLD_RAW` 和 `VIBE_TEST_ALPINE_RAW`。维护镜像的编辑操作使用来自 `VIBE_E2FS_SBIN` 或 `PATH` 中的 e2fsprogs。`tests/fixtures/make-ext4.sh` 用于重建进程内 ext4 与探测测试所需的 gzip ext4 小镜像。`VIBE_VM_CHECK_DISK` 和 `VIBE_VM_CHECK_CACHE` 为 `probe` 和 `prepare` 选择测试磁盘及 Alpine 缓存路径。设置 `VIBE_MAINT_TEST_PARTUUID` 可以替换写入清单中的 PARTUUID，以便通过反向检查强制触发目标不匹配错误。
+被忽略的测试依赖于 `VIBE_TEST_DEBIAN_NEW_RAW`、`VIBE_TEST_DEBIAN_OLD_RAW` 和 `VIBE_TEST_ALPINE_RAW`。维护镜像的编辑操作使用来自 `VIBE_E2FS_SBIN` 或 `PATH` 中的 e2fsprogs。`tests/fixtures/make-ext4.sh` 用于重建进程内 ext4 与探测测试所需的 gzip ext4 小镜像。这些镜像被 gitignore；当所需镜像缺失时，测试会运行该脚本。`VIBE_VM_CHECK_DISK` 和 `VIBE_VM_CHECK_CACHE` 为 `probe` 和 `prepare` 选择测试磁盘及 Alpine 缓存路径。设置 `VIBE_MAINT_TEST_PARTUUID` 可以替换写入清单中的 PARTUUID，以便通过反向检查强制触发目标不匹配错误。

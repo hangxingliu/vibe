@@ -10,6 +10,7 @@ use std::{fs, path::Path};
 use crate::{
     alpine::ensure_alpine_image,
     cache::disk_lock_path,
+    image_dirs::ImageDirs,
     image_probe::{ImageClass, MachineIdFact, ProbeFacts, probe_disk},
     maintenance::process_disk,
 };
@@ -93,10 +94,12 @@ fn needs_preparation_reasons(facts: &ProbeFacts) -> Vec<&'static str> {
 }
 
 /// Probe `work_copy` and, when needed, prepare it in place with Alpine.
-/// `cache_dir` holds the Alpine image and the maintenance work directories.
+/// The Alpine image is looked up in `dirs` (and downloaded to the preferred
+/// directory). Maintenance work files go next to the Alpine image and the
+/// log goes to the default directory.
 pub(crate) fn ensure_bootable(
     work_copy: &Path,
-    cache_dir: &Path,
+    dirs: &ImageDirs,
 ) -> Result<PreparedKind, Box<dyn std::error::Error>> {
     let (class, facts) = probe_disk(work_copy);
     match prepare_decision(&class) {
@@ -111,8 +114,9 @@ pub(crate) fn ensure_bootable(
         PrepareDecision::Process => {
             println!("{}", preparation_notice(&class, &facts));
             println!("{EMPTY_ROOT_NOTICE}");
-            let alpine = ensure_alpine_image(cache_dir)?;
-            let result = process_disk(work_copy, &alpine, cache_dir);
+            let alpine = ensure_alpine_image(dirs)?;
+            println!("Using Alpine maintenance image {}", alpine.display());
+            let result = process_disk(work_copy, &alpine, dirs.preferred(), dirs.default_dir());
             // The sibling lock file is only ours when this call was not rejected
             // because another process already holds it. Unlinking a lock that
             // someone else holds would let a third process lock a new inode.

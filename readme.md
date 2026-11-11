@@ -142,7 +142,7 @@ In `my-custom-script.sh` I set up my tmux keybindings, favorite shell customizat
 In a project directory, you can then run `vibe --image my-template` to use this template image (this flag is ignored if `.vibe/instance.raw` already exists).
 
 The [base provisioning script](/provisioning/base.sh) is always run when provisioning to install basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, etc.
-If you don't want this, you can make your own `.raw` disk images and copy them into `~/.cache/vibe/` to use them as templates.
+If you don't want this, you can make your own `.raw` disk images and copy them into `~/.cache/vibe/` (or any extra image directory, see [Keeping images on another disk](#keeping-images-on-another-disk)) to use them as templates.
 
 
 ```
@@ -217,6 +217,21 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
 A new Debian base is first prepared once in a headless Alpine maintenance VM; older bases and Vibe images are used as-is.
 Set the environment variable VIBE_KEEP_FAILED_WORK=1 to keep the work copy and maintenance files of a failed provision for debugging.
 
+Image directories:
+
+  Image names (`--image NAME`, `--base NAME`, the `default` image) and the Debian and Alpine base images are looked up
+  in the image directories, in order; the first match is used. Paths given with `/` are used as-is.
+  The default image directory is the cache directory. Two optional environment variables add more:
+
+  VIBE_EXTRA_IMAGE_DIR=DIR[:DIR ...]                        Extra image directories (absolute paths, `:` separated), searched after the default one.
+                                                            Directories that do not exist are listed as skipped.
+  VIBE_PREFERRED_IMAGE_DIR=DIR                              Preferred directory: the default directory or an entry of VIBE_EXTRA_IMAGE_DIR.
+                                                            It is searched first and must exist. Downloads and new images are written here;
+                                                            an existing image is replaced where it was found.
+
+  Shared caches (apt, cargo, ...), agent configuration, and maintenance logs always stay in the cache directory.
+  The lookup order is printed when a VM is run or provisioned.
+
 Built-in provisioning scripts:
 
   @claude     Install Anthropic's Claude.
@@ -229,6 +244,33 @@ Built-in provisioning scripts:
   @rust       Install Rust with sccache.
   
 ```
+
+## Keeping images on another disk
+
+Disk images are large. If you'd rather keep them on an external drive, list extra image directories with two optional environment variables:
+
+    export VIBE_EXTRA_IMAGE_DIR=/Volumes/ExternalDisk/VMImages:/Volumes/ExternalDisk2/VMImages
+    export VIBE_PREFERRED_IMAGE_DIR=/Volumes/ExternalDisk2/VMImages
+
+- `VIBE_EXTRA_IMAGE_DIR` is a `:` separated list of absolute paths. Directories that don't exist (say, an unplugged drive) are skipped.
+- `VIBE_PREFERRED_IMAGE_DIR` must be `~/.cache/vibe` (the default directory, which follows `$XDG_CACHE_HOME`) or one of the extra directories, and it must exist. When unset, the default directory is preferred.
+
+Image names (`--image NAME`, `--base NAME`, and the `default` image), the Debian base image, and the Alpine maintenance image are looked up in this order: the preferred directory, then the default directory, then the remaining extra directories. The first match wins.
+Paths such as `vibe path/to/disk.raw`, `--base path/to/x.raw`, and `.vibe/instance.raw` are used as given.
+
+Downloads and new images go to the preferred directory. Provisioning an image that already exists (with `--replace`) replaces it in the directory where it was found.
+Debian and Alpine images in directories other than the preferred one are only read: never locked, repaired, or re-downloaded. A broken Alpine image there is skipped with a warning.
+While a new Debian base is prepared, a temporary `maint/` folder is created next to the Alpine image in use (or in the preferred directory if that location is not writable).
+The shared caches (`apt`, `cargo`, ...), agent configuration, `vibe-usernet`, and maintenance logs (`logs/`) always stay in the default directory.
+
+So you don't forget about this setup, `vibe` and `vibe provision` print the lookup order when they start, and `vibe --help` ends with it:
+
+    Image directories (lookup order):
+      1. /Volumes/ExternalDisk2/VMImages (preferred)
+      2. /Users/me/.cache/vibe (default)
+      3. /Volumes/ExternalDisk/VMImages (missing, skipped)
+
+When an image is found by name, Vibe prints its full path.
 
 ## Other notes
 

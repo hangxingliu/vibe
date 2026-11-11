@@ -9,8 +9,9 @@
 use std::{env, fs, os::unix::fs::PermissionsExt, path::Path};
 
 use crate::disk_prepare::ensure_bootable;
+use crate::image_dirs::ImageDirs;
 use crate::image_probe::{self, MachineIdFact};
-use crate::images::ensure_base_image;
+use crate::images::{ensure_base_image, locate_debian_base};
 use crate::networking::PreparedNetworkBackend;
 use crate::session::{
     DEFAULT_EXPECT_TIMEOUT,
@@ -165,10 +166,9 @@ fn machine_id_label(fact: &MachineIdFact) -> &'static str {
 const PROVISION_SUCCESS_MARKER: &str = "VIBE_PROVISION_SUCCESS";
 const DEFAULT_DISK_SIZE: u64 = DEFAULT_DISK_GB * 1024 * BYTES_PER_MB;
 
+/// `default_raw` is the existing default image, or where to create it.
 pub(crate) fn ensure_default_image(
-    cache_dir: &Path,
-    base_raw: &Path,
-    base_compressed: &Path,
+    dirs: &ImageDirs,
     default_raw: &Path,
     directory_shares: &[DirectoryShare],
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
@@ -183,7 +183,9 @@ pub(crate) fn ensure_default_image(
         return Ok(());
     }
 
-    ensure_base_image(base_raw, base_compressed)?;
+    let base = locate_debian_base(dirs);
+    ensure_base_image(&base.raw, &base.compressed)?;
+    println!("Using base image {}", base.raw.display());
 
     // Provision with everything, so folks who don't read README have a "it just works" experience.
     let default_provisioning_scripts: Vec<_> = BUILTIN_PROVISION_SCRIPTS
@@ -194,13 +196,13 @@ pub(crate) fn ensure_default_image(
 
     println!("Provisioning default VM with:");
     for s in &default_provisioning_scripts {
-        println!("  @{}", &s.name);
+        println!("  @{}", s.name);
     }
     println!("If you want a lighter default image, see `vibe provision`");
 
     provision_image(
-        cache_dir,
-        base_raw,
+        dirs,
+        &base.raw,
         default_raw,
         false,
         false,
@@ -215,30 +217,28 @@ pub(crate) fn ensure_default_image(
 
 fn build_provision_script(script: &ProvisionScript, guest_proxy: &Option<String>) -> LoginAction {
     let mut content = script.content.to_string();
-    if script.name == "base" {
-        if let Some(proxy_url) = guest_proxy {
-            let proxy_code = format!(
-                "echo 'Acquire::http::Proxy \"{proxy_url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n\
-                 echo 'Acquire::https::Proxy \"{proxy_url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n\
-                 \n\
-                 {exports}\n",
-                exports = generate_http_proxy_env_export_cmds(proxy_url)
-            );
+    if script.name == "base"
+        && let Some(proxy_url) = guest_proxy
+    {
+        let proxy_code = format!(
+            "echo 'Acquire::http::Proxy \"{proxy_url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n\
+             echo 'Acquire::https::Proxy \"{proxy_url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n\
+             \n\
+             {exports}\n",
+            exports = generate_http_proxy_env_export_cmds(proxy_url)
+        );
 
-            let re = regex::Regex::new(
-                r"(?m)^#\s+region\s+INJECT_PROXY_CODE\n(?:.*\n)*?#\s+endregion\s+INJECT_PROXY_CODE",
+        let re = regex::Regex::new(
+            r"(?m)^#\s+region\s+INJECT_PROXY_CODE\n(?:.*\n)*?#\s+endregion\s+INJECT_PROXY_CODE",
+        )
+        .expect("valid INJECT_PROXY_CODE region regex");
+
+        content = re
+            .replace(
+                &content,
+                format!("# region INJECT_PROXY_CODE\n{proxy_code}\n# endregion INJECT_PROXY_CODE"),
             )
-            .expect("valid INJECT_PROXY_CODE region regex");
-
-            content = re
-                .replace(
-                    &content,
-                    format!(
-                        "# region INJECT_PROXY_CODE\n{proxy_code}\n# endregion INJECT_PROXY_CODE"
-                    ),
-                )
-                .into_owned();
-        }
+            .into_owned();
     }
 
     Script {
@@ -249,7 +249,7 @@ fn build_provision_script(script: &ProvisionScript, guest_proxy: &Option<String>
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn provision_image(
-    cache_dir: &Path,
+    dirs: &ImageDirs,
     base_raw: &Path,
     image_raw: &Path,
     replace: bool,
@@ -303,7 +303,7 @@ pub(crate) fn provision_image(
             .map_err(|err| format!("[prepare] cannot make {tmp_file_str} writable: {err}"))?;
         // Prepare the work copy at its original size. Growing the file first
         // would make the maintenance manifest disagree with the partition table.
-        ensure_bootable(&tmp_raw, cache_dir)?;
+        ensure_bootable(&tmp_raw, dirs)?;
 
         let grow = || -> std::io::Result<()> {
             if fs::metadata(&tmp_raw)?.len() < DEFAULT_DISK_SIZE {

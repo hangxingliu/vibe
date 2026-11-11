@@ -1,5 +1,5 @@
-//! Image files in the cache directory: the downloaded Debian base image, named
-//! images, and per-project instance disks.
+//! Image files in the image directories (see [`ImageDirs`]): the downloaded
+//! Debian base image, named images, and per-project instance disks.
 //!
 //! Alpine downloads use [`fetch_verified`] (a `.part` file, then rename).
 //! The Debian path keeps its original messages and does not re-download an
@@ -12,7 +12,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use crate::cache;
+use crate::{cache, image_dirs::ImageDirs};
 
 pub(crate) const DEBIAN_COMPRESSED_DISK_URL: &str = "https://cdimage.debian.org/cdimage/cloud/trixie/20261001-2618/debian-13-nocloud-arm64-20261001-2618.tar.xz";
 const DEBIAN_COMPRESSED_SHA: &str = "c049582fe2d13d9e0c1a4767ade3a32bed217774bd6e39ac8fc60ca78534bfc258a8c52363ddfad639d5db7eacc2550688d5393f16aaf62bc5d19ecd4a7e6170";
@@ -29,9 +29,54 @@ pub(crate) fn assert_valid_image_name(name: &str) {
     );
 }
 
-pub(crate) fn image_path(cache_dir: &Path, name: &str) -> PathBuf {
+pub(crate) fn image_path(dir: &Path, name: &str) -> PathBuf {
     assert_valid_image_name(name);
-    cache_dir.join(format!("{name}.raw"))
+    dir.join(format!("{name}.raw"))
+}
+
+/// `<name>.raw` in the first image directory that has it.
+pub(crate) fn find_named_image(dirs: &ImageDirs, name: &str) -> Option<PathBuf> {
+    assert_valid_image_name(name);
+    dirs.find_file(&format!("{name}.raw"))
+}
+
+/// Where a new image called `name` is created: the preferred directory.
+pub(crate) fn new_image_path(dirs: &ImageDirs, name: &str) -> PathBuf {
+    image_path(dirs.preferred(), name)
+}
+
+/// The Debian base image files to use.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DebianBase {
+    pub raw: PathBuf,
+    pub compressed: PathBuf,
+    /// `raw` already exists in one of the image directories.
+    pub found: bool,
+}
+
+/// An existing Debian `.raw` in search order, used read-only. Otherwise the
+/// `.raw` and `.tar.xz` paths in the preferred directory, where
+/// [`ensure_base_image`] downloads and extracts. An archive in another
+/// directory is not reused.
+pub(crate) fn locate_debian_base(dirs: &ImageDirs) -> DebianBase {
+    let compressed_name = DEBIAN_COMPRESSED_DISK_URL
+        .rsplit('/')
+        .next()
+        .expect("URL has a file name");
+    let raw_name = format!("{}.raw", compressed_name.trim_end_matches(".tar.xz"));
+    let compressed = dirs.preferred().join(compressed_name);
+    match dirs.find_file(&raw_name) {
+        Some(raw) => DebianBase {
+            raw,
+            compressed,
+            found: true,
+        },
+        None => DebianBase {
+            raw: dirs.preferred().join(raw_name),
+            compressed,
+            found: false,
+        },
+    }
 }
 
 /// An archive needs a download when it is missing or smaller than the known
@@ -267,6 +312,48 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    #[should_panic(expected = "Image name must be alphanumeric")]
+    fn find_named_image_rejects_invalid_names() {
+        find_named_image(&ImageDirs::single(PathBuf::from("/nonexistent")), "../x");
+    }
+
+    #[test]
+    fn debian_base_is_reused_from_any_directory_or_placed_in_the_preferred_one() {
+        let root = temp_dir("debian-locate");
+        let default = root.join("default");
+        let pref = root.join("pref");
+        let other = root.join("other");
+        for dir in [&default, &pref, &other] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let extra = format!("{}:{}", other.display(), pref.display());
+        let dirs = ImageDirs::from_values(
+            default.clone(),
+            Some(std::ffi::OsStr::new(&extra)),
+            Some(pref.as_os_str()),
+        )
+        .unwrap();
+
+        let fresh = locate_debian_base(&dirs);
+        assert!(!fresh.found);
+        assert_eq!(fresh.raw.parent(), Some(pref.as_path()));
+        assert_eq!(fresh.compressed.parent(), Some(pref.as_path()));
+        assert!(fresh.raw.to_string_lossy().ends_with(".raw"));
+        assert!(fresh.compressed.to_string_lossy().ends_with(".tar.xz"));
+
+        let raw_name = fresh.raw.file_name().unwrap();
+        fs::write(other.join(raw_name), b"").unwrap();
+        let reused = locate_debian_base(&dirs);
+        assert!(reused.found);
+        assert_eq!(reused.raw, other.join(raw_name));
+        assert_eq!(reused.compressed.parent(), Some(pref.as_path()));
+
+        fs::write(default.join(raw_name), b"").unwrap();
+        assert_eq!(locate_debian_base(&dirs).raw, default.join(raw_name));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -293,6 +293,7 @@ fn check_recovery(alpine: &Path) -> Result<(), Box<dyn std::error::Error>> {
         2,
         2 * 1024 * 1024 * 1024,
         None,
+        None,
     );
     if booted.is_ok() {
         return Err("force-stop hook returned success".into());
@@ -386,6 +387,7 @@ ssh_check 2>&1 | tee /run/vibe-ssh-check.log
         |_| PreparedNetworkBackend::VzNat,
         2,
         2 * 1024 * 1024 * 1024,
+        None,
         None,
     )?;
     let output = outcome.output;
@@ -901,6 +903,7 @@ fn legacy_boot(disk: &Path) -> Result<(), Box<dyn std::error::Error>> {
         |_| PreparedNetworkBackend::VzNat,
         2,
         2 * 1024 * 1024 * 1024,
+        None,
         None,
     )?;
     Ok(())

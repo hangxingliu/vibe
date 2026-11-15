@@ -7,6 +7,7 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
@@ -22,6 +23,8 @@ mod proxy;
 use provision::*;
 mod session;
 use session::*;
+mod vm_user;
+use vm_user::VmUser;
 mod vm_config;
 mod vm_io;
 use vm_io::*;
@@ -208,7 +211,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run_main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = parse_cli()?;
+    let mut args = parse_cli()?;
 
     let home = env::var("HOME").map(PathBuf::from)?;
     let cache_home = env::var("XDG_CACHE_HOME").map_or_else(|_| home.join(".cache"), PathBuf::from);
@@ -393,6 +396,7 @@ Cache directory:
     // written into the guest. In `vznat` mode the guest gets the proxy
     // variables (and provisioning saves the proxy in the apt configuration).
     let guest_proxy = proxy_plan.guest;
+    let root_password = args.root_password.take().map(Arc::new);
 
     let prepare_network_backend = |log_dir: Option<&Path>| {
         args.network_mode
@@ -452,6 +456,7 @@ Cache directory:
                     cpu_count,
                     ram_bytes,
                     None,
+                    root_password,
                 )
                 .map(|_| ());
             }
@@ -497,6 +502,7 @@ Cache directory:
                 &guest_proxy,
                 cpu_count,
                 ram_bytes,
+                root_password,
             )
         }
         CliCommand::Run { disk, image } => {
@@ -542,6 +548,7 @@ Cache directory:
                         &cache_dir,
                         prepare_network_backend,
                         &guest_proxy,
+                        root_password.clone(),
                     )?;
                     default_raw
                 } else {
@@ -740,6 +747,7 @@ Cache directory:
                 args.cpu_count,
                 args.ram_bytes,
                 None,
+                root_password,
             )
             .map(|_| ())
         }
@@ -780,6 +788,10 @@ struct CliArgs {
     ssh_key: Option<PathBuf>,
     publish: Vec<String>,
     git_mode: GitMode,
+    /// Checked and stored. The session still logs in as root.
+    #[allow(dead_code)]
+    vm_user: VmUser,
+    root_password: Option<RootPassword>,
 }
 
 enum CliCommand {
@@ -831,10 +843,23 @@ fn load_provision_script(name: String) -> Result<ProvisionScript, Box<dyn std::e
 }
 
 fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
-    parse_cli_from(env::args_os().skip(1))
+    parse_cli_from(env::args_os().skip(1), read_root_password_env()?.as_deref())
 }
 
-fn parse_cli_from<I>(args: I) -> Result<CliArgs, Box<dyn std::error::Error>>
+/// `Ok(None)` when `VIBE_ROOT_PASSWORD` is unset. Non-UTF-8 is an error so a
+/// password the parser cannot check is not silently ignored.
+fn read_root_password_env() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match env::var("VIBE_ROOT_PASSWORD") {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err("VIBE_ROOT_PASSWORD is not valid UTF-8".into()),
+    }
+}
+
+fn parse_cli_from<I>(
+    args: I,
+    root_password_env: Option<&str>,
+) -> Result<CliArgs, Box<dyn std::error::Error>>
 where
     I: IntoIterator,
     I::Item: Into<OsString>,
@@ -932,6 +957,8 @@ where
     let mut ssh_key = None;
     let mut publish = Vec::new();
     let mut git_mode = GitMode::Ro;
+    let mut vm_user = VmUser::root();
+    let mut root_password_flag: Option<String> = None;
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -1000,6 +1027,12 @@ where
                     "--env {name} is empty in the host environment"
                 );
                 env_vars.insert(name, value);
+            }
+            Long("vm-user") => {
+                vm_user = VmUser::parse(&os_to_string(parser.value()?, "--vm-user")?)?;
+            }
+            Long("root-password") => {
+                root_password_flag = Some(os_to_string(parser.value()?, "--root-password")?);
             }
             Long("cpus") => cpu_count = parse_cpu_count(&mut parser)?,
             Long("ram") => {
@@ -1143,6 +1176,14 @@ where
         CliCommand::Run { disk, image }
     };
 
+    let root_password = if let Some(value) = root_password_flag {
+        Some(RootPassword::parse(&value, "--root-password")?)
+    } else if let Some(value) = root_password_env {
+        Some(RootPassword::parse(value, "VIBE_ROOT_PASSWORD")?)
+    } else {
+        None
+    };
+
     Ok(CliArgs {
         command,
         version,
@@ -1169,6 +1210,8 @@ where
         ssh_key,
         publish,
         git_mode,
+        vm_user,
+        root_password,
     })
 }
 
@@ -1390,11 +1433,22 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<CliArgs, String> {
-        parse_cli_from(args.iter().copied()).map_err(|err| err.to_string())
+        parse_with_password_env(args, None)
+    }
+
+    fn parse_with_password_env(
+        args: &[&str],
+        env_password: Option<&str>,
+    ) -> Result<CliArgs, String> {
+        parse_cli_from(args.iter().copied(), env_password).map_err(|err| err.to_string())
     }
 
     fn parse_err(args: &[&str]) -> String {
-        match parse_cli_from(args.iter().copied()) {
+        parse_err_with_password_env(args, None)
+    }
+
+    fn parse_err_with_password_env(args: &[&str], env_password: Option<&str>) -> String {
+        match parse_cli_from(args.iter().copied(), env_password) {
             Ok(_) => panic!("expected arguments to be rejected: {args:?}"),
             Err(err) => err.to_string(),
         }
@@ -1742,6 +1796,116 @@ mod tests {
     #[test]
     fn removed_no_default_mounts_is_an_unknown_option() {
         assert!(parse_err(&["--no-default-mounts"]).contains("--no-default-mounts"));
+    }
+
+    #[test]
+    fn vm_user_and_root_password_parse_before_or_after_provision() {
+        let after = parse(&[
+            "provision",
+            "--vm-user",
+            "dev",
+            "--root-password",
+            "s3cret-value",
+        ])
+        .unwrap();
+        let before = parse(&[
+            "--root-password",
+            "s3cret-value",
+            "--vm-user",
+            "dev",
+            "provision",
+        ])
+        .unwrap();
+        for args in [&after, &before] {
+            expect_provision(args);
+            assert_eq!(args.vm_user, VmUser::parse("dev").unwrap());
+            let password = args.root_password.as_ref().unwrap();
+            assert_eq!(password.expose(), "s3cret-value");
+            assert_eq!(format!("{password:?}"), "***");
+            assert!(!format!("{password:?}").contains("s3cret-value"));
+        }
+
+        let run = parse(&["--vm-user", "dev", "--root-password", "s3cret-value"]).unwrap();
+        assert!(matches!(run.command, CliCommand::Run { .. }));
+        assert_eq!(run.vm_user.as_str(), "dev");
+        assert_eq!(run.root_password.as_ref().unwrap().expose(), "s3cret-value");
+    }
+
+    #[test]
+    fn vm_user_root_matches_the_default_and_the_last_value_wins() {
+        let defaulted = parse(&[]).unwrap();
+        assert_eq!(defaulted.vm_user, VmUser::root());
+        assert!(defaulted.root_password.is_none());
+
+        let explicit = parse(&["--vm-user", "root"]).unwrap();
+        assert_eq!(explicit.vm_user, defaulted.vm_user);
+
+        let last = parse(&[
+            "--vm-user",
+            "dev",
+            "--vm-user",
+            "other",
+            "--root-password",
+            "first-secret",
+            "--root-password",
+            "second-secret",
+        ])
+        .unwrap();
+        assert_eq!(last.vm_user.as_str(), "other");
+        assert_eq!(last.root_password.unwrap().expose(), "second-secret");
+    }
+
+    #[test]
+    fn invalid_vm_user_and_root_password_name_the_source() {
+        for name in ["", "Dev", "1dev", "dev/user", &"a".repeat(33)] {
+            let err = parse_err(&["--vm-user", name]);
+            assert!(err.contains("--vm-user"), "{name}: {err}");
+        }
+
+        let empty = parse_err(&["--root-password", ""]);
+        assert!(empty.contains("--root-password"), "{empty}");
+        assert!(!empty.contains("VIBE_ROOT_PASSWORD"), "{empty}");
+
+        let control = parse_err(&["--root-password", "bad\npassword"]);
+        assert!(control.contains("--root-password"), "{control}");
+        assert!(control.contains("control character"), "{control}");
+        assert!(!control.contains("bad\npassword"), "{control}");
+
+        let delete = parse_err(&["--root-password", "bad\u{7f}password"]);
+        assert!(delete.contains("--root-password"), "{delete}");
+
+        let from_env = parse_with_password_env(&[], Some("from-env-secret")).unwrap();
+        assert_eq!(from_env.root_password.unwrap().expose(), "from-env-secret");
+        let utf8 = parse_with_password_env(&["--vm-user", "dev"], Some("pässwörd")).unwrap();
+        assert_eq!(utf8.root_password.unwrap().expose(), "pässwörd");
+
+        let flag_wins =
+            parse_with_password_env(&["--root-password", "from-flag"], Some("from-env-secret"))
+                .unwrap();
+        assert_eq!(flag_wins.root_password.unwrap().expose(), "from-flag");
+
+        let bad_env = parse_err_with_password_env(&["provision"], Some(""));
+        assert!(bad_env.contains("VIBE_ROOT_PASSWORD"), "{bad_env}");
+        assert!(!bad_env.contains("--root-password"), "{bad_env}");
+
+        let bad_env_control = parse_err_with_password_env(&[], Some("line\rbreak"));
+        assert!(
+            bad_env_control.contains("VIBE_ROOT_PASSWORD"),
+            "{bad_env_control}"
+        );
+        assert!(
+            bad_env_control.contains("control character"),
+            "{bad_env_control}"
+        );
+
+        // An invalid flag is an error even when the environment holds a usable password.
+        let invalid_flag = parse_err_with_password_env(&["--root-password", ""], Some("from-env"));
+        assert!(invalid_flag.contains("--root-password"), "{invalid_flag}");
+        assert!(
+            !invalid_flag.contains("VIBE_ROOT_PASSWORD"),
+            "{invalid_flag}"
+        );
+        assert!(!invalid_flag.contains("from-env"), "{invalid_flag}");
     }
 
     #[test]

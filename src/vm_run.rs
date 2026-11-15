@@ -18,7 +18,7 @@ use crate::networking::PreparedNetworkBackend;
 use crate::session::{
     DiskSource,
     LoginAction::{self, *},
-    LoginFailure, VmOutput, action_prefix, legacy_login_prefix, needs_provision_hint,
+    LoginFailure, RootPassword, VmOutput, action_prefix, legacy_login_prefix, needs_provision_hint,
     spawn_login_actions_thread,
 };
 use crate::vm_config::{
@@ -67,6 +67,7 @@ pub(crate) fn run_vm(
     cpu_count: usize,
     ram_bytes: u64,
     actions_completed_notice: Option<&str>,
+    root_password: Option<Arc<RootPassword>>,
 ) -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let disk_path_str = disk_path.to_string_lossy();
     let ram_mib = ram_bytes / 1024 / 1024;
@@ -97,6 +98,7 @@ pub(crate) fn run_vm(
         we_write_to,
         we_write_resize_to,
         actions_completed_notice,
+        root_password,
     )
 }
 
@@ -112,6 +114,7 @@ pub(crate) fn drive_interactive(
     we_write_to: OwnedFd,
     we_write_resize_to: OwnedFd,
     actions_completed_notice: Option<&str>,
+    root_password: Option<Arc<RootPassword>>,
 ) -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let config = create_vm_configuration(spec).map_err(|err| format!("[boot] {err}"))?;
     let vm = start_vm(&config).map_err(|err| format!("[boot] {err}"))?;
@@ -126,7 +129,7 @@ pub(crate) fn drive_interactive(
         we_write_resize_to,
     );
 
-    let mut all_login_actions = legacy_login_prefix(LOGIN_EXPECT_TIMEOUT)?;
+    let mut all_login_actions = legacy_login_prefix(LOGIN_EXPECT_TIMEOUT, root_password)?;
 
     if !directory_shares.is_empty() {
         all_login_actions.push(Send(" mkdir -p /mnt/shared".into()));
@@ -205,7 +208,12 @@ pub(crate) fn drive_interactive(
                 format!("{} failed with exit code {status}", prefixes[index])
             }
             VmOutput::LoginFailed(failure) => login_error(failure),
-            VmOutput::LoginReady => {
+            VmOutput::LoginReady {
+                password_prompted: _,
+            } => {
+                // `password_prompted` is carried for the warning printed when a
+                // non-root session starts on an image whose root account has
+                // no password. Nothing consumes it in this loop yet.
                 login_ready = true;
                 if std::env::var("VIBE_FORCE_STOP_AFTER_LOGIN").ok().as_deref() == Some("1") {
                     want_force.set(true);

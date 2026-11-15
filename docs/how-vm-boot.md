@@ -79,7 +79,7 @@ A valid raw plus a valid archive does not touch the network. The cached raw is a
 1. `fs::copy` the base onto `{name}.tmp.{pid}` and add user-write permission. The base file stays as it was.
 2. `ensure_bootable` on that copy, at the copy's original size. Growing the file first would make the maintenance manifest disagree with the partition table.
 3. If the copy is shorter than `DEFAULT_DISK_SIZE` (`DEFAULT_DISK_GB` is 12, so 12 GiB), `set_len` extends it. The extra bytes are sparse.
-4. Boot the copy and run scripts. `provisioning/base.sh` is always first. It installs the base packages and then runs `growpart /dev/vda 1` and `resize2fs /dev/vda1`.
+4. Boot the copy. When `--root-password` or `VIBE_ROOT_PASSWORD` is set, that password is applied with `chpasswd` after login and before `.profile` and the scripts. Then the scripts run. `provisioning/base.sh` is always the first script. It installs the base packages and then runs `growpart /dev/vda 1` and `resize2fs /dev/vda1`.
 5. Clear `/etc/machine-id`, confirm the clear with `probe_disk`, and `fs::rename` the work copy onto `<name>.raw`.
 
 `ensure_default_image` does this once for `default.raw`, with every built-in script. An existing `default.raw` is returned immediately and is not probed again. The first plain `vibe` in a project with no instance disk calls `ensure_default_image` when `--image` is `default` (or omitted).
@@ -88,7 +88,7 @@ A valid raw plus a valid archive does not touch the network. The cached raw is a
 
 A positional `path/to/disk.raw` is booted as given (`DiskSource::External`). It does not create `.vibe/instance.raw` and does not read the cache templates.
 
-Every published image has an empty `/etc/machine-id` and an empty root password field. Each instance therefore generates its own machine id on first boot and keeps it across reboots. The root password field stays empty, as it did on the older nocloud images.
+Every published image has an empty `/etc/machine-id`. Each instance therefore generates its own machine id on first boot and keeps it across reboots. The root password field stays empty unless the provision that published the image was given `--root-password` or `VIBE_ROOT_PASSWORD`. In that case the same password is set before the scripts run.
 
 ## From the CLI to a running guest
 
@@ -160,7 +160,7 @@ Any error deletes `<name>.tmp.<pid>` unless `VIBE_KEEP_FAILED_WORK=1`. A failed 
 
 `drive_interactive` builds the full action list:
 
-1. `legacy_login_prefix(LOGIN_EXPECT_TIMEOUT)` with `LOGIN_EXPECT_TIMEOUT` = 120 seconds.
+1. `legacy_login_prefix(LOGIN_EXPECT_TIMEOUT, root_password)` with `LOGIN_EXPECT_TIMEOUT` = 120 seconds. `root_password` comes from `--root-password`, or from `VIBE_ROOT_PASSWORD` when that flag is omitted.
 2. When shares exist: `mkdir -p /mnt/shared`, `mount -t virtiofs shared /mnt/shared`, then `mkdir` and `mount --bind` for each share.
 3. The caller actions from `run_main` or `provision_image`.
 4. Two trailing `Send`s that activate `mise` and `fzf` when those commands exist.
@@ -177,10 +177,13 @@ When the VM leaves `Running`, or a stop was requested, `output_monitor.close()` 
 
 1. `wait_for_text("login: ", timeout)`. Zero bytes on `hvc0` is `LoginFailure::NoSerialOutput`. Any other timeout is `NoLoginPrompt`. Both display as `[boot]`.
 2. Type `root`.
-3. `wait_for_any` of `Password:`, `Debian GNU/Linux`, and `login: `. `Password:` is `LoginFailure::PasswordRequired` (`[login]`). A timeout is `NoBanner`.
+3. `wait_for_any` of `Password:`, `Debian GNU/Linux`, and `login: `. A timeout is `NoBanner`.
+   - `Password:` with no password supplied is `LoginFailure::PasswordRequired`: `[login] The image asks for a root password (disk: ...). Pass --root-password to log in.`
+   - `Password:` with a password supplied types that password. The password is not logged. The next wait is `Login incorrect`, `Debian GNU/Linux`, `Last login`, and `login: `. `Login incorrect` or another `login: ` is `AuthFailed`: `[login] root authentication failed with the given --root-password (disk: ...)`. A timeout is `AuthTimeout`: `[login] Sent the root password but saw neither a successful login nor 'Login incorrect' within {timeout:?} (disk: ...)`. Any other match continues to the readiness probe.
+   - Any other match leaves the password untyped and continues to the probe.
 4. Type a readiness probe. `readiness_probe_command_and_marker` builds a `printf` whose marker `VIBE_READY_<nonce>` is split across two arguments, so the echoed command line does not contain the marker. The next line must be `id -u` equal to `0`. Anything else is `ProbeTimeout` or `ProbeNotRoot` (`[login]`).
 
-`LoginReady` is sent when the probe returns uid 0. `input_open` stays false until `ActionsCompleted`, which is after the setup sends, the share mounts, and the caller's actions. Until then the keyboard is discarded.
+`LoginReady` is sent when the probe returns uid 0. It records `password_prompted` when the guest asked for a password and accepted it. Nothing prints a warning from that flag. `input_open` stays false until `ActionsCompleted`, which is after the setup sends, the share mounts, and the caller's actions. Until then the keyboard is discarded.
 
 The setup sends inside `legacy_login_prefix` are: `HISTCONTROL=ignorespace` and `unset HISTFILE` (so the automatic commands stay out of history), `stty -F /dev/hvc0 sane`, a background loop that reads `rows cols` from `/dev/hvc1` and applies them to `hvc0`, then `write_file_into_vm` of `src/bash_logout.sh` to `/root/.bash_logout`. It never writes or sources `/root/.profile`; provision and `--write-bashrc` add `write_bashrc_actions` to the caller's actions instead. The logout script runs `systemctl poweroff` on a normal exit. It skips poweroff when the shell is SSH, is inside tmux, or tmux has a session.
 
@@ -188,7 +191,7 @@ The setup sends inside `legacy_login_prefix` are: `HISTCONTROL=ignorespace` and 
 
 ### Boot failure hint
 
-`suggests_provision` is true for silence, a missing `login:` prompt, a password prompt, and a VM that stopped before login. When `disk_source` is `Some`, `needs_provision_hint` appends a `vibe provision` command. The wording stays tentative: the run path did not inspect the disk.
+`suggests_provision` is true for silence, a missing `login:` prompt, and a VM that stopped before login. `PasswordRequired`, `AuthFailed`, and `AuthTimeout` do not suggest `vibe provision`. When `disk_source` is `Some` and `suggests_provision` is true, `needs_provision_hint` appends a `vibe provision` command. The wording stays tentative: the run path did not inspect the disk.
 
 - `DiskSource::External`: `vibe provision --base <absolute disk> --image <name>`, then `vibe --image <name>` in a project.
 - `DiskSource::Instance`: the same provision command, then move `.vibe/instance.raw` aside and run `vibe --image <name>` so a new instance is copied from the prepared image.
@@ -273,7 +276,7 @@ A non-Debian GPT disk is `Unsupported`: `[probe]` warning, no Alpine, then the l
 
 ## New Debian images
 
-Debian nocloud images published since late 2026, including the pinned `debian-13-nocloud-arm64-20261001-2618`, no longer leave the root password field empty, and the console stops in an interactive firstboot wizard. Older nocloud images booted straight to a `login:` prompt, which is why Vibe's login types `root` and expects no password.
+Debian nocloud images published since late 2026, including the pinned `debian-13-nocloud-arm64-20261001-2618`, no longer leave the root password field empty, and the console stops in an interactive firstboot wizard. Older nocloud images booted straight to a `login:` prompt and accepted `root` with an empty password field. Vibe still types `root`. It types a password only after the guest prints `Password:` and a password was supplied.
 
 Vibe returns a new image to that older state only while provisioning:
 
@@ -297,7 +300,7 @@ vibe --image my-image
 
 ### Security
 
-Root has an empty password in every processed image and in every instance created from it. Anyone who can open the console, including another tool that boots the disk, can log in as root. A non-root user inside the guest can `su -` without a password. Vibe itself only logs in as root and does not create other users.
+Alpine preparation leaves the root password field empty. A provision that runs scripts and was given `--root-password` or `VIBE_ROOT_PASSWORD` then sets that same password with `chpasswd` after login and before `.profile` and the scripts. The password is not written into a guest command. A run, and `provision --repl` of an existing image, use the value only to authenticate and do not change the disk. When the field is left empty, anyone who can open the console, including another tool that boots the disk, can log in as root, and a non-root user inside the guest can `su -` without a password. Vibe itself only logs in as root and does not create other users.
 
 Debian's SSH server refuses empty passwords by default (`PermitEmptyPasswords no`). Preparation fails if a config file sets `PermitEmptyPasswords yes`. `provisioning/base.sh` also writes `PasswordAuthentication no` and `PermitRootLogin yes` under `sshd_config.d`, and disables the `ssh` service until a later `--ssh-key` start.
 

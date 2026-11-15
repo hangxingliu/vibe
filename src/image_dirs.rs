@@ -442,7 +442,7 @@ mod tests {
         assert_eq!(
             dirs.describe(),
             format!(
-                "Image directories (lookup order):\n  1. {} (preferred)\n  2. {} (default)\n  3. {} (missing, skipped)",
+                "Image directories (lookup order):\n\n  1. {} (preferred)\n  2. {} (default)\n  3. {} (missing, skipped)",
                 pref.display(),
                 default.display(),
                 gone.display()
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(
             ImageDirs::single(default.clone()).describe(),
             format!(
-                "Image directories (lookup order):\n  1. {} (preferred, default)",
+                "Image directories (lookup order):\n\n  1. {} (preferred, default)",
                 default.display()
             )
         );

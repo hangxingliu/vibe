@@ -135,6 +135,7 @@ fn check_read_only_second_disk() -> Result<(), Box<dyn std::error::Error>> {
             we_write_to,
             we_write_resize_to,
             None,
+            None,
         )?;
         eprintln!("read-only-disk: guest reported /sys/block/vda/ro=0 and /sys/block/vdb/ro=1");
         Ok(())

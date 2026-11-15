@@ -6,7 +6,7 @@
 //! Every provision, including ones that were already legacy compatible,
 //! clears `/etc/machine-id` before the image is published.
 
-use std::{env, fs, os::unix::fs::PermissionsExt, path::Path};
+use std::{env, fs, ops::Range, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
 use crate::disk_prepare::ensure_bootable;
 use crate::image_dirs::ImageDirs;
@@ -17,7 +17,8 @@ use crate::proxy::{APT_PROXY_FILE, GuestProxy};
 use crate::session::{
     DEFAULT_EXPECT_TIMEOUT,
     LoginAction::{self, *},
-    generate_http_proxy_env_export_cmds, shell_single_quote, write_bashrc_actions,
+    RootPassword, generate_http_proxy_env_export_cmds, set_root_password_actions,
+    shell_single_quote, write_bashrc_actions,
 };
 use crate::vm_run::run_vm;
 use crate::{
@@ -184,6 +185,7 @@ pub(crate) fn ensure_default_image(
     cache_dir: &Path,
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
     guest_proxy: &Option<GuestProxy>,
+    root_password: Option<Arc<RootPassword>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // An existing default image is not probed or prepared again.
     if default_raw.exists() {
@@ -229,6 +231,7 @@ pub(crate) fn ensure_default_image(
         guest_proxy,
         DEFAULT_CPU_COUNT,
         DEFAULT_PROVISION_RAM_BYTES,
+        root_password,
     )
 }
 
@@ -271,6 +274,85 @@ fn build_provision_script(
     }
 }
 
+struct ProvisionLoginPlan {
+    actions: Vec<LoginAction>,
+    /// Indexes of the provisioning scripts inside `actions`.
+    user_actions: Range<usize>,
+}
+
+/// Login actions for a provision that runs scripts. When `root_password` is
+/// set, the same value is applied with `chpasswd` before `.profile` and the
+/// scripts. The password is not embedded in any command.
+fn build_provision_login_actions(
+    image_name: &str,
+    base_raw: &Path,
+    scripts: &[&ProvisionScript],
+    guest_proxy: &Option<GuestProxy>,
+    repl: bool,
+    root_password: Option<Arc<RootPassword>>,
+) -> Result<ProvisionLoginPlan, Box<dyn std::error::Error>> {
+    let mut login_actions = Vec::new();
+    if let Some(password) = root_password {
+        login_actions.extend(set_root_password_actions(password)?);
+    }
+
+    // `.profile` sets up PATH and mise activation for the scripts, and is
+    // saved with the image.
+    login_actions.extend(write_bashrc_actions()?);
+
+    let script_names = scripts
+        .iter()
+        .map(|script| script.name.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    login_actions.push(Send(format!(
+        " export VIBE_PROVISION_IMAGE='{}'\n\
+export VIBE_PROVISION_BASE='{}'\n\
+export VIBE_GIT_SHA='{}'\n\
+export VIBE_BUILD_DATE='{}'\n\
+export VIBE_PROVISION_SCRIPTS='{}'",
+        shell_single_quote(image_name),
+        shell_single_quote(&base_raw.to_string_lossy()),
+        env!("GIT_SHA"),
+        env!("BUILD_DATE"),
+        shell_single_quote(&script_names)
+    )));
+
+    // `[action N: ...]` numbers the provisioning scripts (`@base` first).
+    let user_actions = login_actions.len()..login_actions.len() + scripts.len();
+    for script in scripts {
+        login_actions.push(build_provision_script(script, guest_proxy));
+    }
+
+    // Clear the template identity after the scripts and before publish.
+    // `--repl` defers the clear until poweroff so the interactive session
+    // still has the id systemd generated at boot.
+    login_actions.push(Script {
+        name: "finalize-machine-id".to_string(),
+        content: if repl {
+            REPL_FINALIZE_SCRIPT.to_string()
+        } else {
+            CLEAR_MACHINE_ID_SCRIPT.to_string()
+        },
+    });
+
+    login_actions.push(Send(format!(" echo {PROVISION_SUCCESS_MARKER}")));
+    login_actions.push(Expect {
+        text: PROVISION_SUCCESS_MARKER.to_string(),
+        timeout: DEFAULT_EXPECT_TIMEOUT,
+    });
+
+    if !repl {
+        login_actions.push(Send(" systemctl poweroff; sleep 100".to_string()));
+    }
+
+    Ok(ProvisionLoginPlan {
+        actions: login_actions,
+        user_actions,
+    })
+}
+
 /// `stage` names the provision in the host log of shares and written files;
 /// `notes` are printed after that log, before the VM starts.
 #[allow(clippy::too_many_arguments)]
@@ -288,6 +370,7 @@ pub(crate) fn provision_image(
     guest_proxy: &Option<GuestProxy>,
     cpu_count: usize,
     ram_bytes: u64,
+    root_password: Option<Arc<RootPassword>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let image_name = image_raw
         .file_stem()
@@ -353,52 +436,18 @@ pub(crate) fn provision_image(
         .chain(extra_scripts.iter())
         .collect();
 
-        // `.profile` sets up PATH and mise activation for the scripts, and is
-        // saved with the image.
-        let mut login_actions = write_bashrc_actions()?;
-
-        let script_names = scripts
-            .iter()
-            .map(|script| script.name.as_ref())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        login_actions.push(Send(format!(
-            " export VIBE_PROVISION_IMAGE='{}'\n\
-export VIBE_PROVISION_BASE='{}'\n\
-export VIBE_GIT_SHA='{}'\n\
-export VIBE_BUILD_DATE='{}'\n\
-export VIBE_PROVISION_SCRIPTS='{}'",
-            shell_single_quote(&image_name),
-            shell_single_quote(&base_raw.to_string_lossy()),
-            env!("GIT_SHA"),
-            env!("BUILD_DATE"),
-            shell_single_quote(&script_names)
-        )));
-
-        // `[action N: ...]` numbers the provisioning scripts (`@base` first).
-        let user_actions = login_actions.len()..login_actions.len() + scripts.len();
-        for script in scripts {
-            login_actions.push(build_provision_script(script, guest_proxy));
-        }
-
-        // Clear the template identity after the scripts and before publish.
-        // `--repl` defers the clear until poweroff so the interactive session
-        // still has the id systemd generated at boot.
-        login_actions.push(Script {
-            name: "finalize-machine-id".to_string(),
-            content: if repl {
-                REPL_FINALIZE_SCRIPT.to_string()
-            } else {
-                CLEAR_MACHINE_ID_SCRIPT.to_string()
-            },
-        });
-
-        login_actions.push(Send(format!(" echo {PROVISION_SUCCESS_MARKER}")));
-        login_actions.push(Expect {
-            text: PROVISION_SUCCESS_MARKER.to_string(),
-            timeout: DEFAULT_EXPECT_TIMEOUT,
-        });
+        let login_password = root_password.clone();
+        let ProvisionLoginPlan {
+            actions: login_actions,
+            user_actions,
+        } = build_provision_login_actions(
+            &image_name,
+            base_raw,
+            &scripts,
+            guest_proxy,
+            repl,
+            root_password,
+        )?;
 
         let actions_completed_notice = if repl {
             // Leave the shell open for interactive customisation.
@@ -408,7 +457,6 @@ export VIBE_PROVISION_SCRIPTS='{}'",
 Type `exit` or run `systemctl poweroff` when you are done.",
             )
         } else {
-            login_actions.push(Send(" systemctl poweroff; sleep 100".to_string()));
             None
         };
 
@@ -431,6 +479,7 @@ Type `exit` or run `systemctl poweroff` when you are done.",
             cpu_count,
             ram_bytes,
             actions_completed_notice,
+            login_password,
         )?;
         if let Some(error) = incomplete_run_error(
             &image_name,
@@ -468,15 +517,16 @@ Type `exit` or run `systemctl poweroff` when you are done.",
 #[cfg(test)]
 mod tests {
     use super::{
-        CLEAR_MACHINE_ID_SCRIPT, REPL_FINALIZE_SCRIPT, build_provision_script, failed_work_message,
-        incomplete_run_error, machine_id_label,
+        CLEAR_MACHINE_ID_SCRIPT, REPL_FINALIZE_SCRIPT, build_provision_login_actions,
+        build_provision_script, failed_work_message, incomplete_run_error, machine_id_label,
     };
     use crate::ProvisionScript;
     use crate::image_probe::MachineIdFact;
     use crate::proxy::GuestProxy;
-    use crate::session::LoginAction;
+    use crate::session::{LoginAction, RootPassword};
     use std::borrow::Cow;
     use std::path::Path;
+    use std::sync::Arc;
 
     fn script_content(name: &'static str, guest_proxy: &Option<GuestProxy>) -> String {
         let script = ProvisionScript {
@@ -587,5 +637,77 @@ mod tests {
         assert!(
             !machine_id_label(&MachineIdFact::Symlink("/tmp/secret".into())).contains("secret")
         );
+    }
+
+    #[test]
+    fn scripted_provision_sets_the_root_password_before_other_scripts() {
+        let secret = "s3cret-value";
+        let password = Arc::new(RootPassword::parse(secret, "--root-password").unwrap());
+        let base = ProvisionScript {
+            name: Cow::Borrowed("base"),
+            description: Cow::Borrowed(""),
+            content: Cow::Borrowed("echo base\n"),
+        };
+        let extra = ProvisionScript {
+            name: Cow::Borrowed("extra"),
+            description: Cow::Borrowed(""),
+            content: Cow::Borrowed("echo extra\n"),
+        };
+        let plan = build_provision_login_actions(
+            "demo",
+            Path::new("/bases/debian.raw"),
+            &[&base, &extra],
+            &None,
+            false,
+            Some(password),
+        )
+        .unwrap();
+
+        assert_eq!(plan.actions[1].label(), "set root password");
+        let rendered = format!("{:?}", plan.actions);
+        assert!(!rendered.contains(secret), "{rendered}");
+        match &plan.actions[0] {
+            LoginAction::Send(command) => {
+                assert!(command.contains("chpasswd"), "{command}");
+                assert!(!command.contains(secret), "{command}");
+            }
+            other => panic!("expected the chpasswd command, got {other:?}"),
+        }
+        assert!(plan.user_actions.start > 1);
+        match &plan.actions[plan.user_actions.start] {
+            LoginAction::Script { name, .. } => assert_eq!(name, "base"),
+            other => panic!("expected the base script, got {other:?}"),
+        }
+        match &plan.actions[plan.user_actions.start + 1] {
+            LoginAction::Script { name, .. } => assert_eq!(name, "extra"),
+            other => panic!("expected the extra script, got {other:?}"),
+        }
+        assert!(plan.actions.iter().any(|action| matches!(
+            action,
+            LoginAction::Send(text) if text.contains("systemctl poweroff")
+        )));
+
+        let repl = build_provision_login_actions(
+            "demo",
+            Path::new("/bases/debian.raw"),
+            &[&base],
+            &None,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(
+            repl.actions
+                .iter()
+                .all(|action| action.label() != "set root password")
+        );
+        assert!(repl.actions.iter().all(|action| match action {
+            LoginAction::Send(text) => !text.contains("chpasswd") && !text.contains("VIBE_PW_"),
+            _ => true,
+        }));
+        assert!(!repl.actions.iter().any(|action| matches!(
+            action,
+            LoginAction::Send(text) if text.contains("systemctl poweroff")
+        )));
     }
 }

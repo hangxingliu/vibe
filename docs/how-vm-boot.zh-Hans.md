@@ -79,7 +79,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 1. 使用 `fs::copy` 将基础镜像复制到 `{name}.tmp.{pid}` 并赋予用户写入权限。基础镜像文件保持原样。
 2. 保持副本的原始大小，在该副本上执行 `ensure_bootable`。如果预先扩容文件，会导致维护清单（manifest）与分区表不一致。
 3. 如果副本小于 `DEFAULT_DISK_SIZE`（`DEFAULT_DISK_GB` 为 12，即 12 GiB），则通过 `set_len` 进行扩容。额外增加的字节为稀疏分配。
-4. 启动该副本并运行脚本。`provisioning/base.sh` 始终最先执行。它安装基础软件包，然后运行 `growpart /dev/vda 1` 和 `resize2fs /dev/vda1`。
+4. 启动该副本。若设置了 `--root-password` 或 `VIBE_ROOT_PASSWORD`，则在登录之后、`.profile` 与脚本之前用 `chpasswd` 写入该密码。随后运行脚本。`provisioning/base.sh` 始终是第一个脚本。它安装基础软件包，然后运行 `growpart /dev/vda 1` 和 `resize2fs /dev/vda1`。
 5. 清空 `/etc/machine-id`，通过 `probe_disk` 确认清空，然后通过 `fs::rename` 将工作副本重命名为 `<name>.raw`。
 
 `ensure_default_image` 会针对 `default.raw` 配合所有内置脚本执行一次此流程。已存在的 `default.raw` 会被立即返回，且不会再次探测。在没有实例磁盘的项目中，当 `--image` 为 `default`（或省略）时，首次执行普通的 `vibe` 会调用 `ensure_default_image`。
@@ -88,7 +88,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 位置参数指定的 `path/to/disk.raw` 会直接按原样启动（`DiskSource::External`）。它不会创建 `.vibe/instance.raw`，也不会读取缓存模板。
 
-每个发布的镜像都具有空的 `/etc/machine-id` 和空的 root 密码字段。因此，每个实例都会在首次启动时生成自己的 machine id，并在重启后保持不变。root 密码字段保持为空，与早期的 nocloud 镜像一致。
+每个发布的镜像都具有空的 `/etc/machine-id`。因此，每个实例都会在首次启动时生成自己的 machine id，并在重启后保持不变。root 密码字段保持为空，除非发布该镜像的 provision 给出了 `--root-password` 或 `VIBE_ROOT_PASSWORD`。在这种情况下，同一密码会在脚本运行前被设置。
 
 ## 从 CLI 到运行中的客户机
 
@@ -160,7 +160,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 `drive_interactive` 构建完整的动作列表：
 
-1. `legacy_login_prefix(LOGIN_EXPECT_TIMEOUT)`，其中 `LOGIN_EXPECT_TIMEOUT` = 120 秒。
+1. `legacy_login_prefix(LOGIN_EXPECT_TIMEOUT, root_password)`，其中 `LOGIN_EXPECT_TIMEOUT` = 120 秒。`root_password` 来自 `--root-password`；未给出该选项时来自 `VIBE_ROOT_PASSWORD`。
 2. 存在共享目录时：执行 `mkdir -p /mnt/shared`、`mount -t virtiofs shared /mnt/shared`，然后为每个共享执行 `mkdir` 和 `mount --bind`。
 3. 来自 `run_main` 或 `provision_image` 的调用方动作。
 4. 尾部两个 `Send` 动作：当命令存在时激活 `mise` 和 `fzf`。
@@ -177,10 +177,13 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 1. `wait_for_text("login: ", timeout)`。`hvc0` 上为零字节则返回 `LoginFailure::NoSerialOutput`。其他超时则返回 `NoLoginPrompt`。两者均显示为 `[boot]`。
 2. 输入 `root`。
-3. 在 `Password:`、`Debian GNU/Linux` 和 `login: ` 中执行 `wait_for_any`。匹配到 `Password:` 则为 `LoginFailure::PasswordRequired`（`[login]`）。超时则为 `NoBanner`。
+3. 在 `Password:`、`Debian GNU/Linux` 和 `login: ` 中执行 `wait_for_any`。超时则为 `NoBanner`。
+   - 出现 `Password:` 且未提供密码时，为 `LoginFailure::PasswordRequired`：`[login] The image asks for a root password (disk: ...). Pass --root-password to log in.`
+   - 出现 `Password:` 且已提供密码时，键入该密码。密码不会被记录。下一步在 `Login incorrect`、`Debian GNU/Linux`、`Last login` 和 `login: ` 中等待。`Login incorrect` 或再次出现 `login: ` 为 `AuthFailed`：`[login] root authentication failed with the given --root-password (disk: ...)`。超时为 `AuthTimeout`：`[login] Sent the root password but saw neither a successful login nor 'Login incorrect' within {timeout:?} (disk: ...)`。其他匹配则继续就绪探测。
+   - 其他匹配不会键入密码，直接进入就绪探测。
 4. 输入就绪探测命令。`readiness_probe_command_and_marker` 构建一个 `printf` 命令，其标记 `VIBE_READY_<nonce>` 被拆分在两个参数中，从而确保回显的命令行本身不包含完整标记。下一行必须是 `id -u` 且结果等于 `0`。其他任何情况均为 `ProbeTimeout` 或 `ProbeNotRoot`（`[login]`）。
 
-当探测返回 uid 0 时发送 `LoginReady`。在 `ActionsCompleted`（即 setup 发送、共享挂载和调用方动作均完成）之前，`input_open` 始终为 false。在此之前，键盘输入均会被丢弃。
+当探测返回 uid 0 时发送 `LoginReady`。若客户机要求密码且密码被接受，其中会记录 `password_prompted`。目前不会据此打印警告。在 `ActionsCompleted`（即 setup 发送、共享挂载和调用方动作均完成）之前，`input_open` 始终为 false。在此之前，键盘输入均会被丢弃。
 
 `legacy_login_prefix` 内的 setup 发送动作包括：`HISTCONTROL=ignorespace` 和 `unset HISTFILE`（使自动执行的命令不计入历史记录）、`stty -F /dev/hvc0 sane`、一个从 `/dev/hvc1` 读取 `rows cols` 并应用到 `hvc0` 的后台循环，随后通过 `write_file_into_vm` 将 `src/bash_logout.sh` 写入 `/root/.bash_logout`。它从不写入或 source `/root/.profile`；provision 与 `--write-bashrc` 改为在调用方的动作中加入 `write_bashrc_actions`。注销脚本在正常退出时会运行 `systemctl poweroff`。如果 shell 属于 SSH 会话、位于 tmux 内或 tmux 存在活动会话，则跳过关机。
 
@@ -188,7 +191,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 ### 启动失败提示
 
-在无输出、缺少 `login:` 提示符、出现密码提示以及虚拟机在登录前停止的情况下，`suggests_provision` 均为 true。当 `disk_source` 为 `Some` 时，`needs_provision_hint` 会追加一条 `vibe provision` 命令提示。措辞保持推测性：因为运行路径并未对磁盘进行实际检查。
+在无输出、缺少 `login:` 提示符以及虚拟机在登录前停止的情况下，`suggests_provision` 为 true。`PasswordRequired`、`AuthFailed` 和 `AuthTimeout` 不会建议 `vibe provision`。当 `disk_source` 为 `Some` 且 `suggests_provision` 为 true 时，`needs_provision_hint` 会追加一条 `vibe provision` 命令提示。措辞保持推测性：因为运行路径并未对磁盘进行实际检查。
 
 - `DiskSource::External`：提示 `vibe provision --base <absolute disk> --image <name>`，随后在项目中运行 `vibe --image <name>`。
 - `DiskSource::Instance`：同样的 provision 命令，随后移走 `.vibe/instance.raw` 并运行 `vibe --image <name>`，以便从处理好的镜像中复制出新实例。
@@ -273,7 +276,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 ## 新版 Debian 镜像
 
-自 2026 年底发布的 Debian nocloud 镜像（包括锁定的 `debian-13-nocloud-arm64-20261001-2618`）不再保留空的 root 密码字段，控制台会停在交互式初次启动向导中。早期的 nocloud 镜像会直接引导至 `login:` 提示符，这就是 Vibe 登录流程输入 `root` 且预期无密码的原因。
+自 2026 年底发布的 Debian nocloud 镜像（包括锁定的 `debian-13-nocloud-arm64-20261001-2618`）不再保留空的 root 密码字段，控制台会停在交互式初次启动向导中。早期的 nocloud 镜像会直接引导至 `login:` 提示符，并在 root 密码字段为空时接受 `root`。Vibe 仍然键入 `root`。只有在客户机打印 `Password:` 且已经提供密码时，才会键入密码。
 
 Vibe 仅在配置（provision）阶段将新镜像恢复到早期状态：
 
@@ -297,7 +300,7 @@ vibe --image my-image
 
 ### 安全性
 
-在所有处理过的镜像以及由其创建的实例中，root 用户均拥有空密码。任何能够打开控制台的人（包括引导该磁盘的其他工具）都可以直接以 root 身份登录。客户机内部的非 root 用户无需密码即可执行 `su -`。Vibe 自身仅以 root 身份登录，不会创建其他用户。
+Alpine 预处理会把 root 密码字段留空。若一次会运行脚本的 provision 给出了 `--root-password` 或 `VIBE_ROOT_PASSWORD`，则会在登录之后、`.profile` 与脚本之前用 `chpasswd` 设置同一密码。密码不会写入客户机命令行。run，以及针对已有镜像的 `provision --repl`，只用该值完成认证，不会改写磁盘。当密码字段仍为空时，任何能够打开控制台的人（包括引导该磁盘的其他工具）都可以直接以 root 身份登录，客户机内部的非 root 用户也无需密码即可执行 `su -`。Vibe 自身仅以 root 身份登录，不会创建其他用户。
 
 Debian 的 SSH 服务端默认拒绝空密码（`PermitEmptyPasswords no`）。如果配置文件中设置了 `PermitEmptyPasswords yes`，预处理将会失败。`provisioning/base.sh` 还会在 `sshd_config.d` 下写入 `PasswordAuthentication no` 和 `PermitRootLogin yes`，并禁用 `ssh` 服务，直到后续通过 `--ssh-key` 启动。
 

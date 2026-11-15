@@ -3,6 +3,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     hash::{BuildHasher, Hasher},
     path::Path,
     sync::{Arc, mpsc},
@@ -38,12 +39,69 @@ pub(crate) enum LoginAction {
         name: String,
         content: String,
     },
-    /// Logs in as root on a legacy console (`login: ` prompt, no password) and
-    /// confirms with a readiness probe that a root shell is accepting input.
-    /// Each wait is bounded by `timeout`. Only used by `legacy_login_prefix`.
+    /// Logs in as root on the serial console and confirms with a readiness
+    /// probe that a root shell is accepting input. Each wait is bounded by
+    /// `timeout`. When `password` is set it is typed at a `Password:` prompt
+    /// and is never included in logs or in [`LoginAction::label`].
+    /// Only used by `legacy_login_prefix`.
     LegacyLogin {
         timeout: Duration,
+        password: Option<Arc<RootPassword>>,
     },
+    /// Waits until `marker` (echo is off), types `password`, then reads the
+    /// status line that follows `done_marker`. The label never includes the
+    /// password. Only used by `set_root_password_actions`.
+    SecretSend {
+        marker: String,
+        done_marker: String,
+        password: Arc<RootPassword>,
+        timeout: Duration,
+    },
+}
+
+/// Root password from `--root-password` or `VIBE_ROOT_PASSWORD`.
+///
+/// `Debug` and `Display` print `***`. The characters are available only
+/// through [`RootPassword::expose`], at the moment they are typed.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RootPassword(String);
+
+impl RootPassword {
+    /// `source` is `--root-password` or `VIBE_ROOT_PASSWORD` and is named in
+    /// the error. The password itself is not.
+    pub(crate) fn parse(value: &str, source: &str) -> Result<Self, String> {
+        if value.is_empty() {
+            return Err(format!("{source} requires a non-empty password"));
+        }
+        if value.chars().any(is_password_control_char) {
+            return Err(format!(
+                "{source} contains a control character (U+0000 through U+001F, or U+007F)"
+            ));
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    /// Password characters to type into the guest. Do not log the result.
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+fn is_password_control_char(c: char) -> bool {
+    let value = u32::from(c);
+    value <= 0x1f || value == 0x7f
+}
+
+impl fmt::Debug for RootPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("***")
+    }
+}
+
+impl fmt::Display for RootPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("***")
+    }
 }
 
 pub(crate) use LoginAction::*;
@@ -57,6 +115,7 @@ impl LoginAction {
             Send(_) => "send".to_string(),
             Script { name, .. } => format!("script '{name}'"),
             LegacyLogin { .. } => "login".to_string(),
+            SecretSend { .. } => "set root password".to_string(),
         }
     }
 }
@@ -87,9 +146,10 @@ pub(crate) fn action_prefix(
 /// `write_bashrc_actions`.
 pub(crate) fn legacy_login_prefix(
     timeout: Duration,
+    password: Option<Arc<RootPassword>>,
 ) -> Result<Vec<LoginAction>, Box<dyn std::error::Error>> {
     Ok(vec![
-        LegacyLogin { timeout },
+        LegacyLogin { timeout, password },
         // Temporarily disable bash history and set commands starting with space to be ignored
         Send(" export HISTCONTROL=ignorespace".to_string()),
         Send(" unset HISTFILE".to_string()),
@@ -150,8 +210,12 @@ pub(crate) enum LoginFailure {
     NoSerialOutput { timeout: Duration },
     /// hvc0 produced output, but never a `login: ` prompt.
     NoLoginPrompt { timeout: Duration },
-    /// The guest asked for a root password.
+    /// The guest asked for a root password and none was supplied.
     PasswordRequired,
+    /// The supplied root password was rejected.
+    AuthFailed,
+    /// The guest did not accept or reject the root password before `timeout`.
+    AuthTimeout { timeout: Duration },
     /// Neither a password prompt nor the Debian banner followed `root`.
     NoBanner { timeout: Duration },
     /// The shell never answered the readiness probe.
@@ -173,7 +237,13 @@ impl LoginFailure {
                 "[boot] The serial console (hvc0) produced output but no 'login: ' prompt within {timeout:?} (disk: {disk})."
             ),
             LoginFailure::PasswordRequired => format!(
-                "[login] The image asks for a root password (disk: {disk}); it is not a legacy image that Vibe can manage. Newer Debian images have to be prepared by the default provision flow."
+                "[login] The image asks for a root password (disk: {disk}). Pass --root-password to log in."
+            ),
+            LoginFailure::AuthFailed => format!(
+                "[login] root authentication failed with the given --root-password (disk: {disk})."
+            ),
+            LoginFailure::AuthTimeout { timeout } => format!(
+                "[login] Sent the root password but saw neither a successful login nor 'Login incorrect' within {timeout:?} (disk: {disk})."
             ),
             LoginFailure::NoBanner { timeout } => format!(
                 "[login] Sent 'root' but saw neither a password prompt nor the Debian banner within {timeout:?} (disk: {disk})."
@@ -197,7 +267,6 @@ impl LoginFailure {
             self,
             LoginFailure::NoSerialOutput { .. }
                 | LoginFailure::NoLoginPrompt { .. }
-                | LoginFailure::PasswordRequired
                 | LoginFailure::VmStopped
         )
     }
@@ -377,6 +446,14 @@ pub(crate) fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<L
     Some(Send(command))
 }
 
+/// Result of a legacy root login that reached a root shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoginInfo {
+    /// The guest printed `Password:` and accepted the supplied password.
+    pub(crate) password_prompted: bool,
+}
+
+#[derive(Debug)]
 pub(crate) enum VmOutput {
     /// The action at `index` (in the full action list) started.
     ActionStarted {
@@ -392,7 +469,13 @@ pub(crate) enum VmOutput {
     },
     LoginFailed(LoginFailure),
     /// The legacy login finished and the readiness probe confirmed a root shell.
-    LoginReady,
+    LoginReady {
+        /// Whether the guest printed `Password:` and accepted the supplied
+        /// password. Recorded so a non-root session can warn when the image
+        /// has no root password. Nothing reads it yet.
+        #[allow(dead_code)]
+        password_prompted: bool,
+    },
     /// Every login action ran to completion.
     ActionsCompleted,
 }
@@ -419,11 +502,55 @@ fn send_text(input_tx: &mpsc::Sender<VmInput>, mut text: String) -> Step {
     Step::Continue
 }
 
+const ROOT_PASSWORD_MARKER_PREFIX: &str = "VIBE_PW_";
+const ROOT_PASSWORD_DONE_PREFIX: &str = "VIBE_PW_DONE_";
+/// The shell runs any share mounts typed ahead of this command before
+/// `chpasswd`, so the wait is the same length as the login waits.
+const SET_ROOT_PASSWORD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Actions that set the root password to `password` without placing it on a
+/// command line. The guest turns echo off, prints a marker split across two
+/// `printf` arguments, reads one line, and passes that line to `chpasswd`.
+/// A run, and `provision --repl` of an existing image, do not add these actions.
+pub(crate) fn set_root_password_actions(
+    password: Arc<RootPassword>,
+) -> Result<Vec<LoginAction>, Box<dyn std::error::Error>> {
+    let nonce = probe_nonce();
+    let marker = format!("{ROOT_PASSWORD_MARKER_PREFIX}{nonce}");
+    let done_marker = format!("{ROOT_PASSWORD_DONE_PREFIX}{nonce}");
+    // Markers are split across printf arguments so the echoed command line
+    // never contains the complete marker.
+    let command = format!(
+        " stty -echo; printf '\\n%s%s\\n' '{ROOT_PASSWORD_MARKER_PREFIX}' '{nonce}'; \
+IFS= read -r __vibe_pw; stty echo; printf 'root:%s\\n' \"$__vibe_pw\" | chpasswd; \
+__vibe_status=$?; unset __vibe_pw; \
+printf '\\n%s%s\\n%s\\n' '{ROOT_PASSWORD_DONE_PREFIX}' '{nonce}' \"$__vibe_status\""
+    );
+    debug_assert!(
+        !command.contains(&marker),
+        "echoed command must not contain the password-read marker"
+    );
+    debug_assert!(
+        !command.contains(&done_marker),
+        "echoed command must not contain the password-done marker"
+    );
+    Ok(vec![
+        Send(command),
+        SecretSend {
+            marker,
+            done_marker,
+            password,
+            timeout: SET_ROOT_PASSWORD_TIMEOUT,
+        },
+    ])
+}
+
 fn legacy_login(
     timeout: Duration,
+    password: Option<&RootPassword>,
     output_monitor: &OutputMonitor,
     input_tx: &mpsc::Sender<VmInput>,
-) -> Result<(), Option<LoginFailure>> {
+) -> Result<LoginInfo, Option<LoginFailure>> {
     // `Err(None)` means the VM stopped or its input closed; `run_vm` reports it.
     let stopped = || None;
 
@@ -444,19 +571,47 @@ fn legacy_login(
     // contains "Debian GNU/Linux") and `login: ` again; the readiness probe
     // below catches that case.
     const PASSWORD_PROMPT: usize = 0;
-    match output_monitor.wait_for_any(&["Password:", "Debian GNU/Linux", "login: "], timeout) {
-        WaitResult::Found(PASSWORD_PROMPT) => return Err(Some(LoginFailure::PasswordRequired)),
-        WaitResult::Found(_) => {}
-        WaitResult::Timeout => return Err(Some(LoginFailure::NoBanner { timeout })),
-        WaitResult::Closed => return Err(stopped()),
-    }
+    let password_prompted =
+        match output_monitor.wait_for_any(&["Password:", "Debian GNU/Linux", "login: "], timeout) {
+            WaitResult::Found(PASSWORD_PROMPT) => {
+                let Some(password) = password else {
+                    return Err(Some(LoginFailure::PasswordRequired));
+                };
+                // Typed while the guest has already turned echo off for the prompt.
+                // `send_text` does not log the text.
+                if let Step::Stop = send_text(input_tx, password.expose().to_string()) {
+                    return Err(stopped());
+                }
+                const LOGIN_INCORRECT: usize = 0;
+                const LOGIN_AGAIN: usize = 3;
+                match output_monitor.wait_for_any(
+                    &[
+                        "Login incorrect",
+                        "Debian GNU/Linux",
+                        "Last login",
+                        "login: ",
+                    ],
+                    timeout,
+                ) {
+                    WaitResult::Found(LOGIN_INCORRECT | LOGIN_AGAIN) => {
+                        return Err(Some(LoginFailure::AuthFailed));
+                    }
+                    WaitResult::Found(_) => true,
+                    WaitResult::Timeout => return Err(Some(LoginFailure::AuthTimeout { timeout })),
+                    WaitResult::Closed => return Err(stopped()),
+                }
+            }
+            WaitResult::Found(_) => false,
+            WaitResult::Timeout => return Err(Some(LoginFailure::NoBanner { timeout })),
+            WaitResult::Closed => return Err(stopped()),
+        };
 
     let (command, marker) = readiness_probe_command_and_marker(&probe_nonce());
     if let Step::Stop = send_text(input_tx, command) {
         return Err(stopped());
     }
     match output_monitor.wait_for_line_after(&marker, timeout) {
-        WaitResult::Found(uid) if uid.trim() == "0" => Ok(()),
+        WaitResult::Found(uid) if uid.trim() == "0" => Ok(LoginInfo { password_prompted }),
         WaitResult::Found(uid) => Err(Some(LoginFailure::ProbeNotRoot {
             uid: uid.trim().to_string(),
         })),
@@ -517,10 +672,12 @@ pub(crate) fn spawn_login_actions_thread(
                         },
                     }
                 }
-                LegacyLogin { timeout } => {
-                    match legacy_login(timeout, &output_monitor, &input_tx) {
-                        Ok(()) => {
-                            let _ = vm_output_tx.send(VmOutput::LoginReady);
+                LegacyLogin { timeout, password } => {
+                    match legacy_login(timeout, password.as_deref(), &output_monitor, &input_tx) {
+                        Ok(info) => {
+                            let _ = vm_output_tx.send(VmOutput::LoginReady {
+                                password_prompted: info.password_prompted,
+                            });
                             Step::Continue
                         }
                         Err(failure) => {
@@ -531,6 +688,42 @@ pub(crate) fn spawn_login_actions_thread(
                         }
                     }
                 }
+                SecretSend {
+                    marker,
+                    done_marker,
+                    password,
+                    timeout,
+                } => match output_monitor.wait_for_text(&marker, timeout) {
+                    WaitResult::Timeout => {
+                        let _ = vm_output_tx.send(VmOutput::LoginActionTimeout { index, timeout });
+                        Step::Stop
+                    }
+                    WaitResult::Closed => Step::Stop,
+                    WaitResult::Found(()) => {
+                        if let Step::Stop = send_text(&input_tx, password.expose().to_string()) {
+                            Step::Stop
+                        } else {
+                            match output_monitor.wait_for_line_after(&done_marker, timeout) {
+                                WaitResult::Found(status) => {
+                                    let status = status.trim().parse().unwrap_or(u8::MAX);
+                                    if status == 0 {
+                                        Step::Continue
+                                    } else {
+                                        let _ = vm_output_tx
+                                            .send(VmOutput::LoginActionFailed { index, status });
+                                        Step::Stop
+                                    }
+                                }
+                                WaitResult::Timeout => {
+                                    let _ = vm_output_tx
+                                        .send(VmOutput::LoginActionTimeout { index, timeout });
+                                    Step::Stop
+                                }
+                                WaitResult::Closed => Step::Stop,
+                            }
+                        }
+                    }
+                },
             };
             if let Step::Stop = step {
                 return;
@@ -565,14 +758,20 @@ mod tests {
     fn spawn_login(
         monitor: &Arc<OutputMonitor>,
         timeout: Duration,
+        password: Option<RootPassword>,
     ) -> (
         mpsc::Receiver<VmInput>,
-        thread::JoinHandle<Result<(), Option<LoginFailure>>>,
+        thread::JoinHandle<Result<LoginInfo, Option<LoginFailure>>>,
     ) {
         let (input_tx, input_rx) = mpsc::channel();
         let monitor = monitor.clone();
-        let handle = thread::spawn(move || legacy_login(timeout, &monitor, &input_tx));
+        let handle =
+            thread::spawn(move || legacy_login(timeout, password.as_ref(), &monitor, &input_tx));
         (input_rx, handle)
+    }
+
+    fn password(value: &str) -> RootPassword {
+        RootPassword::parse(value, "--root-password").unwrap()
     }
 
     /// Answers a readiness probe the way bash on hvc0 would: echo the command,
@@ -586,20 +785,25 @@ mod tests {
     #[test]
     fn legacy_login_confirms_a_root_shell() {
         let monitor = Arc::new(OutputMonitor::default());
-        let (input_rx, handle) = spawn_login(&monitor, LONG);
+        let (input_rx, handle) = spawn_login(&monitor, LONG, None);
         monitor.push(b"Debian GNU/Linux 13 debian hvc0\r\n\r\ndebian login: ");
         assert_eq!(typed_line(&input_rx), "root");
         monitor.push(b"root\r\nLinux debian 6.12\r\n\r\nThe programs included with the Debian GNU/Linux system are free software;\r\n");
         let probe = typed_line(&input_rx);
         assert!(probe.starts_with(" printf "));
         answer_probe(&monitor, &probe, "0");
-        assert_eq!(handle.join().unwrap(), Ok(()));
+        assert_eq!(
+            handle.join().unwrap(),
+            Ok(LoginInfo {
+                password_prompted: false
+            })
+        );
     }
 
     #[test]
     fn legacy_login_reports_a_password_prompt() {
         let monitor = Arc::new(OutputMonitor::default());
-        let (input_rx, handle) = spawn_login(&monitor, LONG);
+        let (input_rx, handle) = spawn_login(&monitor, LONG, None);
         monitor.push(b"debian login: ");
         assert_eq!(typed_line(&input_rx), "root");
         monitor.push(b"root\r\nPassword: ");
@@ -612,7 +816,7 @@ mod tests {
     #[test]
     fn legacy_login_rejects_a_non_root_shell() {
         let monitor = Arc::new(OutputMonitor::default());
-        let (input_rx, handle) = spawn_login(&monitor, LONG);
+        let (input_rx, handle) = spawn_login(&monitor, LONG, None);
         monitor.push(b"debian login: ");
         typed_line(&input_rx);
         monitor.push(b"Debian GNU/Linux\r\n");
@@ -629,7 +833,7 @@ mod tests {
     #[test]
     fn legacy_login_probe_ignores_the_echoed_command() {
         let monitor = Arc::new(OutputMonitor::default());
-        let (input_rx, handle) = spawn_login(&monitor, SHORT);
+        let (input_rx, handle) = spawn_login(&monitor, SHORT, None);
         monitor.push(b"debian login: ");
         typed_line(&input_rx);
         monitor.push(b"Debian GNU/Linux\r\n");
@@ -645,7 +849,7 @@ mod tests {
     #[test]
     fn legacy_login_distinguishes_silence_from_missing_prompt() {
         let silent = Arc::new(OutputMonitor::default());
-        let (_input_rx, handle) = spawn_login(&silent, SHORT);
+        let (_input_rx, handle) = spawn_login(&silent, SHORT, None);
         assert_eq!(
             handle.join().unwrap(),
             Err(Some(LoginFailure::NoSerialOutput { timeout: SHORT }))
@@ -653,7 +857,7 @@ mod tests {
 
         let noisy = Arc::new(OutputMonitor::default());
         noisy.push(b"[  OK  ] Started some unit\r\n");
-        let (_input_rx, handle) = spawn_login(&noisy, SHORT);
+        let (_input_rx, handle) = spawn_login(&noisy, SHORT, None);
         assert_eq!(
             handle.join().unwrap(),
             Err(Some(LoginFailure::NoLoginPrompt { timeout: SHORT }))
@@ -663,7 +867,7 @@ mod tests {
     #[test]
     fn legacy_login_stops_quietly_when_the_vm_stops() {
         let monitor = Arc::new(OutputMonitor::default());
-        let (_input_rx, handle) = spawn_login(&monitor, LONG);
+        let (_input_rx, handle) = spawn_login(&monitor, LONG, None);
         thread::sleep(SHORT);
         monitor.close();
         assert_eq!(handle.join().unwrap(), Err(None));
@@ -672,7 +876,7 @@ mod tests {
         let (input_tx, input_rx) = mpsc::channel();
         drop(input_rx);
         monitor.push(b"login: ");
-        assert_eq!(legacy_login(LONG, &monitor, &input_tx), Err(None));
+        assert_eq!(legacy_login(LONG, None, &monitor, &input_tx), Err(None));
     }
 
     #[test]
@@ -687,8 +891,14 @@ mod tests {
 
     #[test]
     fn legacy_login_prefix_starts_with_the_login() {
-        let prefix = legacy_login_prefix(LONG).unwrap();
-        assert!(matches!(prefix[0], LegacyLogin { timeout } if timeout == LONG));
+        let prefix = legacy_login_prefix(LONG, None).unwrap();
+        assert!(matches!(
+            prefix[0],
+            LegacyLogin {
+                timeout,
+                password: None
+            } if timeout == LONG
+        ));
         assert!(prefix[1..].iter().all(|action| matches!(action, Send(_))));
     }
 
@@ -704,7 +914,7 @@ mod tests {
 
     #[test]
     fn only_write_bashrc_actions_touch_the_profile() {
-        let prefix = legacy_login_prefix(LONG).unwrap();
+        let prefix = legacy_login_prefix(LONG, None).unwrap();
         let prefix = sent(&prefix);
         assert!(
             prefix
@@ -927,12 +1137,14 @@ mod tests {
     }
 
     #[test]
-    fn only_boot_and_password_failures_suggest_provision() {
+    fn only_boot_failures_suggest_provision() {
         let timeout = LONG;
         assert!(LoginFailure::NoSerialOutput { timeout }.suggests_provision());
         assert!(LoginFailure::NoLoginPrompt { timeout }.suggests_provision());
-        assert!(LoginFailure::PasswordRequired.suggests_provision());
         assert!(LoginFailure::VmStopped.suggests_provision());
+        assert!(!LoginFailure::PasswordRequired.suggests_provision());
+        assert!(!LoginFailure::AuthFailed.suggests_provision());
+        assert!(!LoginFailure::AuthTimeout { timeout }.suggests_provision());
         assert!(!LoginFailure::NoBanner { timeout }.suggests_provision());
         assert!(!LoginFailure::ProbeTimeout { timeout }.suggests_provision());
         assert!(
@@ -940,10 +1152,277 @@ mod tests {
                 .describe(Path::new("disk.raw"))
                 .starts_with("[boot] No output on the serial console")
         );
-        assert!(
-            LoginFailure::PasswordRequired
-                .describe(Path::new("disk.raw"))
-                .starts_with("[login]")
+        assert_eq!(
+            LoginFailure::PasswordRequired.describe(Path::new("disk.raw")),
+            "[login] The image asks for a root password (disk: disk.raw). Pass --root-password to log in."
         );
+        assert_eq!(
+            LoginFailure::AuthFailed.describe(Path::new("/img/dev.raw")),
+            "[login] root authentication failed with the given --root-password (disk: /img/dev.raw)."
+        );
+        let auth_timeout = LoginFailure::AuthTimeout { timeout }.describe(Path::new("disk.raw"));
+        assert!(auth_timeout.starts_with("[login]"), "{auth_timeout}");
+        assert!(auth_timeout.contains("root password"), "{auth_timeout}");
+    }
+
+    /// Drives a login up through the `Password:` prompt and returns the line
+    /// typed in response.
+    fn login_to_password_prompt(
+        monitor: &Arc<OutputMonitor>,
+        timeout: Duration,
+        password: Option<RootPassword>,
+    ) -> (
+        mpsc::Receiver<VmInput>,
+        thread::JoinHandle<Result<LoginInfo, Option<LoginFailure>>>,
+    ) {
+        let (input_rx, handle) = spawn_login(monitor, timeout, password);
+        monitor.push(b"debian login: ");
+        assert_eq!(typed_line(&input_rx), "root");
+        monitor.push(b"Password: ");
+        (input_rx, handle)
+    }
+
+    #[test]
+    fn passwordless_image_does_not_type_a_supplied_password() {
+        let monitor = Arc::new(OutputMonitor::default());
+        let (input_rx, handle) = spawn_login(&monitor, LONG, Some(password("s3cret-value")));
+        monitor.push(b"debian login: ");
+        assert_eq!(typed_line(&input_rx), "root");
+        monitor.push(b"Debian GNU/Linux\r\n");
+        let probe = typed_line(&input_rx);
+        assert!(probe.starts_with(" printf "), "{probe}");
+        assert!(!probe.contains("s3cret-value"));
+        answer_probe(&monitor, &probe, "0");
+        assert_eq!(
+            handle.join().unwrap(),
+            Ok(LoginInfo {
+                password_prompted: false
+            })
+        );
+    }
+
+    #[test]
+    fn correct_password_reaches_a_root_shell_via_last_login() {
+        let secret = "s3cret-value";
+        let monitor = Arc::new(OutputMonitor::default());
+        let (input_rx, handle) = login_to_password_prompt(&monitor, LONG, Some(password(secret)));
+        assert_eq!(typed_line(&input_rx), secret);
+        monitor.push(b"Last login: Mon Nov 16 12:00:00 on hvc0\r\n");
+        let probe = typed_line(&input_rx);
+        assert!(!probe.contains(secret), "{probe}");
+        answer_probe(&monitor, &probe, "0");
+        assert_eq!(
+            handle.join().unwrap(),
+            Ok(LoginInfo {
+                password_prompted: true
+            })
+        );
+    }
+
+    #[test]
+    fn correct_password_accepts_the_debian_banner() {
+        let monitor = Arc::new(OutputMonitor::default());
+        let (input_rx, handle) =
+            login_to_password_prompt(&monitor, LONG, Some(password("s3cret-value")));
+        assert_eq!(typed_line(&input_rx), "s3cret-value");
+        monitor.push(b"Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY\r\n");
+        let probe = typed_line(&input_rx);
+        answer_probe(&monitor, &probe, "0");
+        assert_eq!(
+            handle.join().unwrap(),
+            Ok(LoginInfo {
+                password_prompted: true
+            })
+        );
+    }
+
+    #[test]
+    fn login_incorrect_and_a_repeated_login_prompt_are_auth_failures() {
+        let secret = "s3cret-value";
+        let monitor = Arc::new(OutputMonitor::default());
+        let (input_rx, handle) = login_to_password_prompt(&monitor, LONG, Some(password(secret)));
+        assert_eq!(typed_line(&input_rx), secret);
+        monitor.push(b"Login incorrect\r\n");
+        let failure = handle.join().unwrap();
+        assert_eq!(failure, Err(Some(LoginFailure::AuthFailed)));
+        assert!(!format!("{failure:?}").contains(secret));
+
+        let monitor = Arc::new(OutputMonitor::default());
+        let (input_rx, handle) = login_to_password_prompt(&monitor, LONG, Some(password(secret)));
+        assert_eq!(typed_line(&input_rx), secret);
+        monitor.push(b"\r\ndebian login: ");
+        assert_eq!(handle.join().unwrap(), Err(Some(LoginFailure::AuthFailed)));
+    }
+
+    #[test]
+    fn password_prompt_without_a_password_names_the_option_and_hides_nothing_secret() {
+        let monitor = Arc::new(OutputMonitor::default());
+        let (input_rx, handle) = login_to_password_prompt(&monitor, LONG, None);
+        // Nothing is typed after `root`; the prompt itself is the failure.
+        assert!(
+            input_rx.recv_timeout(SHORT).is_err(),
+            "a missing password must not type anything"
+        );
+        assert_eq!(
+            handle.join().unwrap(),
+            Err(Some(LoginFailure::PasswordRequired))
+        );
+    }
+
+    #[test]
+    fn auth_times_out_after_the_password_is_typed() {
+        let secret = "s3cret-value";
+        let monitor = Arc::new(OutputMonitor::default());
+        let (input_rx, handle) = login_to_password_prompt(&monitor, SHORT, Some(password(secret)));
+        assert_eq!(typed_line(&input_rx), secret);
+        assert_eq!(
+            handle.join().unwrap(),
+            Err(Some(LoginFailure::AuthTimeout { timeout: SHORT }))
+        );
+    }
+
+    #[test]
+    fn root_password_debug_and_setup_actions_do_not_contain_the_password() {
+        let secret = "s3cret-value";
+        let value = password(secret);
+        assert_eq!(format!("{value:?}"), "***");
+        assert_eq!(value.to_string(), "***");
+        assert!(!format!("{value:?}").contains(secret));
+
+        let stored = Arc::new(value.clone());
+        let prefix = legacy_login_prefix(LONG, Some(stored.clone())).unwrap();
+        let rendered = format!("{prefix:?}");
+        assert!(!rendered.contains(secret), "{rendered}");
+        match &prefix[0] {
+            LegacyLogin {
+                password: Some(stored_password),
+                ..
+            } => assert_eq!(stored_password.expose(), secret),
+            other => panic!("expected the login action, got {other:?}"),
+        }
+
+        let actions = set_root_password_actions(stored).unwrap();
+        assert_eq!(actions.len(), 2);
+        let rendered = format!("{actions:?}");
+        assert!(!rendered.contains(secret), "{rendered}");
+        let Send(command) = &actions[0] else {
+            panic!("expected the chpasswd command");
+        };
+        assert!(command.starts_with(" stty -echo;"));
+        assert!(command.contains("chpasswd"));
+        assert!(!command.contains(secret), "{command}");
+        let SecretSend {
+            marker,
+            done_marker,
+            password: action_password,
+            ..
+        } = &actions[1]
+        else {
+            panic!("expected the secret send");
+        };
+        assert!(!command.contains(marker), "{command}");
+        assert!(!command.contains(done_marker), "{command}");
+        assert!(marker.starts_with(ROOT_PASSWORD_MARKER_PREFIX));
+        assert!(done_marker.starts_with(ROOT_PASSWORD_DONE_PREFIX));
+        assert_eq!(action_password.expose(), secret);
+        assert_eq!(actions[1].label(), "set root password");
+        assert!(!actions[1].label().contains(secret));
+        let caller = 10..10;
+        assert_eq!(
+            action_prefix(3, &caller, &caller, &actions[1]),
+            "[login] setup set root password"
+        );
+        assert_eq!(
+            format!(
+                "{} failed with exit code 7",
+                action_prefix(3, &caller, &caller, &actions[1])
+            ),
+            "[login] setup set root password failed with exit code 7"
+        );
+
+        for failure in [
+            LoginFailure::PasswordRequired,
+            LoginFailure::AuthFailed,
+            LoginFailure::AuthTimeout { timeout: LONG },
+        ] {
+            let text = format!("{failure:?} {}", failure.describe(Path::new("disk.raw")));
+            assert!(!text.contains(secret), "{text}");
+        }
+    }
+
+    #[test]
+    fn secret_send_types_the_password_only_after_the_marker() {
+        let secret = "s3cret-value";
+        let actions = set_root_password_actions(Arc::new(password(secret))).unwrap();
+        let SecretSend {
+            marker,
+            done_marker,
+            ..
+        } = &actions[1]
+        else {
+            panic!("expected the secret send");
+        };
+        let marker = marker.clone();
+        let done_marker = done_marker.clone();
+
+        let monitor = Arc::new(OutputMonitor::default());
+        let (input_rx, output_rx, handle) = actions_thread(actions, &monitor);
+        let command = typed_line(&input_rx);
+        assert!(!command.contains(secret), "{command}");
+        assert!(
+            input_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "password must not be typed before the marker"
+        );
+        // Echo of the command does not contain the complete marker.
+        monitor.push(format!("{command}\r\n").as_bytes());
+        assert!(
+            input_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the echoed command must not be treated as the marker"
+        );
+        monitor.push(format!("\r\n{marker}\r\n").as_bytes());
+        assert_eq!(typed_line(&input_rx), secret);
+        monitor.push(format!("\r\n{done_marker}\r\n0\r\n").as_bytes());
+        handle.join().unwrap();
+        assert!(matches!(
+            next_report(&output_rx),
+            Some(VmOutput::ActionsCompleted)
+        ));
+    }
+
+    #[test]
+    fn secret_send_reports_a_nonzero_chpasswd_status() {
+        let secret = "s3cret-value";
+        let actions = set_root_password_actions(Arc::new(password(secret))).unwrap();
+        let SecretSend {
+            marker,
+            done_marker,
+            ..
+        } = &actions[1]
+        else {
+            panic!("expected the secret send");
+        };
+        let marker = marker.clone();
+        let done_marker = done_marker.clone();
+
+        let monitor = Arc::new(OutputMonitor::default());
+        let (input_rx, output_rx, handle) = actions_thread(actions, &monitor);
+        let _command = typed_line(&input_rx);
+        monitor.push(format!("\r\n{marker}\r\n").as_bytes());
+        assert_eq!(typed_line(&input_rx), secret);
+        monitor.push(format!("\r\n{done_marker}\r\n3\r\n").as_bytes());
+        handle.join().unwrap();
+        let reports: Vec<_> = output_rx.try_iter().collect();
+        assert!(
+            reports.iter().any(|output| matches!(
+                output,
+                VmOutput::LoginActionFailed {
+                    index: 1,
+                    status: 3
+                }
+            )),
+            "{reports:?}"
+        );
+        let rendered = format!("{reports:?}");
+        assert!(!rendered.contains(secret), "{rendered}");
     }
 }

@@ -212,10 +212,12 @@ fn check_session(work: &Path, image: &Path) -> Result<(), Box<dyn std::error::Er
                 &["--vm-user", "dev", "--root-password", PASSWORD],
                 &["--mount", &data_mount, "--mount", &ro_mount],
                 &["--script", &script_arg],
-                // `exit` leaves the vm-user's shell; the echo then runs in
-                // the root shell. The marker is assembled by the shell so the
+                // `exit` leaves the vm-user's shell. Input sent before the
+                // root shell's notice is lost with the closing `su` terminal,
+                // so wait for it. The marker is assembled by the shell so the
                 // echoed command line does not match it.
                 &["--send", "exit"],
+                &["--expect", "back in the root shell"],
                 &["--send", "echo VIBE_BACK_IN_$(id -un)_SHELL"],
                 &["--expect", "VIBE_BACK_IN_root_SHELL"],
                 &[

@@ -56,34 +56,81 @@ const DEFAULT_IMAGE_NAME: &str = "default";
 const INSTANCE_DIR_NAME: &str = ".vibe";
 const INSTANCE_DISK_IMAGE_NAME: &str = "instance.raw";
 
-/// CACHE_NAME:GUEST_VM_PATH. Mounted when running and provisioning unless `--no-mount-sys-cache`.
-/// Relative guest paths are below the HOME of the `--vm-user`.
-const SYS_CACHE_SHARES: &[&str] = &[
-    "apt:/var/cache/apt",
-    "cargo:.cargo",
-    "yarn:.yarn",
-    "m2:.m2",
-    "go:go",
+/// Whose cache a host cache directory holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheScope {
+    /// One directory for every `--vm-user`: `<cache dir>/<name>`.
+    Global,
+    /// One directory per `--vm-user`: `<cache dir>/user-<user>/<name>`.
+    User,
+}
+
+/// A host cache directory shared with the VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheShare {
+    name: &'static str,
+    scope: CacheScope,
+    /// A relative path is below the HOME of the `--vm-user`.
+    guest: &'static str,
+}
+
+impl CacheShare {
+    const fn global(name: &'static str, guest: &'static str) -> Self {
+        Self {
+            name,
+            scope: CacheScope::Global,
+            guest,
+        }
+    }
+
+    const fn user(name: &'static str, guest: &'static str) -> Self {
+        Self {
+            name,
+            scope: CacheScope::User,
+            guest,
+        }
+    }
+
+    fn host_dir(&self, cache_dir: &Path, vm_user: &VmUser) -> PathBuf {
+        match self.scope {
+            CacheScope::Global => cache_dir.join(self.name),
+            CacheScope::User => user_cache_dir(cache_dir, vm_user).join(self.name),
+        }
+    }
+}
+
+/// The host directory that holds the user caches of `vm_user`.
+fn user_cache_dir(cache_dir: &Path, vm_user: &VmUser) -> PathBuf {
+    cache_dir.join(format!("user-{}", vm_user.as_str()))
+}
+
+/// Mounted when running and provisioning unless `--no-mount-sys-cache`.
+const SYS_CACHE_SHARES: &[CacheShare] = &[
+    CacheShare::global("apt", session_plan::APT_CACHE_GUEST),
+    CacheShare::user("cargo", ".cargo"),
+    CacheShare::user("yarn", ".yarn"),
+    CacheShare::user("m2", ".m2"),
+    CacheShare::user("go", "go"),
 ];
 
 /// Mounted when running and provisioning unless `--no-mount-mise`.
-const MISE_CACHE_SHARE: &str = "mise-cache:.local/share/mise";
+const MISE_CACHE_SHARE: CacheShare = CacheShare::user("mise-cache", ".local/share/mise");
 
 /// Only mounted when running with `--mount-agents-conf`.
-const AGENT_CONF_SHARES: &[&str] = &[
-    "codex:.codex",
-    "copilot:.copilot",
-    "claude:.claude",
-    "gemini:.gemini",
-    "pi:.pi",
-    "grok:.grok",
-    "opencode:.config/opencode",
+const AGENT_CONF_SHARES: &[CacheShare] = &[
+    CacheShare::user("codex", ".codex"),
+    CacheShare::user("copilot", ".copilot"),
+    CacheShare::user("claude", ".claude"),
+    CacheShare::user("gemini", ".gemini"),
+    CacheShare::user("pi", ".pi"),
+    CacheShare::user("grok", ".grok"),
+    CacheShare::user("opencode", ".config/opencode"),
 ];
 
 const RUN_NO_MOUNT_MISE_NOTE: &str = "Note: --no-mount-mise: the shared mise directory is not mounted; tools that mise installed into it during provisioning are not available in this VM.";
 const RUN_NO_MOUNT_SYS_CACHE_NOTE: &str = "Note: --no-mount-sys-cache: the shared apt, cargo, yarn, m2, and go caches are not mounted; tools installed into them during provisioning (e.g. Rust) are not available in this VM.";
 const PROVISION_NO_MOUNT_MISE_NOTE: &str = "Note: --no-mount-mise: mise tools are installed into the image itself. Run this image with --no-mount-mise to use them; otherwise the shared mise directory hides them.";
-const PROVISION_NO_MOUNT_SYS_CACHE_NOTE: &str = "Note: --no-mount-sys-cache: tools installed into the cache directories (e.g. Rust in /root/.cargo) are written into the image itself. Run this image with --no-mount-sys-cache to use them; otherwise the shared cache directories hide them.";
+const PROVISION_NO_MOUNT_SYS_CACHE_NOTE: &str = "Note: --no-mount-sys-cache: tools installed into the cache directories (e.g. Rust in ~/.cargo) are written into the image itself. Run this image with --no-mount-sys-cache to use them; otherwise the shared cache directories hide them.";
 
 /// Project subfolders masked with tmpfs to prevent host data leaking into the VM.
 const MASKED_SUBFOLDERS: &[&str] = &[".vibe"];
@@ -295,6 +342,7 @@ Options:
   Project directories (the current directory and `--mount` shares) always have `.vibe` masked.
   Files such as `.env` appear in the VM like any other file in the share; keep secrets outside the project directory.
   `~` above means the HOME of the --vm-user (`/root` by default).
+  The caches except apt are kept per --vm-user in the cache directory, under user-NAME/ (for example user-root/cargo).
   Writable shares can be written by every user in the VM; new files there belong to the host user running vibe.
   Git may report `dubious ownership` in a shared repository; set `safe.directory` in the VM if you need to.
   With a non-root --vm-user, the shared apt cache is mounted read-only for that user with bindfs (only root's apt
@@ -440,6 +488,20 @@ Cache directory:
     let guest_proxy = proxy_plan.guest;
     let root_password = args.root_password.take().map(Arc::new);
 
+    let cache_specs = match &args.command {
+        CliCommand::Provision { .. } => {
+            cache_share_specs(args.mount_sys_cache, args.mount_mise, false)
+        }
+        CliCommand::Run { .. } => cache_share_specs(
+            args.mount_sys_cache,
+            args.mount_mise,
+            args.mount_agents_conf,
+        ),
+    };
+    if let Some(notice) = legacy_cache_notice(&cache_dir, &cache_specs, &args.vm_user) {
+        println!("{notice}");
+    }
+
     let prepare_network_backend = |log_dir: Option<&Path>| {
         args.network_mode
             .prepare(
@@ -463,10 +525,7 @@ Cache directory:
             ram_bytes,
         } => {
             let existing_image_raw = find_named_image(&image_dirs, &image);
-            let provision_shares = create_cache_shares(
-                &cache_dir,
-                &cache_share_specs(args.mount_sys_cache, args.mount_mise, false),
-            )?;
+            let provision_shares = create_cache_shares(&cache_dir, &cache_specs, &args.vm_user)?;
             let notes = provision_share_notes(args.mount_sys_cache, args.mount_mise);
 
             // --repl with an existing image and no --replace: boot the image interactively
@@ -487,7 +546,8 @@ Cache directory:
                         "Provision",
                         &provision_shares,
                         &written_files,
-                        &args.vm_user
+                        &args.vm_user,
+                        false,
                     )
                 );
                 for note in &notes {
@@ -651,14 +711,7 @@ Cache directory:
                 project_masks_and_shares(&directory_shares, args.git_mode, &cache_dir)?;
             directory_shares.extend(project_extra_shares);
 
-            directory_shares.extend(create_cache_shares(
-                &cache_dir,
-                &cache_share_specs(
-                    args.mount_sys_cache,
-                    args.mount_mise,
-                    args.mount_agents_conf,
-                ),
-            )?);
+            directory_shares.extend(create_cache_shares(&cache_dir, &cache_specs, &vm_user)?);
 
             let mut tmux_conf = None;
             if args.mount_tmux_conf {
@@ -707,7 +760,13 @@ Cache directory:
                 .collect();
             print!(
                 "{}",
-                describe_vm_files("Run", &directory_shares, &written_files, &vm_user)
+                describe_vm_files(
+                    "Run",
+                    &directory_shares,
+                    &written_files,
+                    &vm_user,
+                    plan.restrict_apt_cache
+                )
             );
             for note in run_share_notes(args.mount_sys_cache, args.mount_mise) {
                 println!("{note}");
@@ -1380,17 +1439,9 @@ where
     })
 }
 
-fn create_cache_share(
-    cache_dir: &Path,
-    share: &str,
-) -> Result<DirectoryShare, Box<dyn std::error::Error>> {
-    let (name, guest_path) = share.split_once(':').unwrap();
-    DirectoryShare::new(cache_dir.join(name), guest_path, false, true, false)
-}
-
 /// The cache directory shares to mount, in mount order: mise, the system
 /// caches, then the coding agent configuration directories.
-fn cache_share_specs(sys_cache: bool, mise: bool, agents_conf: bool) -> Vec<&'static str> {
+fn cache_share_specs(sys_cache: bool, mise: bool, agents_conf: bool) -> Vec<CacheShare> {
     let mut specs = Vec::new();
     if mise {
         specs.push(MISE_CACHE_SHARE);
@@ -1404,15 +1455,48 @@ fn cache_share_specs(sys_cache: bool, mise: bool, agents_conf: bool) -> Vec<&'st
     specs
 }
 
-/// Creates (if needed) and shares the given cache directories.
+/// Creates (if needed) and shares the given cache directories of `vm_user`.
 fn create_cache_shares(
     cache_dir: &Path,
-    specs: &[&str],
+    specs: &[CacheShare],
+    vm_user: &VmUser,
 ) -> Result<Vec<DirectoryShare>, Box<dyn std::error::Error>> {
     specs
         .iter()
-        .map(|spec| create_cache_share(cache_dir, spec))
+        .map(|spec| {
+            DirectoryShare::new(
+                spec.host_dir(cache_dir, vm_user),
+                spec.guest,
+                false,
+                true,
+                false,
+            )
+        })
         .collect()
+}
+
+/// Note about user caches that still sit in the old layout
+/// (`<cache dir>/<name>`, before `user-<user>/`): printed when a user cache
+/// directory about to be created does not exist yet but its old directory does.
+/// Vibe never moves or deletes the old directories.
+fn legacy_cache_notice(cache_dir: &Path, specs: &[CacheShare], vm_user: &VmUser) -> Option<String> {
+    let old: Vec<&str> = specs
+        .iter()
+        .filter(|spec| spec.scope == CacheScope::User)
+        .filter(|spec| {
+            !spec.host_dir(cache_dir, vm_user).exists() && cache_dir.join(spec.name).is_dir()
+        })
+        .map(|spec| spec.name)
+        .collect();
+    let first = old.first()?;
+    let user_dir = user_cache_dir(cache_dir, vm_user);
+    let cache = cache_dir.display();
+    let user_dir = user_dir.display();
+    Some(format!(
+        "Note: user caches now live in {user_dir}/. The old directories in {cache} ({}) are no longer mounted, so tools installed into them are not available. \
+Vibe does not move or delete them. To reuse one, move it by hand while no VM runs, for example: rmdir {user_dir}/{first} && mv {cache}/{first} {user_dir}/{first}. Or provision the image again.",
+        old.join(", ")
+    ))
 }
 
 /// Err when a provision that runs scripts would create a non-root `--vm-user`
@@ -1472,11 +1556,14 @@ The default image is created once and shared by all projects. Create it first, e
 
 /// Host log of what a VM gets from the host: the directory shares and the
 /// files Vibe writes into it. `written` holds (guest path, source) pairs.
+/// With `restrict_apt_cache` the apt cache is marked as read-only for the
+/// `vm_user` (mounted with `bindfs`).
 fn describe_vm_files(
     stage: &str,
     shares: &[DirectoryShare],
     written: &[(&str, &str)],
     vm_user: &VmUser,
+    restrict_apt_cache: bool,
 ) -> String {
     let mut text = format!("{stage}: directory shares:\n");
     if shares.is_empty() {
@@ -1484,9 +1571,14 @@ fn describe_vm_files(
     }
     for share in shares {
         let mode = if share.read_only {
-            "read-only"
+            "read-only".to_string()
+        } else if restrict_apt_cache && share.is_apt_cache() {
+            format!(
+                "read-write, read-only for {} via bindfs if the image has it",
+                vm_user.as_str()
+            )
         } else {
-            "read-write"
+            "read-write".to_string()
         };
         text.push_str(&format!(
             "  {} -> {} ({mode})\n",
@@ -2117,8 +2209,12 @@ mod tests {
             project_masks_and_shares(&shares, GitMode::No, &dir.join("cache")).unwrap();
         shares.extend(extra);
         shares.extend(
-            create_cache_shares(&dir.join("cache"), &["apt:/var/cache/apt", "cargo:.cargo"])
-                .unwrap(),
+            create_cache_shares(
+                &dir.join("cache"),
+                &[SYS_CACHE_SHARES[0], SYS_CACHE_SHARES[1]],
+                vm_user,
+            )
+            .unwrap(),
         );
         let env = HashMap::new();
         let project_dir = shares[0].guest.clone();
@@ -2271,16 +2367,11 @@ mod tests {
 
     #[test]
     fn cache_share_specs_select_each_group_in_mount_order() {
+        let names =
+            |specs: Vec<CacheShare>| -> Vec<&str> { specs.iter().map(|spec| spec.name).collect() };
         assert_eq!(
-            cache_share_specs(true, true, false),
-            [
-                "mise-cache:.local/share/mise",
-                "apt:/var/cache/apt",
-                "cargo:.cargo",
-                "yarn:.yarn",
-                "m2:.m2",
-                "go:go",
-            ]
+            names(cache_share_specs(true, true, false)),
+            ["mise-cache", "apt", "cargo", "yarn", "m2", "go"]
         );
         assert_eq!(cache_share_specs(true, false, false), SYS_CACHE_SHARES);
         assert_eq!(cache_share_specs(false, true, false), [MISE_CACHE_SHARE]);
@@ -2288,6 +2379,72 @@ mod tests {
         let with_agents = cache_share_specs(true, true, true);
         assert_eq!(with_agents.len(), 6 + AGENT_CONF_SHARES.len());
         assert_eq!(&with_agents[6..], AGENT_CONF_SHARES);
+    }
+
+    #[test]
+    fn user_caches_are_kept_per_vm_user_and_apt_is_global() {
+        let cache = Path::new("/cache/vibe");
+        let dev = VmUser::parse("dev").unwrap();
+        let specs = cache_share_specs(true, true, true);
+        for vm_user in [VmUser::root(), dev] {
+            let user_dir = format!("/cache/vibe/user-{}", vm_user.as_str());
+            for spec in &specs {
+                let host = spec.host_dir(cache, &vm_user);
+                if spec.name == "apt" {
+                    assert_eq!(spec.scope, CacheScope::Global);
+                    assert_eq!(host, Path::new("/cache/vibe/apt"));
+                    assert_eq!(spec.guest, session_plan::APT_CACHE_GUEST);
+                } else {
+                    assert_eq!(spec.scope, CacheScope::User, "{spec:?}");
+                    assert_eq!(host, Path::new(&user_dir).join(spec.name));
+                    assert!(!spec.guest.starts_with('/'), "{spec:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_cache_notice_lists_old_directories_without_a_new_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibe-legacy-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = VmUser::root();
+        let specs = cache_share_specs(true, true, false);
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(legacy_cache_notice(&dir, &specs, &root), None);
+
+        // The global apt cache keeps its directory and never counts as old.
+        for name in ["apt", "cargo", "mise-cache"] {
+            fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        let notice = legacy_cache_notice(&dir, &specs, &root).unwrap();
+        assert!(notice.contains("(mise-cache, cargo)"), "{notice}");
+        assert!(notice.contains(&format!("{}/user-root/", dir.display())));
+        assert!(notice.contains("rmdir"), "{notice}");
+
+        // Only shares about to be mounted count.
+        assert!(
+            !legacy_cache_notice(&dir, &cache_share_specs(true, false, false), &root)
+                .unwrap()
+                .contains("mise-cache")
+        );
+
+        // Once a new directory exists, its old one is not mentioned again.
+        let created = create_cache_shares(&dir, &specs, &root).unwrap();
+        assert_eq!(created[1].host, dir.join("apt"));
+        assert!(dir.join("user-root/cargo").is_dir());
+        assert_eq!(legacy_cache_notice(&dir, &specs, &root), None);
+
+        // Another user gets its own directories, so the note shows up for it.
+        let dev = VmUser::parse("dev").unwrap();
+        let notice = legacy_cache_notice(&dir, &specs, &dev).unwrap();
+        assert!(notice.contains("user-dev/"), "{notice}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2372,6 +2529,7 @@ mod tests {
                 ("/root/.tmux.conf", "from /home/me/.tmux.conf"),
             ],
             &VmUser::root(),
+            false,
         );
         assert_eq!(
             text,
@@ -2388,14 +2546,30 @@ mod tests {
         );
 
         let dev = VmUser::parse("dev").unwrap();
-        let relative =
-            describe_vm_files("Run", &[share("/home/me/proj", "proj", false)], &[], &dev);
+        let relative = describe_vm_files(
+            "Run",
+            &[share("/home/me/proj", "proj", false)],
+            &[],
+            &dev,
+            true,
+        );
         assert!(
             relative.contains("/home/me/proj -> ~dev/proj (read-write)"),
             "{relative}"
         );
 
-        let empty = describe_vm_files("Provision", &[], &[], &VmUser::root());
+        let apt = share("/cache/apt", session_plan::APT_CACHE_GUEST, false);
+        assert!(
+            describe_vm_files("Run", std::slice::from_ref(&apt), &[], &dev, true).contains(
+                "/cache/apt -> /var/cache/apt (read-write, read-only for dev via bindfs if the image has it)"
+            )
+        );
+        assert!(
+            describe_vm_files("Provision", &[apt], &[], &dev, false)
+                .contains("/cache/apt -> /var/cache/apt (read-write)\n")
+        );
+
+        let empty = describe_vm_files("Provision", &[], &[], &VmUser::root(), false);
         assert_eq!(
             empty,
             "Provision: directory shares:\n  (none)\nProvision: files written into the VM:\n  (none)\n"

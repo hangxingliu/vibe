@@ -46,7 +46,8 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 | `<name>.tmp.<pid>.lock` | 与 `<name>.raw` 同目录 | `FileLock::try_acquire_existing` | 维护虚拟机的同级锁文件。磁盘镜像本身不加 flock 锁，否则 Virtualization.framework 会拒绝附加该磁盘。 |
 | `maint/<pid>-<nonce>/` | Alpine `.raw` 所在目录，否则首选目录 | `process_disk` | 单次维护运行环境：Alpine 克隆、seed ISO、EFI 变量存储、控制台日志。 |
 | `logs/maint-<unix>-<pid>.log` | 默认目录 | `publish_log` | 已发布的维护控制台日志，开头带有列出完整路径的头部。仅保留最新的 5 个日志。 |
-| `mise-cache/`、`apt/`、`cargo/`、`yarn/`、`m2/`、`go/`、`guest_node_modules/`；agent 配置（`codex/`、`copilot/` 等，仅在 `--mount-agents-conf` 时） | 默认目录 | `create_cache_share` | VirtioFS 共享的源目录，只在实际挂载时创建。 |
+| `apt/`、`guest_node_modules/` | 默认目录 | `create_cache_shares`、`project_masks_and_shares` | 所有 `--vm-user` 共用的 VirtioFS 共享源目录，只在实际挂载时创建。 |
+| `user-<name>/`：`mise-cache/`、`cargo/`、`yarn/`、`m2/`、`go/`；agent 配置（`codex/`、`copilot/` 等，仅在 `--mount-agents-conf` 时） | 默认目录 | `create_cache_shares` | `--vm-user` 为 `<name>` 时的用户缓存（默认为 `user-root/`），只在实际挂载时创建。旧的顶层目录（`cargo/`、`mise-cache/` 等）不再挂载；旧目录存在而新目录不存在时，`legacy_cache_notice` 打印提示，不移动也不删除旧目录。 |
 | `vibe-usernet` | 默认目录 | `ensure_usernet_helper_extracted` | 内置的用户态网络辅助程序，在缓存字节不一致时写出。 |
 | `.vibe/instance.raw` | 项目目录 | `ensure_instance_disk` | 项目专属磁盘，从模板复制一次生成。这是常规 `vibe` 启动的文件。 |
 | `.vibe/vibe-usernet.log` | 项目目录 | `NetworkMode::prepare` | 项目实例的辅助程序日志。外部的 `path/to/disk.raw` 不会生成此日志。 |
@@ -94,7 +95,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 ### `run_main`
 
-`parse_cli`（`lexopt`）用于填充 `CliArgs`。`run_main` 负责创建缓存目录，调用 `ensure_signed`，并准备一个包裹 `NetworkMode::prepare` 的闭包。各命令自行构建缓存共享：`cache_share_specs(sys_cache, mise, agents_conf)` 按 `MISE_CACHE_SHARE`、`SYS_CACHE_SHARES`、`AGENT_CONF_SHARES` 的顺序选取，`create_cache_shares` 只创建这些宿主机目录。
+`parse_cli`（`lexopt`）用于填充 `CliArgs`。`run_main` 负责创建缓存目录，调用 `ensure_signed`，并准备一个包裹 `NetworkMode::prepare` 的闭包。各命令自行构建缓存共享：`cache_share_specs(sys_cache, mise, agents_conf)` 按 `MISE_CACHE_SHARE`、`SYS_CACHE_SHARES`、`AGENT_CONF_SHARES` 的顺序选取，`create_cache_shares` 只创建这些宿主机目录。每个 `CacheShare` 为 `Global`（`apt`，位于 `<cache>/apt`）或 `User`（位于 `<cache>/user-<vm-user>/<name>`）。进入各命令分支之前，如果将要挂载的用户缓存有旧的顶层目录而没有新目录，`legacy_cache_notice` 打印一次提示。
 
 在调用 `run_vm` 之前，run 与 provision 都会打印 `describe_vm_files`：目录共享（`host -> guest (mode)`）以及 Vibe 写入 VM 的文件，没有时打印 `(none)`。
 
@@ -165,9 +166,9 @@ root 的所有动作都在 root shell 中运行，没有切换。其他用户的
 
 1. `legacy_login_prefix(LOGIN_EXPECT_TIMEOUT, root_password)`，其中 `LOGIN_EXPECT_TIMEOUT` = 120 秒。`root_password` 来自 `--root-password`；未给出该选项时来自 `VIBE_ROOT_PASSWORD`。
 2. 计划中的 `root_prepare`：root 密码，然后是 `--vm-user` 步骤。对非 root 用户，该步骤导出 `VIBE_VM_USER`、`VIBE_VM_UID`、`VIBE_VM_GID` 和 `VIBE_VM_HOME`，供后续路径与挂载使用。
-3. 存在共享目录时：执行 `mkdir -p /mnt/root/virtiofs-shared && chmod -R 700 /mnt/root && mount -t virtiofs shared /mnt/root/virtiofs-shared`，使 staging 目录只有 root 能到达。然后为每个共享创建目标并把 staging 子目录 `mount --bind` 上去。在非 root 用户的 HOME 下，每个缺失的目录用 `install -d -o "$VIBE_VM_UID" -g "$VIBE_VM_GID"` 逐级创建。设置 `restrict_apt_cache` 时，apt 缓存是一个标签为 `mount apt cache` 的 `StatusCommand`：`bindfs -u _apt -g 0 -p 0755,af-x`，文件显示为 `_apt` 所有，其他用户只能读不能写，root 的 apt 仍下载到宿主机缓存中。缺少 `bindfs` 或 `_apt` 账号时（例如 Vibe 开始安装 `bindfs` 之前 provision 的镜像），回退为可写的绑定挂载，宿主机打印警告并建议重新 provision 或使用 `--no-mount-sys-cache`。
+3. 存在共享目录时：执行 `mkdir -p /mnt/root/virtiofs-shared && chmod -R 700 /mnt/root && mount -t virtiofs shared /mnt/root/virtiofs-shared`，使 staging 目录只有 root 能到达。然后为每个共享创建目标并把 staging 子目录 `mount --bind` 上去。在非 root 用户的 HOME 下，每个缺失的目录用 `install -d -o "$VIBE_VM_UID" -g "$VIBE_VM_GID"` 逐级创建。设置 `restrict_apt_cache` 时，apt 缓存是一个标签为 `mount apt cache` 的 `StatusCommand`：`bindfs -u _apt -g 0 -p 0755,af-x`，文件显示为 `_apt` 所有，其他用户只能读不能写，root 的 apt 仍下载到宿主机缓存中。缺少 `bindfs` 或 `_apt` 账号时（例如 Vibe 开始安装 `bindfs` 之前 provision 的镜像），回退为可写的绑定挂载，宿主机打印警告并建议重新 provision 或使用 `--no-mount-sys-cache`。共享的读写权限由谁决定、为什么这样，见 [file-shares-between-vm.md](file-shares-between-vm.md)（英文）。
 4. 遮蔽：`mount -t tmpfs -o mode=0555,uid=0,gid=0 tmpfs <path>`，一个属于 root、其他用户无法写入的空目录。
-5. 调用方动作：计划中的 `root_actions`，然后（设置了 `switch_user` 时）是切换，再是 `user_actions`。切换先键入 ` sysctl -q -w dev.tty.legacy_tiocsti=0 2>/dev/null || true`，使用户的程序不能把输入塞回 root shell 的终端；然后 `LoginAction::SwitchUser` 键入 `SWITCH_USER_COMMAND`：` su --login --pty "$VIBE_VM_USER"; echo; echo 'Vibe: back in the root shell. ...'`。root shell 读取的是整行，所以提示只在用户的 shell 退出后出现。随后发送一个与 root 就绪探测相同方式的探测（拆分的标记，然后是 `id -un` 与 `id -u`），每 10 秒重试，最长 120 秒；结果必须是该用户名且 uid 不为 0，否则报错 `LoginFailure::SwitchFailed`（`[login] Switching to vm-user ...`）。切换动作标记为 `[login] setup`。
+5. 调用方动作：计划中的 `root_actions`，然后（设置了 `switch_user` 时）是切换，再是 `user_actions`。切换先键入 ` sysctl -q -w dev.tty.legacy_tiocsti=0 2>/dev/null || true`，使用户的程序不能把输入塞回 root shell 的终端；然后 `LoginAction::SwitchUser` 键入 `SWITCH_USER_COMMAND`：` su --login --pty "$VIBE_VM_USER"; echo; echo 'Vibe: back in the root shell. ...'`。root shell 读取的是整行，所以提示只在用户的 shell 退出后出现。`su` 关闭用户终端时发送的输入会丢失，所以登录动作在 `--send exit` 之后要用 `--expect` 等待这条提示。随后发送一个与 root 就绪探测相同方式的探测（拆分的标记，然后是 `id -un` 与 `id -u`），每 10 秒重试，最长 120 秒；结果必须是该用户名且 uid 不为 0，否则报错 `LoginFailure::SwitchFailed`（`[login] Switching to vm-user ...`）。切换动作标记为 `[login] setup`。
 6. 尾部两个 `Send` 动作：当命令存在时激活 `mise` 和 `fzf`。
 
 `StatusCommand` 把命令放在一个 stdin 来自 `/dev/null` 的命令组中运行（这样 apt-get 之类的工具无法吃掉其后输入的行），然后打印 `VIBE_STEP_STATUS_<id>` 及 `<退出码> <notice>`。非零退出码使该动作失败。非空的 `__vibe_notice` 会成为 `VmOutput::Notice`，由 `drive_interactive` 打印为警告（例如 `--vm-user` 属于 `sudo` 或 `adm` 组）。

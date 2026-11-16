@@ -281,7 +281,8 @@ pub(crate) fn ensure_default_image(
         println!("{}", GuestProxy::image_note());
     }
 
-    let directory_shares = create_cache_shares(cache_dir, &cache_share_specs(true, true, false))?;
+    let directory_shares =
+        create_cache_shares(cache_dir, &cache_share_specs(true, true, false), vm_user)?;
     provision_image(
         dirs,
         &base.raw,
@@ -577,7 +578,7 @@ pub(crate) fn provision_image(
             .collect();
         print!(
             "{}",
-            describe_vm_files(stage, directory_shares, &written_files, vm_user)
+            describe_vm_files(stage, directory_shares, &written_files, vm_user, false)
         );
         for note in notes {
             println!("{note}");

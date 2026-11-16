@@ -10,9 +10,9 @@ flowchart TD
   check -->|是| checks["vm_checks::run"]
   check -->|否| runmain["run_main()"]
   runmain --> cmd{"CliCommand"}
-  cmd -->|Run| disk["解析磁盘，构建共享与登录操作"]
+  cmd -->|Run| disk["run_run：解析磁盘，构建共享与登录操作"]
   cmd -->|"Provision --repl，镜像已存在"| runvm
-  cmd -->|Provision| copy["provision_image：复制基础镜像到 name.tmp.pid"]
+  cmd -->|Provision| copy["run_provision，然后 provision_image：复制基础镜像到 name.tmp.pid"]
   copy --> prep["ensure_bootable"]
   prep --> grow["将 raw 文件扩容至 12 GiB"]
   grow --> runvm["run_vm"]
@@ -25,7 +25,7 @@ flowchart TD
   alpine --> grow
 ```
 
-Virtualization.framework 的完成处理程序（completion handler）在进程主线程上运行。因此，当设置了 `VIBE_VM_CHECK` 时，`main` 会在解析 CLI 之前调用 `vm_checks::run`。常规 CLI 从不设置该变量。`ensure_signed`（`src/main.rs`）会检查 `com.apple.security.virtualization` 权限；如果缺失，则使用 `src/entitlements.plist` 对二进制文件执行 `codesign` 代码签名并重新执行。
+Virtualization.framework 的完成处理程序（completion handler）在进程主线程上运行。因此，当设置了 `VIBE_VM_CHECK` 时，`main` 会在解析 CLI 之前调用 `vm_checks::run`。常规 CLI 从不设置该变量。`ensure_signed`（`src/signing.rs`）会检查 `com.apple.security.virtualization` 权限；如果缺失，则使用 `src/entitlements.plist` 对二进制文件执行 `codesign` 代码签名并重新执行。
 
 ## 磁盘文件
 
@@ -57,7 +57,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 `src/images.rs` 中的 `DEBIAN_COMPRESSED_DISK_URL` 是 Debian 13 "trixie" nocloud arm64 镜像 `20261001-2618`。当 `.raw` 文件已存在时，`ensure_base_image` 会立即返回。否则，当归档文件缺失或小于 `DEBIAN_COMPRESSED_SIZE_BYTES` 时，它会通过 `curl` 下载，使用 `verify_sha512`（`/usr/bin/shasum`）校验 SHA-512，并通过 `extract_disk_raw` 解压（数据先写入同级临时文件，然后通过 `cache::replace` 替换）。失败信息会带上 `[download]` 前缀。
 
-在未指定 `--base` 进行配置时，`run_main` 会调用 `ensure_base_image`；在构建第一个 `default.raw` 之前，`ensure_default_image` 也会再次调用它。
+在未指定 `--base` 进行配置时，`run_provision`（`src/provision_command.rs`）会调用 `ensure_base_image`；在构建第一个 `default.raw` 之前，`ensure_default_image` 也会再次调用它。
 
 ### Alpine 维护镜像
 
@@ -85,7 +85,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 `ensure_default_image` 会针对 `default.raw` 配合所有内置脚本执行一次此流程。已存在的 `default.raw` 会被立即返回，且不会再次探测。在没有实例磁盘的项目中，当 `--image` 为 `default`（或省略）时，首次执行普通的 `vibe` 会调用 `ensure_default_image`。
 
-当 `.vibe/instance.raw`（`INSTANCE_DIR_NAME`，`INSTANCE_DISK_IMAGE_NAME`）不存在时，`ensure_instance_disk` 会将所选模板复制到该文件。后续运行则直接按原样启动该实例。一旦 `.vibe/instance.raw` 存在，`vibe --image NAME` 参数将被忽略（当 `NAME` 不是 `default` 时，`run_main` 会打印提示信息）。
+当 `.vibe/instance.raw`（`INSTANCE_DIR_NAME`，`INSTANCE_DISK_IMAGE_NAME`）不存在时，`ensure_instance_disk` 会将所选模板复制到该文件。后续运行则直接按原样启动该实例。一旦 `.vibe/instance.raw` 存在，`vibe --image NAME` 参数将被忽略（当 `NAME` 不是 `default` 时，`run_run` 会打印提示信息）。
 
 位置参数指定的 `path/to/disk.raw` 会直接按原样启动（`DiskSource::External`）。它不会创建 `.vibe/instance.raw`，也不会读取缓存模板。
 
@@ -95,7 +95,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 ### `run_main`
 
-`parse_cli`（`lexopt`）用于填充 `CliArgs`。`run_main` 负责创建缓存目录，调用 `ensure_signed`，并准备一个包裹 `NetworkMode::prepare` 的闭包。各命令自行构建缓存共享：`cache_share_specs(sys_cache, mise, agents_conf)` 按 `MISE_CACHE_SHARE`、`SYS_CACHE_SHARES`、`AGENT_CONF_SHARES` 的顺序选取，`create_cache_shares` 只创建这些宿主机目录。每个 `CacheShare` 为 `Global`（`apt`，位于 `<cache>/apt`）或 `User`（位于 `<cache>/user-<vm-user>/<name>`）。进入各命令分支之前，如果将要挂载的用户缓存有旧的顶层目录而没有新目录，`legacy_cache_notice` 打印一次提示。
+`parse_cli`（`lexopt`）用于填充 `CliArgs`。`run_main` 负责创建缓存目录，调用 `ensure_signed`，并准备一个包裹 `NetworkMode::prepare` 的闭包。它把两个命令共用的值放进 `CommandContext`，再调用 `run_run`（`src/run_command.rs`）或 `run_provision`（`src/provision_command.rs`）。各命令自行构建缓存共享：`cache_share_specs(sys_cache, mise, agents_conf)` 按 `MISE_CACHE_SHARE`、`SYS_CACHE_SHARES`、`AGENT_CONF_SHARES` 的顺序选取，`create_cache_shares` 只创建这些宿主机目录。每个 `CacheShare` 为 `Global`（`apt`，位于 `<cache>/apt`）或 `User`（位于 `<cache>/user-<vm-user>/<name>`）。进入各命令分支之前，如果将要挂载的用户缓存有旧的顶层目录而没有新目录，`legacy_cache_notice` 打印一次提示。
 
 在调用 `run_vm` 之前，run 与 provision 都会打印 `describe_vm_files`：目录共享（`host -> guest (mode)`）以及 Vibe 写入 VM 的文件，没有时打印 `(none)`。运行计划设置了 `restrict_apt_cache` 时，apt 缓存的模式显示为 `read-write, read-only for <user> via bindfs if the image has it`。
 
@@ -103,7 +103,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 ### Run 命令
 
-`run_main` 中的 `CliCommand::Run` 处理流程如下：
+`run_run` 中的 `CliCommand::Run` 处理流程如下：
 
 1. 按照上文所述解析磁盘。`DiskSource` 为 `External` 或 `Instance`。仅针对实例磁盘时，网络日志目录才为 `.vibe/`。
    使用默认镜像且 `default.raw` 尚不存在时，`check_implicit_provision` 先拒绝 `--no-mount-sys-cache` / `--no-mount-mise`（错误中列出这些选项、`default.raw` 的路径以及 `vibe provision` 的用法），此时 `ensure_default_image` 尚未查找或下载任何东西。`ensure_default_image` 接收缓存目录，只在需要 provision 时才创建共享，并且总是使用 `cache_share_specs(true, true, false)`。
@@ -115,7 +115,7 @@ root 的所有动作都在 root shell 中运行，没有切换。其他用户的
 
 ### Provision 命令
 
-`CliCommand::Provision` 处理流程如下：
+`run_provision` 中的 `CliCommand::Provision` 处理流程如下：
 
 - 缓存共享为 `cache_share_specs(mount_sys_cache, mount_mise, false)`。指定 `--no-mount-sys-cache` / `--no-mount-mise` 时打印提示：工具会装进镜像自身，运行该镜像时需要使用同样的选项才能看到它们。
 - 非 root 的 `--vm-user` 而没有 root 密码（`--root-password` 或 `VIBE_ROOT_PASSWORD`）时，在复制或启动任何东西之前报错（`check_provision_root_password`）：否则该用户可以用 `su -` 成为 root。
@@ -175,7 +175,7 @@ root 的所有动作都在 root shell 中运行，没有切换。其他用户的
 
 `action_prefix` 标记每个索引。用户范围内的动作用 `[action N: ...]` 标记，从 1 开始计数。该范围之后的调用方动作（provision 的收尾与关机）标记为 `[shutdown] ...`。调用方范围之前的动作以及位于其后的尾部 `mise` 和 `fzf` 发送动作均标记为 `[login] setup ...`。`Send` 动作的 `LoginAction::label` 为单词 `send`，不包含实际输入的文本。
 
-`spawn_login_actions_thread`（`src/session.rs`）在后台线程上运行该列表，并通过通道报告 `VmOutput`。主线程每 0.2 秒轮询驱动一次运行循环，应用这些消息，并在动作失败或设置了 `stop_requested` 时调用 `request_stop`（错误提示为 `[shutdown] Stopped because Ctrl-C was pressed twice before setup finished.`）。`request_stop` 优先使用 `canRequestStop`，回退时使用 `stopWithCompletionHandler`。`VIBE_FORCE_STOP_AFTER_LOGIN=1` 是一个测试钩子：在 `LoginReady` 之后，`force_stop` 会使客户机文件系统保持未正常卸载的脏状态。
+`spawn_login_actions_thread`（`src/session/actions.rs`）在后台线程上运行该列表，并通过通道报告 `VmOutput`。主线程每 0.2 秒轮询驱动一次运行循环，应用这些消息，并在动作失败或设置了 `stop_requested` 时调用 `request_stop`（错误提示为 `[shutdown] Stopped because Ctrl-C was pressed twice before setup finished.`）。`request_stop` 优先使用 `canRequestStop`，回退时使用 `stopWithCompletionHandler`。`VIBE_FORCE_STOP_AFTER_LOGIN=1` 是一个测试钩子：在 `LoginReady` 之后，`force_stop` 会使客户机文件系统保持未正常卸载的脏状态。
 
 当虚拟机离开 `Running` 状态或收到停止请求时，`output_monitor.close()` 会解除动作线程的阻塞。`drive_interactive` 等待其汇合（join），关闭 I/O 线程并返回。如果始终未达到 `LoginReady`，错误为 `LoginFailure::VmStopped`（`[boot] The VM stopped before the root login completed`）。`RunOutcome` 记录了是否所有动作均已完成、最终状态是否为 `Stopped`，以及当时仍在运行的调用方动作的前缀。
 
@@ -343,7 +343,7 @@ Debian 的 SSH 服务端默认拒绝空密码（`PermitEmptyPasswords no`）。�
 
 ## 涉及磁盘启动或分类的测试
 
-单元测试位于代码旁的 `#[cfg(test)]` 中：包括 `src/main.rs` 中的 CLI 解析、`src/session.rs` 中的登录与 provision 提示、`src/vm_config.rs` 中的 `VmSpec` 结构、`src/vm_lifecycle.rs` 中的无头虚拟机超时控制、GPT 和 ext4 测试固件、控制帧、`classify` / `verify_processed`、缓存辅助函数、Alpine UUID 检查、seed 清单规则、`observe_frame`、`prepare_decision` 以及 machine-id 清理脚本。
+单元测试位于代码旁的 `#[cfg(test)]` 中：`src/cli/tests.rs` 中的 CLI 解析、`src/session/` 中的登录与 provision 提示（共用辅助在 `src/session/test_support.rs`）、`src/ext4ro/tests.rs` 中的 ext4 读取、`src/vm_lifecycle.rs` 中的无头虚拟机超时控制、GPT 和 ext4 测试固件、控制帧、`classify` / `verify_processed`、缓存辅助函数、Alpine UUID 检查、seed 清单规则以及 `observe_frame`。
 
 无法在工作线程中通过 `cargo test` 启动虚拟机。标记了 `#[ignore]` 的测试会带有 `VIBE_VM_CHECK` 环境变量启动 `vibe` 二进制文件，由 `main` 在主线程上运行检查：
 
@@ -352,7 +352,7 @@ Debian 的 SSH 服务端默认拒绝空密码（`PermitEmptyPasswords no`）。�
 | `tests/vm_devices.rs` | `read-only-disk` | 挂载第二个只读磁盘运行 `drive_interactive`。客户机读取 `/sys/block/vdb/ro`。 |
 | `tests/vm_devices.rs` | `headless-timeout` | 针对从不发送 `PREP-READY` 的客户机执行 `run_headless`，验证首次输出、停止与汇合的时间预算。 |
 | `tests/disk_prepare.rs` | `prepare` | 通过 `src/vm_checks/prepare.rs` 运行 `ensure_bootable`。旧版 Debian 镜像返回 `AlreadyCompatible` 且保持空缓存不变。新版 Debian 镜像则会被处理。 |
-| `tests/alpine_maintenance.rs` | `maintenance-all` | 运行 `src/vm_checks/maintenance.rs`：下载、shadow 编辑、新旧镜像预处理、重复预处理、反向异常磁盘用例、needs-recovery、SSH `PermitEmptyPasswords` 以及日志保留。缓存的 Alpine raw 的 SHA-256 必须保持不变。`maintenance-<name>` 运行其中某一项检查。 |
+| `tests/alpine_maintenance.rs` | `maintenance-all` | 运行 `src/vm_checks/maintenance.rs`（各项检查在 `src/vm_checks/maintenance/`）：下载、shadow 编辑、新旧镜像预处理、重复预处理、反向异常磁盘用例、needs-recovery、SSH `PermitEmptyPasswords` 以及日志保留。缓存的 Alpine raw 的 SHA-256 必须保持不变。`maintenance-<name>` 运行其中某一项检查。 |
 | `src/vm_checks/prepare.rs` | `probe` | 对 `VIBE_VM_CHECK_DISK` 执行 `probe_disk`。打印分类、machine-id 状态以及 root 密码字段是否为空。不打印 shadow 字节。 |
 | `tests/vm_user.rs` | `vm-user` | `src/vm_checks/vm_user.rs` 以子进程运行 `vibe` CLI。它从 `VIBE_VM_CHECK_DISK` 的克隆为 `dev` provision 一个 `t-vmcheck-dev` 镜像（带 root 密码），放在临时镜像目录中；检查不存在的 `--vm-user` 会失败；然后以 `dev` 运行一个会话，其脚本检查 uid、项目目录、在项目、可写 `--mount` 与缓存中写入、只读 `--mount`、`.vibe` 屏蔽、`.env` 未被屏蔽、只读的 `.git`（也通过 `.GIT` 与 `.Git`）、staging 目录、`umount`，以及 `bindfs` 下的 apt 缓存。之后键入 `exit`，检查回到了 root shell 且 root 的 apt 可用。 |
 | `tests/vm_user.rs` | `root-password` | 使用同样的 CLI 驱动：provision 一个带密码的 root 镜像，然后分别用正确的密码、错误的密码（`[login]`，且不打印密码）和不带密码（错误中提到 `--root-password`）登录。 |

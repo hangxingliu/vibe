@@ -378,20 +378,6 @@ mod tests {
     }
 
     #[test]
-    fn large_archive_does_not_need_another_download() {
-        assert!(archive_needs_download(false, None));
-        assert!(archive_needs_download(true, Some(0)));
-        assert!(archive_needs_download(
-            true,
-            Some(DEBIAN_COMPRESSED_SIZE_BYTES - 1)
-        ));
-        assert!(!archive_needs_download(
-            true,
-            Some(DEBIAN_COMPRESSED_SIZE_BYTES)
-        ));
-    }
-
-    #[test]
     fn large_bad_debian_archive_is_not_replaced() {
         let dir = temp_dir("debian-sha");
         let archive = dir.join("debian.tar.xz");

@@ -10,9 +10,9 @@ flowchart TD
   check -->|yes| checks["vm_checks::run"]
   check -->|no| runmain["run_main()"]
   runmain --> cmd{"CliCommand"}
-  cmd -->|Run| disk["resolve the disk, build shares and login actions"]
+  cmd -->|Run| disk["run_run: resolve the disk, build shares and login actions"]
   cmd -->|"Provision --repl, image already exists"| runvm
-  cmd -->|Provision| copy["provision_image: copy base to name.tmp.pid"]
+  cmd -->|Provision| copy["run_provision, then provision_image: copy base to name.tmp.pid"]
   copy --> prep["ensure_bootable"]
   prep --> grow["grow the raw file to 12 GiB"]
   grow --> runvm["run_vm"]
@@ -25,7 +25,7 @@ flowchart TD
   alpine --> grow
 ```
 
-Virtualization.framework completion handlers run on the process main thread. `main` therefore calls `vm_checks::run` before CLI parsing when `VIBE_VM_CHECK` is set. The normal CLI never sets that variable. `ensure_signed` (`src/main.rs`) checks for the `com.apple.security.virtualization` entitlement and, when it is missing, `codesign`s the binary with `src/entitlements.plist` and re-executes it.
+Virtualization.framework completion handlers run on the process main thread. `main` therefore calls `vm_checks::run` before CLI parsing when `VIBE_VM_CHECK` is set. The normal CLI never sets that variable. `ensure_signed` (`src/signing.rs`) checks for the `com.apple.security.virtualization` entitlement and, when it is missing, `codesign`s the binary with `src/entitlements.plist` and re-executes it.
 
 ## Disk files
 
@@ -57,7 +57,7 @@ Image names (`--image`, `--base NAME`, `default`) go through `find_named_image`,
 
 `DEBIAN_COMPRESSED_DISK_URL` in `src/images.rs` is the Debian 13 "trixie" nocloud arm64 image `20261001-2618`. `ensure_base_image` returns immediately when the `.raw` already exists. Otherwise it downloads with `curl` when the archive is missing or smaller than `DEBIAN_COMPRESSED_SIZE_BYTES`, checks SHA-512 with `verify_sha512` (`/usr/bin/shasum`), and extracts with `extract_disk_raw` (bytes land in a sibling temp file, then `cache::replace`). Failures use the `[download]` prefix.
 
-`run_main` calls `ensure_base_image` when provisioning with no `--base`, and `ensure_default_image` calls it again before the first `default.raw` is built.
+`run_provision` (`src/provision_command.rs`) calls `ensure_base_image` when provisioning with no `--base`, and `ensure_default_image` calls it again before the first `default.raw` is built.
 
 ### Alpine maintenance image
 
@@ -85,7 +85,7 @@ A valid raw plus a valid archive does not touch the network. The cached raw is a
 
 `ensure_default_image` does this once for `default.raw`, with every built-in script. An existing `default.raw` is returned immediately and is not probed again. The first plain `vibe` in a project with no instance disk calls `ensure_default_image` when `--image` is `default` (or omitted).
 
-`ensure_instance_disk` copies the chosen template to `.vibe/instance.raw` (`INSTANCE_DIR_NAME`, `INSTANCE_DISK_IMAGE_NAME`) when that file is absent. Later runs boot the instance as it is. `vibe --image NAME` is ignored once `.vibe/instance.raw` exists (`run_main` prints that when `NAME` is not `default`).
+`ensure_instance_disk` copies the chosen template to `.vibe/instance.raw` (`INSTANCE_DIR_NAME`, `INSTANCE_DISK_IMAGE_NAME`) when that file is absent. Later runs boot the instance as it is. `vibe --image NAME` is ignored once `.vibe/instance.raw` exists (`run_run` prints that when `NAME` is not `default`).
 
 A positional `path/to/disk.raw` is booted as given (`DiskSource::External`). It does not create `.vibe/instance.raw` and does not read the cache templates.
 
@@ -95,7 +95,7 @@ Every published image has an empty `/etc/machine-id`. Each instance therefore ge
 
 ### `run_main`
 
-`parse_cli` (`lexopt`) fills `CliArgs`. `run_main` creates the cache directory, calls `ensure_signed`, and prepares a closure over `NetworkMode::prepare`. Each command builds its own cache shares: `cache_share_specs(sys_cache, mise, agents_conf)` picks from `MISE_CACHE_SHARE`, `SYS_CACHE_SHARES`, and `AGENT_CONF_SHARES` (in that order), and `create_cache_shares` creates only those host directories. Each `CacheShare` is `Global` (`apt`, at `<cache>/apt`) or `User` (at `<cache>/user-<vm-user>/<name>`). Before the command branches, `legacy_cache_notice` prints one note when a user cache about to be mounted has an old top-level directory but no new one.
+`parse_cli` (`lexopt`) fills `CliArgs`. `run_main` creates the cache directory, calls `ensure_signed`, and prepares a closure over `NetworkMode::prepare`. It puts the values both commands need into a `CommandContext` and calls `run_run` (`src/run_command.rs`) or `run_provision` (`src/provision_command.rs`). Each command builds its own cache shares: `cache_share_specs(sys_cache, mise, agents_conf)` picks from `MISE_CACHE_SHARE`, `SYS_CACHE_SHARES`, and `AGENT_CONF_SHARES` (in that order), and `create_cache_shares` creates only those host directories. Each `CacheShare` is `Global` (`apt`, at `<cache>/apt`) or `User` (at `<cache>/user-<vm-user>/<name>`). Before the command branches, `legacy_cache_notice` prints one note when a user cache about to be mounted has an old top-level directory but no new one.
 
 Before `run_vm`, run and provision print `describe_vm_files`: the directory shares (`host -> guest (mode)`) and the files Vibe writes into the VM, or `(none)`. When the run plan sets `restrict_apt_cache`, the apt cache mode reads `read-write, read-only for <user> via bindfs if the image has it`.
 
@@ -103,7 +103,7 @@ In `nat` mode `guest_proxy` is `None`: the `vibe-usernet` helper applies `--prox
 
 ### Run
 
-`CliCommand::Run` in `run_main`:
+`CliCommand::Run` in `run_run`:
 
 1. Resolve the disk, as described above. `DiskSource` is `External` or `Instance`. The network log directory is `.vibe/` only for the instance disk.
    For the default image, when `default.raw` does not exist yet, `check_implicit_provision` first rejects `--no-mount-sys-cache` / `--no-mount-mise` (the error names the options, the `default.raw` path, and `vibe provision`), before `ensure_default_image` looks up or downloads anything. `ensure_default_image` receives the cache directory and creates the shares only when it provisions, always with `cache_share_specs(true, true, false)`.
@@ -115,7 +115,7 @@ For root, every action runs in the root shell and there is no switch. For anothe
 
 ### Provision
 
-`CliCommand::Provision`:
+`CliCommand::Provision` in `run_provision`:
 
 - The cache shares are `cache_share_specs(mount_sys_cache, mount_mise, false)`. `--no-mount-sys-cache` / `--no-mount-mise` print a note that the tools are installed into the image itself and that the image has to be run with the same option to see them.
 - A non-root `--vm-user` without a root password (`--root-password` or `VIBE_ROOT_PASSWORD`) is an error before anything is copied or booted (`check_provision_root_password`): the user could otherwise become root with `su -`.
@@ -175,7 +175,7 @@ A `StatusCommand` runs its command in a group with stdin from `/dev/null` (so a 
 
 `action_prefix` labels each index. Actions inside the user range are `[action N: ...]`, counting from 1. Caller actions after that range (provision's finalize and poweroff) are `[shutdown] ...`. Actions before the caller range, and the trailing `mise` and `fzf` sends that sit after it, are `[login] setup ...`. `LoginAction::label` for a `Send` is the word `send` and does not include the typed text.
 
-`spawn_login_actions_thread` (`src/session.rs`) runs that list on a background thread and reports `VmOutput` on a channel. The main thread pumps the run loop every 0.2 seconds, applies those messages, and calls `request_stop` when an action fails or when `stop_requested` is set (the error is `[shutdown] Stopped because Ctrl-C was pressed twice before setup finished.`). `request_stop` uses `canRequestStop` and falls back to `stopWithCompletionHandler`. `VIBE_FORCE_STOP_AFTER_LOGIN=1` is a test hook: after `LoginReady`, `force_stop` leaves the guest filesystem dirty.
+`spawn_login_actions_thread` (`src/session/actions.rs`) runs that list on a background thread and reports `VmOutput` on a channel. The main thread pumps the run loop every 0.2 seconds, applies those messages, and calls `request_stop` when an action fails or when `stop_requested` is set (the error is `[shutdown] Stopped because Ctrl-C was pressed twice before setup finished.`). `request_stop` uses `canRequestStop` and falls back to `stopWithCompletionHandler`. `VIBE_FORCE_STOP_AFTER_LOGIN=1` is a test hook: after `LoginReady`, `force_stop` leaves the guest filesystem dirty.
 
 When the VM leaves `Running`, or a stop was requested, `output_monitor.close()` unblocks the actions thread. `drive_interactive` joins it, shuts down the I/O threads, and returns. If `LoginReady` never arrived, the error is `LoginFailure::VmStopped` (`[boot] The VM stopped before the root login completed`). `RunOutcome` records whether every action finished, whether the final state was `Stopped`, and the prefix of the caller action that was still running.
 
@@ -343,7 +343,7 @@ On an M2 Mac, preparing a new base takes about 19 seconds, or about 20 seconds w
 
 ## Tests that boot or classify disks
 
-Unit tests live in `#[cfg(test)]` next to the code: CLI parsing in `src/main.rs`, login and the provision hint in `src/session.rs`, `VmSpec` shape in `src/vm_config.rs`, headless deadlines in `src/vm_lifecycle.rs`, GPT and ext4 fixtures, control frames, `classify` / `verify_processed`, cache helpers, the Alpine UUID check, seed manifest rules, `observe_frame`, `prepare_decision`, and the machine-id finalize scripts.
+Unit tests live in `#[cfg(test)]` next to the code: CLI parsing in `src/cli/tests.rs`, login and the provision hint in `src/session/` (shared helpers in `src/session/test_support.rs`), ext4 reads in `src/ext4ro/tests.rs`, headless deadlines in `src/vm_lifecycle.rs`, GPT and ext4 fixtures, control frames, `classify` / `verify_processed`, cache helpers, the Alpine UUID check, seed manifest rules, and `observe_frame`.
 
 Booting a VM from `cargo test` is not possible on a worker thread. The `#[ignore]` tests spawn the `vibe` binary with `VIBE_VM_CHECK`, and `main` runs the check on the main thread:
 
@@ -352,7 +352,7 @@ Booting a VM from `cargo test` is not possible on a worker thread. The `#[ignore
 | `tests/vm_devices.rs` | `read-only-disk` | `drive_interactive` with a second read-only disk. The guest reads `/sys/block/vdb/ro`. |
 | `tests/vm_devices.rs` | `headless-timeout` | `run_headless` against a guest that never sends `PREP-READY`, within the first-output, stop, and join budget. |
 | `tests/disk_prepare.rs` | `prepare` | `ensure_bootable` through `src/vm_checks/prepare.rs`. An old Debian image returns `AlreadyCompatible` and leaves an empty cache untouched. A new Debian image is processed. |
-| `tests/alpine_maintenance.rs` | `maintenance-all` | `src/vm_checks/maintenance.rs`: download, shadow edit, prepare new and old, prepare again, negative disks, needs-recovery, SSH `PermitEmptyPasswords`, and log retention. The cached Alpine raw's SHA-256 must be unchanged. `maintenance-<name>` runs one of those checks. |
+| `tests/alpine_maintenance.rs` | `maintenance-all` | `src/vm_checks/maintenance.rs` (checks in `src/vm_checks/maintenance/`): download, shadow edit, prepare new and old, prepare again, negative disks, needs-recovery, SSH `PermitEmptyPasswords`, and log retention. The cached Alpine raw's SHA-256 must be unchanged. `maintenance-<name>` runs one of those checks. |
 | `src/vm_checks/prepare.rs` | `probe` | `probe_disk` on `VIBE_VM_CHECK_DISK`. Prints the class, machine-id fact, and whether the root password field is empty. Shadow bytes are not printed. |
 | `tests/vm_user.rs` | `vm-user` | `src/vm_checks/vm_user.rs` runs the `vibe` CLI as a child process. It provisions a `t-vmcheck-dev` image for `dev` from a clone of `VIBE_VM_CHECK_DISK` (with a root password) into a temporary image directory, checks that a missing `--vm-user` fails, then runs a session as `dev` whose script checks the uid, the project directory, writes to the project, a writable `--mount`, and a cache, a read-only `--mount`, the `.vibe` mask, `.env` not being masked, the read-only `.git` (also as `.GIT` and `.Git`), the staging directory, `umount`, and the `bindfs` apt cache. It then types `exit` and checks that the root shell is back and root's apt works. |
 | `tests/vm_user.rs` | `root-password` | The same CLI driver: provisions a root image with a password, then logs in with the right password, a wrong one (`[login]`, and the password is not printed), and none (the error names `--root-password`). |

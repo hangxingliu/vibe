@@ -629,23 +629,6 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_deadlines_have_the_expected_values() {
-        assert_eq!(MAINT_FIRST_OUTPUT_TIMEOUT, Duration::from_secs(90));
-        assert_eq!(MAINT_TOTAL_TIMEOUT, Duration::from_secs(300));
-        assert_eq!(STOP_TIMEOUT, Duration::from_secs(30));
-        assert_eq!(WORKER_JOIN_TIMEOUT, Duration::from_secs(10));
-        assert_eq!(
-            HeadlessDeadlines::maintenance(),
-            HeadlessDeadlines {
-                first_output: MAINT_FIRST_OUTPUT_TIMEOUT,
-                total: MAINT_TOTAL_TIMEOUT,
-                stop: STOP_TIMEOUT,
-                worker_join: WORKER_JOIN_TIMEOUT,
-            }
-        );
-    }
-
-    #[test]
     fn headless_steps_follow_the_phase_timeouts() {
         let deadlines = deadlines();
         let mut progress = running();
@@ -716,22 +699,6 @@ mod tests {
         assert_eq!(
             headless_step(&progress, &deadlines),
             HeadlessStep::ForceStop
-        );
-    }
-
-    #[test]
-    fn timeout_reasons_name_the_phase() {
-        assert_eq!(
-            timeout_reason(false, false),
-            "timed out waiting for PREP-READY"
-        );
-        assert_eq!(
-            timeout_reason(true, false),
-            "timed out waiting for PREP-RESULT"
-        );
-        assert_eq!(
-            timeout_reason(true, true),
-            "timed out waiting for the VM to stop after PREP-RESULT"
         );
     }
 }

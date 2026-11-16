@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn root_paths_render_below_slash_root_as_before() {
+    fn root_paths_render_below_slash_root() {
         let root = VmUser::root();
         let cargo = GuestPath::new(".cargo");
         assert_eq!(cargo, GuestPath::Home(".cargo".into()));

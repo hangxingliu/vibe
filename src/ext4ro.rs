@@ -8,12 +8,30 @@
 //!
 //! `image_probe` and the maintenance VM checks read through this module.
 //! Provision is a production caller, via `image_probe`. The run path is not.
+//!
+//! Read path: `open` reads the superblock at byte 1024 of the partition and
+//! derives the block size, inode size and group geometry from it. The group
+//! descriptor table starts in the block after `s_first_data_block`; from each
+//! descriptor only the inode table location is kept. An inode number then
+//! maps to a group and a slot in that group's inode table. File contents are
+//! located through the extent tree whose root lives in the inode's `i_block`.
+//! Directory contents are read the same way and scanned as linear entry
+//! blocks (hashed directory indexes are read as plain blocks). A path is
+//! resolved from the root inode (2) one component at a time: read the
+//! directory inode, look the name up in its blocks, and continue with the
+//! child inode until the final component.
 
 use std::{
     fs::File,
     io::{self, ErrorKind},
     os::unix::fs::FileExt,
 };
+
+mod dir;
+mod extent;
+mod inode;
+
+use inode::Inode;
 
 const EXT4_MAGIC: u16 = 0xEF53;
 const EXTENT_MAGIC: u16 = 0xF30A;
@@ -38,13 +56,22 @@ const S_IFDIR: u16 = 0x4000;
 const S_IFREG: u16 = 0x8000;
 const S_IFLNK: u16 = 0xA000;
 const S_IFMT: u16 = 0xF000;
+/// Caps the inode table list built in `open`, so a superblock with a huge
+/// group count cannot force a huge allocation or millions of reads.
 const MAX_GROUPS: u64 = 100_000;
+/// Caps extent tree depth, so a crafted tree cannot recurse deeply.
 const MAX_EXTENT_DEPTH: u16 = 5;
+/// Caps the extent tree blocks visited per inode, so index entries that point
+/// back at shared blocks cannot fan out into an effectively endless walk.
 const MAX_EXTENT_NODES: usize = 64;
+/// Caps the extents collected per inode, bounding memory and the overlap sort.
 const MAX_EXTENTS: usize = 4096;
+/// Caps a symlink target, so a forged size cannot request a huge buffer.
 const MAX_SYMLINK_LEN: u64 = 4096;
 /// Stop a directory walk after this many bytes so a hostile tree cannot loop.
+/// It also bounds the work for a directory with a forged huge size.
 const DIR_SCAN_LIMIT: u64 = 4 * 1024 * 1024;
+/// Caps path components, bounding the number of directory lookups per path.
 const MAX_PATH_COMPONENTS: usize = 64;
 
 pub(crate) trait ReadAt {
@@ -98,31 +125,12 @@ pub(crate) enum FileRead {
     Other,
 }
 
-struct Inode {
-    mode: u16,
-    uid: u32,
-    gid: u32,
-    flags: u32,
-    /// Size used for regular files and directories (includes `i_size_high`).
-    size: u64,
-    /// Low 32 bits, which is the whole size of a symlink.
-    size_lo: u32,
-    iblock: [u8; 60],
-}
-
 /// `lstat` of one path. The final symlink is not followed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FileMeta {
     pub mode: u16,
     pub uid: u32,
     pub gid: u32,
-}
-
-struct Extent {
-    logical: u32,
-    len: u32,
-    start: u64,
-    uninit: bool,
 }
 
 enum Walked {
@@ -168,101 +176,48 @@ impl<R: ReadAt> Ext4Ro<R> {
         }
         let mut sb = vec![0u8; SB_NEED as usize];
         fs.read_absolute(offset + 1024, &mut sb)?;
+        let geometry = parse_superblock(&sb, len)?;
+        fs.fs_bytes = geometry.fs_bytes;
+        fs.block_size = geometry.block_size;
+        fs.inode_size = geometry.inode_size;
+        fs.inodes_per_group = geometry.inodes_per_group;
+        fs.inodes_count = geometry.inodes_count;
+        fs.blocks_count = geometry.blocks_count;
+        fs.filetype = geometry.filetype;
+        fs.inode_tables = fs.read_inode_tables(&geometry)?;
+        Ok(fs)
+    }
 
-        if u16_at(&sb, 0x38)? != EXT4_MAGIC {
-            return Err(Ext4Error::Corrupt("bad superblock magic"));
-        }
-        let rev = u32_at(&sb, 0x4C)?;
-        let incompat = if rev == 0 { 0 } else { u32_at(&sb, 0x60)? };
-        if incompat & INCOMPAT_RECOVER != 0 {
-            return Err(Ext4Error::Unsupported("needs_recovery"));
-        }
-        if incompat & !INCOMPAT_ALLOWED != 0 {
-            return Err(Ext4Error::Unsupported("unsupported incompat features"));
-        }
-        let log_block = u32_at(&sb, 0x18)?;
-        if log_block > 6 {
-            return Err(Ext4Error::Unsupported("unsupported block size"));
-        }
-        let block_size = 1024u64 << log_block;
-        let blocks_lo = u32_at(&sb, 0x04)? as u64;
-        let blocks_hi = if incompat & INCOMPAT_64BIT != 0 {
-            u32_at(&sb, 0x150)? as u64
-        } else {
-            0
-        };
-        let blocks_count = blocks_lo | (blocks_hi << 32);
-        if blocks_count == 0 {
-            return Err(Ext4Error::Corrupt("filesystem has no blocks"));
-        }
-        let fs_bytes = blocks_count
-            .checked_mul(block_size)
-            .ok_or(Ext4Error::Corrupt("size overflow"))?;
-        if fs_bytes > len {
-            return Err(Ext4Error::Corrupt("filesystem larger than the partition"));
-        }
-        let inode_size = if rev == 0 {
-            128u64
-        } else {
-            u64::from(u16_at(&sb, 0x58)?)
-        };
-        if inode_size < 128 || inode_size > block_size {
-            return Err(Ext4Error::Unsupported("unsupported inode size"));
-        }
-        let inodes_count = u32_at(&sb, 0x00)?;
-        let inodes_per_group = u32_at(&sb, 0x28)?;
-        let blocks_per_group = u32_at(&sb, 0x20)?;
-        if inodes_count == 0 || inodes_per_group == 0 || blocks_per_group == 0 {
-            return Err(Ext4Error::Corrupt("invalid group size"));
-        }
-        let groups_b = div_ceil(blocks_count, u64::from(blocks_per_group))?;
-        let groups_i = div_ceil(u64::from(inodes_count), u64::from(inodes_per_group))?;
-        if groups_b != groups_i || groups_b == 0 || groups_b > MAX_GROUPS {
-            return Err(Ext4Error::Corrupt("invalid group count"));
-        }
-        let desc_size: u64 = if incompat & INCOMPAT_64BIT != 0 {
-            let desc = u16_at(&sb, 0xFE)?;
-            if !(64..=1024).contains(&desc) || !desc.is_multiple_of(8) {
-                return Err(Ext4Error::Unsupported("group descriptor size"));
-            }
-            u64::from(desc)
-        } else {
-            32
-        };
-        let first_data = u32_at(&sb, 0x14)?;
-        if u64::from(first_data) >= blocks_count {
-            return Err(Ext4Error::Corrupt("first data block is out of range"));
-        }
-        fs.fs_bytes = fs_bytes;
-        fs.block_size = block_size;
-        fs.inode_size = inode_size;
-        fs.inodes_per_group = inodes_per_group;
-        fs.inodes_count = inodes_count;
-        fs.blocks_count = blocks_count;
-        fs.filetype = incompat & INCOMPAT_FILETYPE != 0;
-
-        let gdt = (u64::from(first_data) + 1)
-            .checked_mul(block_size)
+    /// Read the inode table block of every group from the group descriptor
+    /// table. `self` must already carry the sizes from `geometry`, because
+    /// descriptor reads are bounded by `fs_bytes`.
+    fn read_inode_tables(&self, geometry: &Geometry) -> Result<Vec<u64>, Ext4Error> {
+        // The group descriptor table starts in the block after the one that
+        // holds the superblock, that is at block `first_data_block + 1`.
+        let gdt = (u64::from(geometry.first_data_block) + 1)
+            .checked_mul(geometry.block_size)
             .ok_or(Ext4Error::Corrupt("size overflow"))?;
         let table_blocks = div_ceil(
-            u64::from(inodes_per_group)
-                .checked_mul(inode_size)
+            u64::from(geometry.inodes_per_group)
+                .checked_mul(geometry.inode_size)
                 .ok_or(Ext4Error::Corrupt("size overflow"))?,
-            block_size,
+            geometry.block_size,
         )?;
-        let mut inode_tables = Vec::with_capacity(groups_b as usize);
-        for group in 0..groups_b {
+        let mut inode_tables = Vec::with_capacity(geometry.groups as usize);
+        for group in 0..geometry.groups {
             let desc_off = gdt
                 .checked_add(
                     group
-                        .checked_mul(desc_size)
+                        .checked_mul(geometry.desc_size)
                         .ok_or(Ext4Error::Corrupt("size overflow"))?,
                 )
                 .ok_or(Ext4Error::Corrupt("size overflow"))?;
-            let mut desc = vec![0u8; desc_size as usize];
-            fs.read_at_fs(desc_off, &mut desc)?;
+            let mut desc = vec![0u8; geometry.desc_size as usize];
+            self.read_at_fs(desc_off, &mut desc)?;
+            // 0x08 bg_inode_table_lo, 0x28 bg_inode_table_hi. The high half
+            // exists only in descriptors of at least 0x2C bytes.
             let lo = u32_at(&desc, 0x08)? as u64;
-            let hi = if desc_size >= 0x2C {
+            let hi = if geometry.desc_size >= 0x2C {
                 u32_at(&desc, 0x28)? as u64
             } else {
                 0
@@ -271,13 +226,12 @@ impl<R: ReadAt> Ext4Ro<R> {
             let table_end = table
                 .checked_add(table_blocks)
                 .ok_or(Ext4Error::Corrupt("size overflow"))?;
-            if table == 0 || table_end > blocks_count {
+            if table == 0 || table_end > geometry.blocks_count {
                 return Err(Ext4Error::Corrupt("inode table is out of range"));
             }
             inode_tables.push(table);
         }
-        fs.inode_tables = inode_tables;
-        Ok(fs)
+        Ok(inode_tables)
     }
 
     /// Read `path` without following symlinks.
@@ -380,283 +334,6 @@ impl<R: ReadAt> Ext4Ro<R> {
         self.read_mapped(inode, inode.size, max_len)
     }
 
-    fn read_mapped(&self, inode: &Inode, size: u64, max_len: usize) -> Result<Vec<u8>, Ext4Error> {
-        if inode.flags & EXTENTS_FL == 0 {
-            return Err(Ext4Error::Unsupported("inode is not extent-mapped"));
-        }
-        if size > max_len as u64 {
-            return Err(Ext4Error::TooLarge);
-        }
-        let extents = self.load_extents(&inode.iblock)?;
-        let mut out = vec![0u8; size as usize];
-        for extent in &extents {
-            let start = u64::from(extent.logical)
-                .checked_mul(self.block_size)
-                .ok_or(Ext4Error::Corrupt("size overflow"))?;
-            if start >= size {
-                continue;
-            }
-            let extent_bytes = u64::from(extent.len)
-                .checked_mul(self.block_size)
-                .ok_or(Ext4Error::Corrupt("size overflow"))?;
-            let copy = extent_bytes.min(size - start);
-            if extent.uninit {
-                continue;
-            }
-            let mut done = 0u64;
-            while done < copy {
-                let block_index = done / self.block_size;
-                let block_off = done % self.block_size;
-                let phys = extent
-                    .start
-                    .checked_add(block_index)
-                    .ok_or(Ext4Error::Corrupt("size overflow"))?;
-                let mut block = vec![0u8; self.block_size as usize];
-                self.read_block(phys, &mut block)?;
-                let n = ((self.block_size - block_off).min(copy - done)) as usize;
-                let dst = usize::try_from(start + done)
-                    .map_err(|_| Ext4Error::Corrupt("size overflow"))?;
-                let src = block_off as usize;
-                out[dst..dst + n].copy_from_slice(&block[src..src + n]);
-                done += n as u64;
-            }
-        }
-        Ok(out)
-    }
-
-    fn load_extents(&self, iblock: &[u8; 60]) -> Result<Vec<Extent>, Ext4Error> {
-        let mut nodes = 0usize;
-        let mut extents = Vec::new();
-        self.walk_extent_node(iblock, &mut nodes, &mut extents)?;
-        extents.sort_by_key(|extent| (extent.logical, extent.len));
-        for pair in extents.windows(2) {
-            let end = u64::from(pair[0].logical) + u64::from(pair[0].len);
-            if end > u64::from(pair[1].logical) {
-                return Err(Ext4Error::Corrupt("overlapping extents"));
-            }
-        }
-        Ok(extents)
-    }
-
-    fn walk_extent_node(
-        &self,
-        data: &[u8],
-        nodes: &mut usize,
-        extents: &mut Vec<Extent>,
-    ) -> Result<(), Ext4Error> {
-        *nodes += 1;
-        if *nodes > MAX_EXTENT_NODES {
-            return Err(Ext4Error::Corrupt("extent tree is too wide"));
-        }
-        if data.len() < 12 {
-            return Err(Ext4Error::Corrupt("truncated extent header"));
-        }
-        if u16_at(data, 0)? != EXTENT_MAGIC {
-            return Err(Ext4Error::Corrupt("bad extent magic"));
-        }
-        let entries = u16_at(data, 2)? as usize;
-        let max = u16_at(data, 4)? as usize;
-        let depth = u16_at(data, 6)?;
-        if depth > MAX_EXTENT_DEPTH {
-            return Err(Ext4Error::Corrupt("extent depth"));
-        }
-        if entries > max {
-            return Err(Ext4Error::Corrupt("extent header is inconsistent"));
-        }
-        let need = 12usize
-            .checked_add(
-                entries
-                    .checked_mul(12)
-                    .ok_or(Ext4Error::Corrupt("size overflow"))?,
-            )
-            .ok_or(Ext4Error::Corrupt("size overflow"))?;
-        if need > data.len() {
-            return Err(Ext4Error::Corrupt("extent entries do not fit"));
-        }
-        if depth == 0 {
-            for index in 0..entries {
-                let off = 12 + index * 12;
-                let logical = u32_at(data, off)?;
-                let ee_len = u16_at(data, off + 4)?;
-                let len = u32::from(ee_len & 0x7FFF);
-                if len == 0 {
-                    return Err(Ext4Error::Corrupt("extent length is zero"));
-                }
-                let start_hi = u16_at(data, off + 6)? as u64;
-                let start_lo = u32_at(data, off + 8)? as u64;
-                let start = start_lo | (start_hi << 32);
-                let end = start
-                    .checked_add(u64::from(len))
-                    .ok_or(Ext4Error::Corrupt("size overflow"))?;
-                if start == 0 || end > self.blocks_count {
-                    return Err(Ext4Error::Corrupt("extent block out of range"));
-                }
-                let logical_end = u64::from(logical)
-                    .checked_add(u64::from(len))
-                    .ok_or(Ext4Error::Corrupt("size overflow"))?;
-                if logical_end > u64::from(u32::MAX) {
-                    return Err(Ext4Error::Corrupt("extent logical block overflow"));
-                }
-                extents.push(Extent {
-                    logical,
-                    len,
-                    start,
-                    uninit: ee_len & 0x8000 != 0,
-                });
-                if extents.len() > MAX_EXTENTS {
-                    return Err(Ext4Error::Corrupt("too many extents"));
-                }
-            }
-            return Ok(());
-        }
-        for index in 0..entries {
-            let off = 12 + index * 12;
-            let leaf_lo = u32_at(data, off + 4)? as u64;
-            let leaf_hi = u16_at(data, off + 8)? as u64;
-            let leaf = leaf_lo | (leaf_hi << 32);
-            if leaf == 0 || leaf >= self.blocks_count {
-                return Err(Ext4Error::Corrupt("extent index block out of range"));
-            }
-            let mut block = vec![0u8; self.block_size as usize];
-            self.read_block(leaf, &mut block)?;
-            if block.len() < 12 {
-                return Err(Ext4Error::Corrupt("truncated extent header"));
-            }
-            let child_depth = u16_at(&block, 6)?;
-            if child_depth != depth - 1 {
-                return Err(Ext4Error::Corrupt("extent depth"));
-            }
-            self.walk_extent_node(&block, nodes, extents)?;
-        }
-        Ok(())
-    }
-
-    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Option<u32>, Ext4Error> {
-        if name.len() > 255 || dir.size == 0 {
-            return Ok(None);
-        }
-        if dir.flags & EXTENTS_FL == 0 {
-            return Err(Ext4Error::Unsupported("inode is not extent-mapped"));
-        }
-        let extents = self.load_extents(&dir.iblock)?;
-        let blocks = div_ceil(dir.size, self.block_size)?;
-        let max_blocks = DIR_SCAN_LIMIT / self.block_size;
-        let scan = blocks.min(max_blocks);
-        for logical in 0..scan {
-            let mut block = vec![0u8; self.block_size as usize];
-            if let Some((phys, uninit)) = self.phys_for(&extents, logical)?
-                && !uninit
-            {
-                self.read_block(phys, &mut block)?;
-            }
-            let valid = if logical + 1 == blocks {
-                (dir.size - logical * self.block_size) as usize
-            } else {
-                self.block_size as usize
-            };
-            if let Some(ino) = self.parse_dir_block(&block[..valid], name)? {
-                return Ok(Some(ino));
-            }
-        }
-        if blocks > max_blocks {
-            return Err(Ext4Error::Unsupported("directory too large"));
-        }
-        Ok(None)
-    }
-
-    fn phys_for(&self, extents: &[Extent], logical: u64) -> Result<Option<(u64, bool)>, Ext4Error> {
-        for extent in extents {
-            let start = u64::from(extent.logical);
-            let end = start + u64::from(extent.len);
-            if logical >= start && logical < end {
-                let phys = extent
-                    .start
-                    .checked_add(logical - start)
-                    .ok_or(Ext4Error::Corrupt("size overflow"))?;
-                return Ok(Some((phys, extent.uninit)));
-            }
-        }
-        Ok(None)
-    }
-
-    fn parse_dir_block(&self, block: &[u8], name: &[u8]) -> Result<Option<u32>, Ext4Error> {
-        let mut off = 0usize;
-        while off + 8 <= block.len() {
-            let ino = u32_at(block, off)?;
-            let rec_len = u16_at(block, off + 4)? as usize;
-            if rec_len == 0 {
-                return Err(Ext4Error::Corrupt("directory entry length"));
-            }
-            if rec_len < 8 || !rec_len.is_multiple_of(4) || off + rec_len > block.len() {
-                return Err(Ext4Error::Corrupt("directory entry length"));
-            }
-            if ino != 0 {
-                let (name_len, name_off) = if self.filetype {
-                    (block[off + 6] as usize, off + 8)
-                } else {
-                    (u16_at(block, off + 6)? as usize, off + 8)
-                };
-                if name_off + name_len > off + rec_len {
-                    return Err(Ext4Error::Corrupt("directory name does not fit"));
-                }
-                if &block[name_off..name_off + name_len] == name {
-                    return Ok(Some(ino));
-                }
-            }
-            off += rec_len;
-        }
-        Ok(None)
-    }
-
-    fn read_inode(&self, ino: u32) -> Result<Inode, Ext4Error> {
-        if ino == 0 || ino > self.inodes_count {
-            return Err(Ext4Error::Corrupt("inode number is out of range"));
-        }
-        let group = (ino - 1) / self.inodes_per_group;
-        let index = (ino - 1) % self.inodes_per_group;
-        let table = self
-            .inode_tables
-            .get(group as usize)
-            .copied()
-            .ok_or(Ext4Error::Corrupt("inode group is out of range"))?;
-        let off = table
-            .checked_mul(self.block_size)
-            .and_then(|base| base.checked_add(u64::from(index) * self.inode_size))
-            .ok_or(Ext4Error::Corrupt("size overflow"))?;
-        let mut raw = vec![0u8; self.inode_size as usize];
-        self.read_at_fs(off, &mut raw)?;
-        if raw.len() < 0x28 + 60 {
-            return Err(Ext4Error::Corrupt("inode is truncated"));
-        }
-        let size_lo = u32_at(&raw, 0x04)?;
-        let size_hi = if self.inode_size >= 0x70 {
-            u32_at(&raw, 0x6C)?
-        } else {
-            0
-        };
-        let uid_lo = u32::from(u16_at(&raw, 0x02)?);
-        let gid_lo = u32::from(u16_at(&raw, 0x18)?);
-        let (uid_hi, gid_hi) = if raw.len() >= 0x7C {
-            (
-                u32::from(u16_at(&raw, 0x78)?),
-                u32::from(u16_at(&raw, 0x7A)?),
-            )
-        } else {
-            (0, 0)
-        };
-        let mut iblock = [0u8; 60];
-        iblock.copy_from_slice(&raw[0x28..0x28 + 60]);
-        Ok(Inode {
-            mode: u16_at(&raw, 0x00)?,
-            uid: uid_lo | (uid_hi << 16),
-            gid: gid_lo | (gid_hi << 16),
-            flags: u32_at(&raw, 0x20)?,
-            size: u64::from(size_lo) | (u64::from(size_hi) << 32),
-            size_lo,
-            iblock,
-        })
-    }
-
     fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<(), Ext4Error> {
         if block >= self.blocks_count || buf.len() as u64 != self.block_size {
             return Err(Ext4Error::Corrupt("block out of range"));
@@ -700,6 +377,117 @@ impl<R: ReadAt> Ext4Ro<R> {
     }
 }
 
+/// Filesystem layout values from the superblock, checked for consistency.
+struct Geometry {
+    /// `blocks_count * block_size`, never more than the partition length.
+    fs_bytes: u64,
+    block_size: u64,
+    inode_size: u64,
+    inodes_per_group: u32,
+    inodes_count: u32,
+    blocks_count: u64,
+    /// Number of block groups, equal to the number of group descriptors.
+    groups: u64,
+    desc_size: u64,
+    first_data_block: u32,
+    filetype: bool,
+}
+
+/// Parse and validate the superblock `sb`, read from a partition of `len`
+/// bytes.
+fn parse_superblock(sb: &[u8], len: u64) -> Result<Geometry, Ext4Error> {
+    // 0x38 s_magic
+    if u16_at(sb, 0x38)? != EXT4_MAGIC {
+        return Err(Ext4Error::Corrupt("bad superblock magic"));
+    }
+    // 0x4C s_rev_level. Revision 0 has no feature fields and a fixed
+    // 128-byte inode; 0x60 s_feature_incompat exists from revision 1.
+    let rev = u32_at(sb, 0x4C)?;
+    let incompat = if rev == 0 { 0 } else { u32_at(sb, 0x60)? };
+    if incompat & INCOMPAT_RECOVER != 0 {
+        return Err(Ext4Error::Unsupported("needs_recovery"));
+    }
+    if incompat & !INCOMPAT_ALLOWED != 0 {
+        return Err(Ext4Error::Unsupported("unsupported incompat features"));
+    }
+    // 0x18 s_log_block_size: block size is 1024 << value (up to 64 KiB).
+    let log_block = u32_at(sb, 0x18)?;
+    if log_block > 6 {
+        return Err(Ext4Error::Unsupported("unsupported block size"));
+    }
+    let block_size = 1024u64 << log_block;
+    // 0x04 s_blocks_count_lo, 0x150 s_blocks_count_hi (64bit feature only).
+    let blocks_lo = u32_at(sb, 0x04)? as u64;
+    let blocks_hi = if incompat & INCOMPAT_64BIT != 0 {
+        u32_at(sb, 0x150)? as u64
+    } else {
+        0
+    };
+    let blocks_count = blocks_lo | (blocks_hi << 32);
+    if blocks_count == 0 {
+        return Err(Ext4Error::Corrupt("filesystem has no blocks"));
+    }
+    let fs_bytes = blocks_count
+        .checked_mul(block_size)
+        .ok_or(Ext4Error::Corrupt("size overflow"))?;
+    if fs_bytes > len {
+        return Err(Ext4Error::Corrupt("filesystem larger than the partition"));
+    }
+    let inode_size = if rev == 0 {
+        128u64
+    } else {
+        // 0x58 s_inode_size
+        u64::from(u16_at(sb, 0x58)?)
+    };
+    if inode_size < 128 || inode_size > block_size {
+        return Err(Ext4Error::Unsupported("unsupported inode size"));
+    }
+    // 0x00 s_inodes_count, 0x28 s_inodes_per_group, 0x20 s_blocks_per_group
+    let inodes_count = u32_at(sb, 0x00)?;
+    let inodes_per_group = u32_at(sb, 0x28)?;
+    let blocks_per_group = u32_at(sb, 0x20)?;
+    if inodes_count == 0 || inodes_per_group == 0 || blocks_per_group == 0 {
+        return Err(Ext4Error::Corrupt("invalid group size"));
+    }
+    // Every group has one descriptor and one inode table, so counting the
+    // groups by blocks and by inodes must agree. A mismatch means the
+    // superblock is corrupt, and either count could index past the
+    // descriptor table.
+    let groups_b = div_ceil(blocks_count, u64::from(blocks_per_group))?;
+    let groups_i = div_ceil(u64::from(inodes_count), u64::from(inodes_per_group))?;
+    if groups_b != groups_i || groups_b == 0 || groups_b > MAX_GROUPS {
+        return Err(Ext4Error::Corrupt("invalid group count"));
+    }
+    let desc_size: u64 = if incompat & INCOMPAT_64BIT != 0 {
+        // 0xFE s_desc_size; without the 64bit feature descriptors are 32 bytes.
+        let desc = u16_at(sb, 0xFE)?;
+        if !(64..=1024).contains(&desc) || !desc.is_multiple_of(8) {
+            return Err(Ext4Error::Unsupported("group descriptor size"));
+        }
+        u64::from(desc)
+    } else {
+        32
+    };
+    // 0x14 s_first_data_block: the block that holds the superblock. It is 1
+    // for 1 KiB blocks, where block 0 is the boot sector, and 0 otherwise.
+    let first_data = u32_at(sb, 0x14)?;
+    if u64::from(first_data) >= blocks_count {
+        return Err(Ext4Error::Corrupt("first data block is out of range"));
+    }
+    Ok(Geometry {
+        fs_bytes,
+        block_size,
+        inode_size,
+        inodes_per_group,
+        inodes_count,
+        blocks_count,
+        groups: groups_b,
+        desc_size,
+        first_data_block: first_data,
+        filetype: incompat & INCOMPAT_FILETYPE != 0,
+    })
+}
+
 fn div_ceil(n: u64, d: u64) -> Result<u64, Ext4Error> {
     if d == 0 {
         return Err(Ext4Error::Corrupt("size overflow"));
@@ -728,678 +516,9 @@ fn u32_at(buf: &[u8], off: usize) -> Result<u32, Ext4Error> {
 }
 
 #[cfg(test)]
-pub(crate) struct MemReader<'a>(pub &'a [u8]);
+mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::{gunzip_ext4_fixture, sample_ext4_image};
 
 #[cfg(test)]
-impl ReadAt for MemReader<'_> {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        let start = usize::try_from(offset)
-            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "offset"))?;
-        if start >= self.0.len() {
-            return Err(io::Error::new(ErrorKind::UnexpectedEof, "eof"));
-        }
-        let n = buf.len().min(self.0.len() - start);
-        buf[..n].copy_from_slice(&self.0[start..start + n]);
-        Ok(n)
-    }
-}
-
-/// Minimal extent-mapped ext4 used by in-memory tests. Layout (4 KiB blocks):
-/// block 0 superblock, 1 group descriptor, 4 inode table, 5 root directory,
-/// 6 `hello`, 7 long symlink, 8–9 hole file, 10 extent index, 11 `deep`.
-#[cfg(test)]
-pub(crate) fn sample_ext4_image() -> Vec<u8> {
-    const BS: usize = 4096;
-    const BLOCKS: usize = 16;
-    const INODE_SIZE: usize = 256;
-    let mut img = vec![0u8; BLOCKS * BS];
-    put_u32(&mut img, 1024, 16); // s_inodes_count at superblock + 0x00
-    put_u32(&mut img, 1024 + 0x04, BLOCKS as u32);
-    put_u32(&mut img, 1024 + 0x14, 0);
-    put_u32(&mut img, 1024 + 0x18, 2);
-    put_u32(&mut img, 1024 + 0x20, BLOCKS as u32);
-    put_u32(&mut img, 1024 + 0x28, 16);
-    put_u16(&mut img, 1024 + 0x38, EXT4_MAGIC);
-    put_u32(&mut img, 1024 + 0x4C, 1);
-    put_u16(&mut img, 1024 + 0x58, INODE_SIZE as u16);
-    put_u32(&mut img, 1024 + 0x60, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
-    put_u32(&mut img, BS + 0x08, 4);
-
-    write_extent_inode(&mut img, 2, S_IFDIR | 0o755, BS as u64, &[(0, 1, 5)]);
-    let hello = b"hello-ext4\n";
-    img[6 * BS..6 * BS + hello.len()].copy_from_slice(hello);
-    write_extent_inode(
-        &mut img,
-        3,
-        S_IFREG | 0o644,
-        hello.len() as u64,
-        &[(0, 1, 6)],
-    );
-    write_fast_symlink(&mut img, 4, b"fast-target");
-    let long = vec![b'L'; 80];
-    img[7 * BS..7 * BS + long.len()].copy_from_slice(&long);
-    write_extent_inode(
-        &mut img,
-        5,
-        S_IFLNK | 0o777,
-        long.len() as u64,
-        &[(0, 1, 7)],
-    );
-    img[8 * BS..8 * BS + 3].copy_from_slice(b"AAA");
-    img[9 * BS..9 * BS + 3].copy_from_slice(b"CCC");
-    write_extent_inode(
-        &mut img,
-        6,
-        S_IFREG | 0o644,
-        3 * BS as u64,
-        &[(0, 1, 8), (2, 1, 9)],
-    );
-    // Depth-1 extent tree: inode index -> block 10 -> leaf extent at block 11.
-    write_index_inode(&mut img, 7, S_IFREG | 0o644, 7, 10);
-    img[11 * BS..11 * BS + 7].copy_from_slice(b"deep-ok");
-    write_leaf_block(&mut img, 10, 0, 1, 11);
-    write_fast_symlink(&mut img, 8, b"hello");
-
-    let entries = [
-        DirEnt {
-            ino: 2,
-            name: ".",
-            ty: 2,
-        },
-        DirEnt {
-            ino: 2,
-            name: "..",
-            ty: 2,
-        },
-        DirEnt {
-            ino: 3,
-            name: "hello",
-            ty: 1,
-        },
-        DirEnt {
-            ino: 4,
-            name: "short",
-            ty: 7,
-        },
-        DirEnt {
-            ino: 5,
-            name: "long",
-            ty: 7,
-        },
-        DirEnt {
-            ino: 6,
-            name: "hole",
-            ty: 1,
-        },
-        DirEnt {
-            ino: 7,
-            name: "deep",
-            ty: 1,
-        },
-        DirEnt {
-            ino: 8,
-            name: "via",
-            ty: 7,
-        },
-    ];
-    write_dir_block(&mut img[5 * BS..6 * BS], &entries);
-    img
-}
-
-#[cfg(test)]
-struct DirEnt {
-    ino: u32,
-    name: &'static str,
-    ty: u8,
-}
-
-#[cfg(test)]
-fn sample_inode_offset(ino: u32) -> usize {
-    4 * 4096 + (ino as usize - 1) * 256
-}
-
-#[cfg(test)]
-fn write_extent_inode(img: &mut [u8], ino: u32, mode: u16, size: u64, extents: &[(u32, u16, u64)]) {
-    let off = sample_inode_offset(ino);
-    put_u16(img, off, mode);
-    put_u32(img, off + 0x04, size as u32);
-    put_u32(img, off + 0x6C, (size >> 32) as u32);
-    put_u32(img, off + 0x20, EXTENTS_FL);
-    write_extent_header(&mut img[off + 0x28..off + 0x28 + 60], extents);
-}
-
-#[cfg(test)]
-fn write_index_inode(img: &mut [u8], ino: u32, mode: u16, size: u64, leaf: u64) {
-    let off = sample_inode_offset(ino);
-    put_u16(img, off, mode);
-    put_u32(img, off + 0x04, size as u32);
-    put_u32(img, off + 0x20, EXTENTS_FL);
-    let ib = &mut img[off + 0x28..off + 0x28 + 60];
-    put_u16(ib, 0, EXTENT_MAGIC);
-    put_u16(ib, 2, 1);
-    put_u16(ib, 4, 4);
-    put_u16(ib, 6, 1);
-    put_u32(ib, 12, 0);
-    put_u32(ib, 16, leaf as u32);
-    put_u16(ib, 20, (leaf >> 32) as u16);
-}
-
-#[cfg(test)]
-fn write_leaf_block(img: &mut [u8], block: usize, logical: u32, len: u16, phys: u64) {
-    let off = block * 4096;
-    put_u16(img, off, EXTENT_MAGIC);
-    put_u16(img, off + 2, 1);
-    put_u16(img, off + 4, 340);
-    put_u16(img, off + 6, 0);
-    put_u32(img, off + 12, logical);
-    put_u16(img, off + 16, len);
-    put_u16(img, off + 18, (phys >> 32) as u16);
-    put_u32(img, off + 20, phys as u32);
-}
-
-#[cfg(test)]
-fn write_extent_header(iblock: &mut [u8], extents: &[(u32, u16, u64)]) {
-    put_u16(iblock, 0, EXTENT_MAGIC);
-    put_u16(iblock, 2, extents.len() as u16);
-    put_u16(iblock, 4, 4);
-    put_u16(iblock, 6, 0);
-    for (index, (logical, len, phys)) in extents.iter().enumerate() {
-        let off = 12 + index * 12;
-        put_u32(iblock, off, *logical);
-        put_u16(iblock, off + 4, *len);
-        put_u16(iblock, off + 6, (*phys >> 32) as u16);
-        put_u32(iblock, off + 8, *phys as u32);
-    }
-}
-
-#[cfg(test)]
-fn write_fast_symlink(img: &mut [u8], ino: u32, target: &[u8]) {
-    assert!(target.len() < 60);
-    let off = sample_inode_offset(ino);
-    put_u16(img, off, S_IFLNK | 0o777);
-    put_u32(img, off + 0x04, target.len() as u32);
-    img[off + 0x28..off + 0x28 + target.len()].copy_from_slice(target);
-}
-
-#[cfg(test)]
-fn write_dir_block(block: &mut [u8], entries: &[DirEnt]) {
-    let mut off = 0usize;
-    for (index, entry) in entries.iter().enumerate() {
-        let min = (8 + entry.name.len()).div_ceil(4) * 4;
-        let rec = if index + 1 == entries.len() {
-            block.len() - off
-        } else {
-            min
-        };
-        assert!(rec >= min && rec % 4 == 0 && off + rec <= block.len());
-        put_u32(block, off, entry.ino);
-        put_u16(block, off + 4, rec as u16);
-        block[off + 6] = entry.name.len() as u8;
-        block[off + 7] = entry.ty;
-        block[off + 8..off + 8 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
-        off += rec;
-    }
-    assert_eq!(off, block.len());
-}
-
-#[cfg(test)]
-fn put_u16(buf: &mut [u8], off: usize, value: u16) {
-    buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-#[cfg(test)]
-fn put_u32(buf: &mut [u8], off: usize, value: u32) {
-    buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-#[cfg(test)]
-fn open_sample(img: &[u8]) -> Ext4Ro<MemReader<'_>> {
-    Ext4Ro::open(MemReader(img), 0, img.len() as u64).unwrap()
-}
-
-/// Gzip images written by `tests/fixtures/make-ext4.sh`.
-/// Keep this list aligned with the names that script publishes.
-#[cfg(test)]
-const EXT4_FIXTURE_NAMES: &[&str] = &[
-    "ext4-new.img.gz",
-    "ext4-old.img.gz",
-    "ext4-mid-nonempty.img.gz",
-    "ext4-mid-symlink.img.gz",
-    "ext4-shadow-locked.img.gz",
-    "ext4-shadow-two.img.gz",
-    "ext4-shadow-none.img.gz",
-    "ext4-dbus-outside.img.gz",
-];
-
-#[cfg(test)]
-fn ext4_fixture_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
-
-/// Fixture names that are not regular files in `dir`.
-#[cfg(test)]
-fn missing_ext4_fixtures(dir: &std::path::Path) -> Vec<&'static str> {
-    EXT4_FIXTURE_NAMES
-        .iter()
-        .copied()
-        .filter(|name| !dir.join(name).is_file())
-        .collect()
-}
-
-/// Run `run_script` when any required gzip image is absent.
-/// A present regular file is left as it is.
-#[cfg(test)]
-fn prepare_ext4_fixtures(
-    dir: &std::path::Path,
-    run_script: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-    if missing_ext4_fixtures(dir).is_empty() {
-        return Ok(());
-    }
-    run_script()?;
-    let missing = missing_ext4_fixtures(dir);
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "tests/fixtures/make-ext4.sh did not create {}",
-            missing.join(", ")
-        ))
-    }
-}
-
-#[cfg(test)]
-fn run_make_ext4(script: &std::path::Path) -> Result<(), String> {
-    let output = std::process::Command::new("/bin/sh")
-        .arg(script)
-        .output()
-        .map_err(|err| format!("cannot run {}: {err}", script.display()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(format!(
-        "{} exited {}\n{}{}",
-        script.display(),
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    ))
-}
-
-/// Build the gitignored ext4 fixtures once per process when any one is missing.
-#[cfg(test)]
-fn ensure_ext4_fixtures() {
-    use std::sync::OnceLock;
-    static READY: OnceLock<Result<(), String>> = OnceLock::new();
-    let result = READY.get_or_init(|| {
-        let dir = ext4_fixture_dir();
-        let script = dir.join("make-ext4.sh");
-        prepare_ext4_fixtures(&dir, || {
-            eprintln!("ext4 fixtures missing; running {}", script.display());
-            run_make_ext4(&script)
-        })
-    });
-    if let Err(err) = result {
-        panic!("ext4 fixtures: {err}");
-    }
-}
-
-/// Gunzip one image from `tests/fixtures`, building the set first when needed.
-#[cfg(test)]
-pub(crate) fn gunzip_ext4_fixture(name: &str) -> Vec<u8> {
-    ensure_ext4_fixtures();
-    let path = ext4_fixture_dir().join(name);
-    let output = std::process::Command::new("/usr/bin/gzip")
-        .arg("-dc")
-        .arg(&path)
-        .output()
-        .unwrap_or_else(|err| panic!("gzip {name}: {err}"));
-    assert!(
-        output.status.success(),
-        "gzip {name}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output.stdout
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reads_regular_symlink_hole_and_extent_index() {
-        let img = sample_ext4_image();
-        let fs = open_sample(&img);
-        assert_eq!(
-            fs.read_file("/hello", 64).unwrap(),
-            FileRead::Regular(b"hello-ext4\n".to_vec())
-        );
-        assert_eq!(
-            fs.read_file("/short", 64).unwrap(),
-            FileRead::Symlink("fast-target".into())
-        );
-        assert_eq!(
-            fs.read_file("/long", 128).unwrap(),
-            FileRead::Symlink("L".repeat(80))
-        );
-        match fs.read_file("/hole", 64 * 1024).unwrap() {
-            FileRead::Regular(bytes) => {
-                assert_eq!(&bytes[..3], b"AAA");
-                assert!(bytes[4096..4099].iter().all(|b| *b == 0));
-                assert_eq!(&bytes[8192..8195], b"CCC");
-                assert_eq!(bytes.len(), 12288);
-            }
-            other => panic!("hole file: {other:?}"),
-        }
-        assert_eq!(
-            fs.read_file("/deep", 64).unwrap(),
-            FileRead::Regular(b"deep-ok".to_vec())
-        );
-        assert_eq!(fs.read_file("/missing", 64).unwrap(), FileRead::Missing);
-        let mut owned = img.clone();
-        let hello = sample_inode_offset(3);
-        put_u16(&mut owned, hello + 0x02, 7);
-        put_u16(&mut owned, hello + 0x18, 42);
-        put_u16(&mut owned, hello + 0x78, 1);
-        put_u16(&mut owned, hello + 0x7A, 2);
-        let fs = open_sample(&owned);
-        assert_eq!(
-            fs.lstat("/hello").unwrap(),
-            Some(FileMeta {
-                mode: S_IFREG | 0o644,
-                uid: (1 << 16) | 7,
-                gid: (2 << 16) | 42,
-            })
-        );
-        let link = fs.lstat("/short").unwrap().unwrap();
-        assert_eq!(link.mode & S_IFMT, S_IFLNK);
-        assert!(fs.lstat("/missing").unwrap().is_none());
-        assert!(matches!(
-            fs.read_file("/via/hello", 64),
-            Err(Ext4Error::Unsupported("symlink in path"))
-        ));
-    }
-
-    #[test]
-    fn fast_symlink_is_not_parsed_as_extents() {
-        let mut img = sample_ext4_image();
-        let off = sample_inode_offset(4);
-        // Extent magic at the start of i_block must stay literal target bytes.
-        img[off + 0x28] = 0x0A;
-        img[off + 0x29] = 0xF3;
-        img[off + 0x2A] = b'x';
-        img[off + 0x2B] = b'y';
-        img[off + 0x04] = 4;
-        let fs = open_sample(&img);
-        let expected = String::from_utf8_lossy(&[0x0A, 0xF3, b'x', b'y']).into_owned();
-        assert_eq!(
-            fs.read_file("/short", 64).unwrap(),
-            FileRead::Symlink(expected)
-        );
-    }
-
-    #[test]
-    fn uninitialized_extent_reads_as_zeros() {
-        let mut img = sample_ext4_image();
-        let len_off = sample_inode_offset(3) + 0x28 + 12 + 4;
-        let len = u16::from_le_bytes([img[len_off], img[len_off + 1]]) | 0x8000;
-        img[len_off..len_off + 2].copy_from_slice(&len.to_le_bytes());
-        let fs = open_sample(&img);
-        assert_eq!(
-            fs.read_file("/hello", 64).unwrap(),
-            FileRead::Regular(vec![0; 11])
-        );
-    }
-
-    #[test]
-    fn corrupt_images_fail_without_panicking() {
-        let mut bad_magic = sample_ext4_image();
-        bad_magic[1024 + 0x38] = 0;
-        assert!(matches!(
-            Ext4Ro::open(MemReader(&bad_magic), 0, bad_magic.len() as u64),
-            Err(Ext4Error::Corrupt("bad superblock magic"))
-        ));
-
-        let mut deep = sample_ext4_image();
-        let depth = sample_inode_offset(3) + 0x28 + 6;
-        deep[depth] = 6;
-        let fs = open_sample(&deep);
-        assert!(matches!(
-            fs.read_file("/hello", 64),
-            Err(Ext4Error::Corrupt("extent depth"))
-        ));
-
-        let mut zero_rec = sample_ext4_image();
-        zero_rec[5 * 4096 + 4] = 0;
-        zero_rec[5 * 4096 + 5] = 0;
-        let fs = open_sample(&zero_rec);
-        assert!(matches!(
-            fs.read_file("/hello", 64),
-            Err(Ext4Error::Corrupt("directory entry length"))
-        ));
-
-        let mut far = sample_ext4_image();
-        let start = sample_inode_offset(3) + 0x28 + 20;
-        far[start..start + 4].copy_from_slice(&100u32.to_le_bytes());
-        let fs = open_sample(&far);
-        assert!(matches!(
-            fs.read_file("/hello", 64),
-            Err(Ext4Error::Corrupt("extent block out of range"))
-        ));
-    }
-
-    #[test]
-    fn file_over_the_cap_is_rejected() {
-        let img = sample_ext4_image();
-        let fs = open_sample(&img);
-        assert!(matches!(
-            fs.read_file("/hole", 100),
-            Err(Ext4Error::TooLarge)
-        ));
-    }
-
-    #[test]
-    fn mkfs_fixtures_match_old_and_new_features() {
-        let new = gunzip_ext4_fixture("ext4-new.img.gz");
-        let fs = Ext4Ro::open(MemReader(&new), 0, new.len() as u64).unwrap();
-        assert_eq!(
-            fs.read_file("/etc/os-release", 4096).unwrap(),
-            FileRead::Symlink("../usr/lib/os-release".into())
-        );
-        match fs.read_file("/usr/lib/os-release", 4096).unwrap() {
-            FileRead::Regular(bytes) => assert!(bytes.windows(9).any(|w| w == b"ID=debian")),
-            other => panic!("os-release: {other:?}"),
-        }
-        match fs.read_file("/etc/debian_version", 64).unwrap() {
-            FileRead::Regular(bytes) => assert_eq!(bytes, b"13.7\n"),
-            other => panic!("debian_version: {other:?}"),
-        }
-        assert_eq!(
-            fs.read_file("/etc/machine-id", 64).unwrap(),
-            FileRead::Regular(Vec::new())
-        );
-        assert_eq!(
-            fs.read_file("/etc/short", 64).unwrap(),
-            FileRead::Symlink("fast-target".into())
-        );
-        match fs.read_file("/etc/long", 128).unwrap() {
-            FileRead::Symlink(target) => assert_eq!(target.len(), 70),
-            other => panic!("long symlink: {other:?}"),
-        }
-        assert!(matches!(
-            fs.read_file("/many/f000", 16).unwrap(),
-            FileRead::Regular(_)
-        ));
-        assert!(matches!(
-            fs.read_file("/many/f599", 16).unwrap(),
-            FileRead::Regular(_)
-        ));
-
-        let old = gunzip_ext4_fixture("ext4-old.img.gz");
-        let fs = Ext4Ro::open(MemReader(&old), 0, old.len() as u64).unwrap();
-        match fs.read_file("/etc/debian_version", 64).unwrap() {
-            FileRead::Regular(bytes) => assert_eq!(bytes, b"13.3\n"),
-            other => panic!("old debian_version: {other:?}"),
-        }
-        match fs.read_file("/etc/os-release", 4096).unwrap() {
-            FileRead::Regular(bytes) => assert!(bytes.windows(9).any(|w| w == b"ID=debian")),
-            other => panic!("old os-release: {other:?}"),
-        }
-        match fs.read_file("/etc/long", 128).unwrap() {
-            FileRead::Symlink(target) => assert_eq!(target.len(), 70),
-            other => panic!("old long symlink: {other:?}"),
-        }
-    }
-
-    #[test]
-    #[ignore = "set VIBE_TEST_DEBIAN_NEW_RAW and VIBE_TEST_DEBIAN_OLD_RAW"]
-    fn real_debian_root_matches_recorded_files() {
-        let Some(new) = std::env::var("VIBE_TEST_DEBIAN_NEW_RAW").ok() else {
-            eprintln!("skipping real ext4 fixtures; set VIBE_TEST_DEBIAN_NEW_RAW");
-            return;
-        };
-        let Some(old) = std::env::var("VIBE_TEST_DEBIAN_OLD_RAW").ok() else {
-            eprintln!("skipping real ext4 fixtures; set VIBE_TEST_DEBIAN_OLD_RAW");
-            return;
-        };
-        assert_real_root(&new, b"13.7\n", b"uninitialized\n", false);
-        assert_real_root(&old, b"13.3\n", b"", true);
-    }
-
-    fn assert_real_root(path: &str, version: &[u8], machine_id: &[u8], password_empty: bool) {
-        use crate::gpt::{read_gpt, select_layout};
-        use std::fs::File;
-        let file = File::open(path).unwrap();
-        let len = file.metadata().unwrap().len();
-        let mut cursor = File::open(path).unwrap();
-        let gpt = read_gpt(&mut cursor).unwrap();
-        let layout = select_layout(&gpt, len).unwrap();
-        let offset = layout.root.first_lba * 512;
-        let part_len = (layout.root.last_lba - layout.root.first_lba + 1) * 512;
-        let fs = Ext4Ro::open(&file, offset, part_len).unwrap();
-        assert!(matches!(
-            fs.read_file("/etc/os-release", 4096).unwrap(),
-            FileRead::Symlink(target) if target == "../usr/lib/os-release"
-        ));
-        match fs.read_file("/etc/debian_version", 64).unwrap() {
-            FileRead::Regular(bytes) => assert_eq!(bytes, version, "{path}"),
-            other => panic!("{path} debian_version: {other:?}"),
-        }
-        match fs.read_file("/etc/machine-id", 64).unwrap() {
-            FileRead::Regular(bytes) => assert_eq!(bytes, machine_id, "{path}"),
-            other => panic!("{path} machine-id: {other:?}"),
-        }
-        let mut shadow = match fs.read_file("/etc/shadow", 1024 * 1024).unwrap() {
-            FileRead::Regular(bytes) => bytes,
-            other => panic!("{path} shadow: {other:?}"),
-        };
-        let empty = shadow
-            .split(|byte| *byte == b'\n')
-            .any(|line| line.starts_with(b"root:") && line.get(5).copied() == Some(b':'));
-        shadow.fill(0);
-        assert_eq!(empty, password_empty, "{path}");
-    }
-
-    #[test]
-    fn fuzz_rewrites_do_not_panic_or_hang() {
-        let base = gunzip_ext4_fixture("ext4-new.img.gz");
-        let mut state = 0x1234_5678_9abc_def0u64;
-        for _ in 0..24 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let mut img = base.clone();
-            for step in 0..4 {
-                let idx = (state.wrapping_add(step * 17) as usize) % img.len();
-                img[idx] ^= (state >> 8) as u8;
-            }
-            let Ok(fs) = Ext4Ro::open(MemReader(&img), 0, img.len() as u64) else {
-                continue;
-            };
-            let _ = fs.read_file("/etc/os-release", 64 * 1024);
-            let _ = fs.read_file("/usr/lib/os-release", 64 * 1024);
-            let _ = fs.read_file("/etc/shadow", 1024 * 1024);
-            let _ = fs.read_file("/many/f010", 64);
-        }
-    }
-
-    fn scratch_fixtures(label: &str) -> ScratchDir {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "vibe-ext4-fix-{label}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        ScratchDir(path)
-    }
-
-    struct ScratchDir(std::path::PathBuf);
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn missing_ext4_fixtures_lists_absent_names() {
-        let dir = scratch_fixtures("missing");
-        assert_eq!(missing_ext4_fixtures(&dir.0).as_slice(), EXT4_FIXTURE_NAMES);
-        std::fs::write(dir.0.join("ext4-new.img.gz"), b"gz").unwrap();
-        std::fs::create_dir(dir.0.join("ext4-old.img.gz")).unwrap();
-        let missing = missing_ext4_fixtures(&dir.0);
-        assert!(!missing.contains(&"ext4-new.img.gz"));
-        assert!(missing.contains(&"ext4-old.img.gz"));
-        assert!(missing.contains(&"ext4-shadow-none.img.gz"));
-    }
-
-    #[test]
-    fn prepare_ext4_fixtures_runs_the_script_only_when_one_is_missing() {
-        let dir = scratch_fixtures("prepare");
-        let mut calls = 0;
-        prepare_ext4_fixtures(&dir.0, || {
-            calls += 1;
-            for name in EXT4_FIXTURE_NAMES {
-                std::fs::write(dir.0.join(name), b"gz").unwrap();
-            }
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(calls, 1);
-
-        prepare_ext4_fixtures(&dir.0, || {
-            calls += 1;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(calls, 1);
-    }
-
-    #[test]
-    fn prepare_ext4_fixtures_reports_a_script_that_leaves_files_missing() {
-        let dir = scratch_fixtures("still-missing");
-        let err = prepare_ext4_fixtures(&dir.0, || Ok(())).unwrap_err();
-        assert!(err.contains("ext4-new.img.gz"), "{err}");
-        assert!(err.contains("ext4-dbus-outside.img.gz"), "{err}");
-    }
-
-    #[test]
-    fn prepare_ext4_fixtures_returns_the_script_error() {
-        let dir = scratch_fixtures("script-error");
-        let err = prepare_ext4_fixtures(&dir.0, || Err("mkfs.ext4 missing".into())).unwrap_err();
-        assert_eq!(err, "mkfs.ext4 missing");
-    }
-
-    #[test]
-    fn fixture_names_match_make_ext4_script() {
-        let script = ext4_fixture_dir().join("make-ext4.sh");
-        let text = std::fs::read_to_string(&script).unwrap();
-        for name in EXT4_FIXTURE_NAMES {
-            assert!(
-                text.contains(&format!("\"{name}\"")),
-                "{name} is not published by {}",
-                script.display()
-            );
-        }
-    }
-}
+mod tests;

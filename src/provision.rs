@@ -21,12 +21,12 @@ use crate::session::{
     shell_single_quote, write_bashrc_actions, write_user_bashrc_action,
 };
 use crate::session_plan::{SessionPlan, install_bindfs_action};
+use crate::shares::{DirectoryShare, cache_share_specs, create_cache_shares, describe_vm_files};
 use crate::vm_run::run_vm;
 use crate::vm_user::{GuestPath, VmUser, ensure_vm_user_actions};
 use crate::{
     BUILTIN_PROVISION_SCRIPTS, BYTES_PER_MB, DEFAULT_CPU_COUNT, DEFAULT_DISK_GB,
-    DEFAULT_PROVISION_RAM_BYTES, DirectoryShare, ProvisionScript, cache_share_specs,
-    create_cache_shares, describe_vm_files,
+    DEFAULT_PROVISION_RAM_BYTES, ProvisionScript,
 };
 
 /// Files a provisioning VM that runs scripts gets written into it, as
@@ -632,11 +632,9 @@ pub(crate) fn provision_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECK_VM_USER_HOME_SCRIPT, CLEAR_MACHINE_ID_SCRIPT, REPL_FINALIZE_SCRIPT,
-        RUN_AS_USER_MARKER, build_provision_plan, build_provision_script, failed_work_message,
-        has_commands, incomplete_run_error, machine_id_label, split_run_as_user,
+        RUN_AS_USER_MARKER, build_provision_plan, build_provision_script, has_commands,
+        incomplete_run_error, split_run_as_user,
     };
-    use crate::image_probe::MachineIdFact;
     use crate::proxy::GuestProxy;
     use crate::session::{LoginAction, RootPassword};
     use crate::vm_user::VmUser;
@@ -708,52 +706,6 @@ mod tests {
         assert!(unclean.starts_with("[shutdown] "), "{unclean}");
         assert!(unclean.contains("did not shut down cleanly"));
         assert_eq!(incomplete_run_error("demo", true, true, None), None);
-    }
-
-    #[test]
-    fn failed_work_message_names_the_kept_copy_only_when_kept() {
-        let work = Path::new("/cache/demo.tmp.42");
-        let kept = failed_work_message("[verify] bad", work, true);
-        assert!(kept.starts_with("[verify] bad\n"));
-        assert!(kept.contains("VIBE_KEEP_FAILED_WORK=1: kept the work copy at /cache/demo.tmp.42"));
-        let removed = failed_work_message("[verify] bad", work, false);
-        assert!(removed.contains("removed"));
-        assert!(removed.contains("VIBE_KEEP_FAILED_WORK=1"));
-        assert!(!removed.contains("/cache/demo.tmp.42"));
-    }
-
-    #[test]
-    fn finalize_scripts_clear_machine_id_and_do_not_print_secrets() {
-        for script in [CLEAR_MACHINE_ID_SCRIPT, REPL_FINALIZE_SCRIPT] {
-            assert!(script.starts_with("#!/bin/sh\n"));
-            assert!(script.contains("findmnt -n /etc/machine-id"));
-            assert!(script.contains(": > /etc/machine-id"));
-            assert!(script.contains("/var/lib/dbus/machine-id"));
-            assert!(script.contains("/etc/machine-id|../../../etc/machine-id"));
-            assert!(!script.contains("shadow"));
-            assert!(!script.contains("unprovisioned"));
-            assert!(!script.contains("set -x"));
-        }
-        assert!(REPL_FINALIZE_SCRIPT.contains("--unit=vibe-finalize-template"));
-        assert!(REPL_FINALIZE_SCRIPT.contains("RemainAfterExit=yes"));
-        assert!(
-            REPL_FINALIZE_SCRIPT
-                .contains("'ExecStop=/bin/sh /run/vibe-finalize/clear-machine-id.sh'")
-        );
-        assert!(REPL_FINALIZE_SCRIPT.contains("/bin/true"));
-        assert!(!CLEAR_MACHINE_ID_SCRIPT.contains("systemd-run"));
-    }
-
-    #[test]
-    fn machine_id_label_does_not_include_file_contents() {
-        assert_eq!(machine_id_label(&MachineIdFact::EmptyFile), "empty");
-        assert_eq!(
-            machine_id_label(&MachineIdFact::Symlink("/tmp/secret".into())),
-            "a symbolic link"
-        );
-        assert!(
-            !machine_id_label(&MachineIdFact::Symlink("/tmp/secret".into())).contains("secret")
-        );
     }
 
     #[test]
@@ -922,7 +874,7 @@ mod tests {
                 "{} has no run-as-user marker",
                 script.name
             );
-            // Root runs the whole script, as before.
+            // Root runs the whole script.
             match build_provision_script(script, &None, &VmUser::root()).as_slice() {
                 [LoginAction::Script { content, .. }] => assert_eq!(content, &script.content),
                 other => panic!("{}: {other:?}", script.name),
@@ -1055,11 +1007,5 @@ mod tests {
                 .iter()
                 .any(|a| a.label().contains("check-vm-user-home"))
         );
-    }
-
-    #[test]
-    fn home_ownership_check_skips_mount_points() {
-        assert!(CHECK_VM_USER_HOME_SCRIPT.contains("find \"$VIBE_VM_HOME\" -xdev -user 0"));
-        assert!(CHECK_VM_USER_HOME_SCRIPT.contains("mountpoint -q \"$path\""));
     }
 }

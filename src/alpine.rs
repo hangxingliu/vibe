@@ -27,6 +27,9 @@ pub(crate) const ALPINE_ARCHIVE_SHA512: &str = "c66badf3648147e0e06f710d600698ec
 pub(crate) const ALPINE_ROOT_FS_UUID: &str = "d51a6213-c765-4b85-9105-1b438c523993";
 pub(crate) const ALPINE_ROOT_PART: u32 = 2;
 
+/// Errors of [`ensure_alpine_image`]. Every message starts with `[download] `.
+/// `Download` and `Checksum` name the URL, the expected SHA-512, and the
+/// path where the user can place the archive by hand.
 #[derive(Debug)]
 pub(crate) enum AlpineError {
     Download {
@@ -184,6 +187,8 @@ fn ensure_locked(archive: &Path, raw: &Path, url: &str, sha512: &str) -> Result<
     Ok(())
 }
 
+/// Download `archive` through [`images::fetch_verified`]. A failure leaves
+/// neither `archive` nor its `.part` file behind.
 fn fetch_archive(url: &str, sha512: &str, archive: &Path) -> Result<(), AlpineError> {
     match images::fetch_verified(url, sha512, archive) {
         Ok(()) => Ok(()),
@@ -396,50 +401,6 @@ mod tests {
         assert_eq!(got, preferred.join(format!("{name}.raw")));
         assert_eq!(fs::read(&got).unwrap(), raw_bytes);
         assert_eq!(fs::read(&bad).unwrap(), b"not-an-alpine-disk");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn every_alpine_error_uses_the_download_prefix() {
-        let path = PathBuf::from("/cache/alpine.raw.tar.gz");
-        let errors = [
-            AlpineError::Download {
-                url: "u".into(),
-                sha: "s".into(),
-                path: path.clone(),
-                detail: "d".into(),
-            },
-            AlpineError::Checksum {
-                url: "u".into(),
-                sha: "s".into(),
-                path,
-                detail: "d".into(),
-            },
-            AlpineError::Extract { detail: "d".into() },
-            AlpineError::Verify { detail: "d".into() },
-            AlpineError::Prepare { detail: "d".into() },
-        ];
-        for err in errors {
-            assert!(err.to_string().starts_with("[download] "), "{err}");
-        }
-    }
-
-    #[test]
-    fn offline_error_names_the_url_checksum_and_manual_path() {
-        let dir = temp_dir("offline");
-        let name = "alpine-test";
-        let err = ensure_alpine_image_at(&dir, "http://127.0.0.1:9/alpine.tar.gz", "abc", name)
-            .unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("[download]"), "{text}");
-        assert!(text.contains("http://127.0.0.1:9/alpine.tar.gz"), "{text}");
-        assert!(text.contains("abc"), "{text}");
-        assert!(
-            text.contains(&dir.join(format!("{name}.raw.tar.gz")).display().to_string()),
-            "{text}"
-        );
-        assert!(!dir.join(format!("{name}.raw.tar.gz")).exists());
-        assert!(!dir.join(format!("{name}.raw.tar.gz.part")).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

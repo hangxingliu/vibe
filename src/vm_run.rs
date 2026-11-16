@@ -12,13 +12,13 @@ use std::{
 use objc2_foundation::*;
 use objc2_virtualization::VZVirtualMachineState;
 
-use crate::DirectoryShare;
 use crate::networking::PreparedNetworkBackend;
 use crate::session::{
     DiskSource, LoginAction, LoginFailure, RootPassword, VmOutput, action_prefix,
     legacy_login_prefix, needs_provision_hint, spawn_login_actions_thread,
 };
 use crate::session_plan::{SessionPlan, expand_session, notice_message, passwordless_root_warning};
+use crate::shares::DirectoryShare;
 use crate::vm_config::{VmSpec, create_vm_configuration, default_interactive_spec};
 use crate::vm_io::{OutputMonitor, create_pipe, spawn_vm_io};
 use crate::vm_lifecycle::{force_stop, request_stop, start_vm};

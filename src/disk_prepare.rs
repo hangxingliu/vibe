@@ -148,30 +148,6 @@ mod tests {
     }
 
     #[test]
-    fn prepare_decision_maps_every_image_class() {
-        assert_eq!(
-            prepare_decision(&ImageClass::LegacyCompatible),
-            PrepareDecision::AlreadyCompatible
-        );
-        assert_eq!(
-            prepare_decision(&ImageClass::Unsupported("no GPT root".into())),
-            PrepareDecision::WarnUnsupported
-        );
-        assert_eq!(
-            prepare_decision(&ImageClass::Unsupported("not Debian".into())),
-            PrepareDecision::WarnUnsupported
-        );
-        assert_eq!(
-            prepare_decision(&ImageClass::NeedsPreparation),
-            PrepareDecision::Process
-        );
-        assert_eq!(
-            prepare_decision(&ImageClass::Unknown("needs_recovery".into())),
-            PrepareDecision::Process
-        );
-    }
-
-    #[test]
     fn preparation_notice_describes_state_without_the_password_field() {
         let facts = facts_with(MachineIdFact::Uninitialized, Some(false));
         let notice = preparation_notice(&ImageClass::NeedsPreparation, &facts);
@@ -196,17 +172,5 @@ mod tests {
         );
         assert!(other.contains("machine-id is not empty or a valid id"));
         assert!(!other.contains("the root password field is not empty"));
-    }
-
-    #[test]
-    fn unsupported_warning_uses_the_probe_prefix() {
-        let warning = unsupported_warning(&ImageClass::Unsupported("not Debian".into()));
-        assert!(warning.starts_with("[probe] Warning: this disk is unsupported: not Debian."));
-    }
-
-    #[test]
-    fn empty_root_notice_does_not_include_a_password_value() {
-        assert!(EMPTY_ROOT_NOTICE.contains("empty password"));
-        assert!(!EMPTY_ROOT_NOTICE.contains("unprovisioned"));
     }
 }

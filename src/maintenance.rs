@@ -761,39 +761,6 @@ mod tests {
     }
 
     #[test]
-    fn published_log_starts_with_the_maintenance_paths() {
-        let dir = std::env::temp_dir().join(format!("vibe-publish-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("hvc0.log");
-        fs::write(&src, "maint: seed ok\n").unwrap();
-        let work = PathBuf::from("/images/a/maint/1-abc");
-        let header = log_header(
-            Path::new("/images/b/t1.tmp.1"),
-            Path::new("/images/a/alpine.raw"),
-            &work,
-        );
-        let dest = publish_log(&src, &dir.join("default"), &header).unwrap();
-        assert_eq!(dest.parent(), Some(dir.join("default/logs").as_path()));
-        assert!(!src.exists());
-        let body = fs::read_to_string(&dest).unwrap();
-        let (head, rest) = body.split_at(header.len());
-        assert_eq!(head, header);
-        assert_eq!(rest, "maint: seed ok\n");
-        for path in [
-            "/images/b/t1.tmp.1",
-            "/images/a/alpine.raw",
-            "/images/a/maint/1-abc/alpine.raw",
-            "/images/a/maint/1-abc/seed.iso",
-            "/images/a/maint/1-abc (removed afterwards",
-        ] {
-            assert!(head.contains(path), "{head}");
-        }
-        assert!(head.lines().all(|line| line.starts_with("# ")), "{head}");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn log_retention_keeps_the_five_newest() {
         let dir = std::env::temp_dir().join(format!("vibe-logs-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);

@@ -46,7 +46,7 @@ vibe provision [OPTIONS] [@name | path/to/script.sh ...]
 
 ## 单个脚本的执行方式
 
-`script_command`（`src/session.rs`）会将一个封装器输入到 root Shell 中。脚本主体经过 base64 编码，因此脚本中的引号不会破坏控制台命令行。控制台会显示该封装器。切勿在脚本中放置敏感信息，root 密码绝不会包含在文本中。
+`script_command`（`src/session/shell.rs`）会将一个封装器输入到 root Shell 中。脚本主体经过 base64 编码，因此脚本中的引号不会破坏控制台命令行。控制台会显示该封装器。切勿在脚本中放置敏感信息，root 密码绝不会包含在文本中。
 
 封装器会将脚本写入 `/tmp/vibe-scripts-<uid>/<id>.sh` 并执行。该目录的权限为 `700`，所有者为运行脚本的 UID。`<id>` 为 `script_` 加上其在完整登录操作列表中的索引。脚本应将状态保存在用户主目录或 `/etc` 下，而非 `/tmp` 中。
 

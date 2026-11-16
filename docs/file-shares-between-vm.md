@@ -7,7 +7,7 @@ It describes the current behavior. The measurements behind it were taken on an A
 
 ### Host side
 
-- `run_main` (`src/main.rs`) collects `DirectoryShare` values: the project directory, `--mount` entries, the caches, `node_modules`, and a read-only `.git`.
+- `run_run` (`src/run_command.rs`) collects `DirectoryShare` values: the project directory, `--mount` entries, the caches, `node_modules`, and a read-only `.git`.
 - Each share gets a tag `<basename>_<hash>` (`DirectoryShare::tag`, a djb2 hash of the host path).
 - `default_interactive_spec` (`src/vm_config.rs`) puts all shares into one VirtioFS device with the tag `shared`. The device holds a `VZMultipleDirectoryShare`. Each entry is a `VZSharedDirectory` with `readOnly` set from the share.
 - Read-only is enforced by the host. The guest cannot turn it off, not even as root.
@@ -182,5 +182,5 @@ Other UIDs are entered with `setpriv --reuid --regid --clear-groups`, so no acco
 ## 6. Sources
 
 - Linux v6.12: `fs/fuse/virtio_fs.c` (`virtio_fs_parameters`, `virtio_fs_parse_param`, `virtio_fs_fill_super`), `fs/fuse/inode.c` (`fuse_show_options`), `fs/fuse/dir.c` (`fuse_permission`).
-- Vibe: `src/main.rs` (`DirectoryShare`, `CacheShare`, `project_masks_and_shares`), `src/vm_config.rs` (VirtioFS device), `src/session_plan.rs` (staging, bind mounts, masks, `bindfs`).
+- Vibe: `src/shares.rs` (`DirectoryShare`, `CacheShare`, `project_masks_and_shares`), `src/vm_config.rs` (VirtioFS device), `src/session_plan.rs` (staging, bind mounts, masks, `bindfs`).
 - Boot sequence and the cache directory layout: [how-vm-boot.md](how-vm-boot.md).

@@ -7,7 +7,7 @@
 
 ### 宿主机端
 
-- `run_main`（`src/main.rs`）收集 `DirectoryShare` 值：项目目录、`--mount` 条目、各缓存、`node_modules` 以及只读的 `.git`。
+- `run_run`（`src/run_command.rs`）收集 `DirectoryShare` 值：项目目录、`--mount` 条目、各缓存、`node_modules` 以及只读的 `.git`。
 - 每个共享都会获得一个标签 `<basename>_<hash>`（`DirectoryShare::tag`，宿主机路径的 djb2 哈希值）。
 - `default_interactive_spec`（`src/vm_config.rs`）将所有共享放入一个标签为 `shared` 的 VirtioFS 设备中。该设备包含一个 `VZMultipleDirectoryShare`。每个条目都是一个 `VZSharedDirectory`，其 `readOnly` 属性根据共享设置。
 - 只读限制由宿主机强制执行。客户机无法关闭它，即使是 root 用户也不行。
@@ -182,5 +182,5 @@ apt 以 `_apt` 身份下载到 `archives/partial`（`0700`），而 root 进程�
 ## 6. 参考资料
 
 - Linux v6.12：`fs/fuse/virtio_fs.c`（`virtio_fs_parameters`、`virtio_fs_parse_param`、`virtio_fs_fill_super`），`fs/fuse/inode.c`（`fuse_show_options`），`fs/fuse/dir.c`（`fuse_permission`）。
-- Vibe：`src/main.rs`（`DirectoryShare`、`CacheShare`、`project_masks_and_shares`），`src/vm_config.rs`（VirtioFS 设备），`src/session_plan.rs`（暂存、bind 挂载、掩码、`bindfs`）。
+- Vibe：`src/shares.rs`（`DirectoryShare`、`CacheShare`、`project_masks_and_shares`），`src/vm_config.rs`（VirtioFS 设备），`src/session_plan.rs`（暂存、bind 挂载、掩码、`bindfs`）。
 - 启动顺序和缓存目录布局：[how-vm-boot.md](how-vm-boot.md)。

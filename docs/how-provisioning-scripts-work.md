@@ -46,7 +46,7 @@ A non-root `--repl` switches to the vm-user after that success marker. `exit` re
 
 ## How one script is executed
 
-`script_command` (`src/session.rs`) types a wrapper into the root shell. The script body is base64, so quotes in the script do not break the console line. The console shows the wrapper. Do not put secrets in a script. The root password is never part of that text.
+`script_command` (`src/session/shell.rs`) types a wrapper into the root shell. The script body is base64, so quotes in the script do not break the console line. The console shows the wrapper. Do not put secrets in a script. The root password is never part of that text.
 
 The wrapper writes `/tmp/vibe-scripts-<uid>/<id>.sh` and runs it. The directory is mode `700` and is owned by the uid that runs the script. `<id>` is `script_` plus the index in the full login-action list. Scripts should keep their state in the home directory or in `/etc`, not in `/tmp`.
 

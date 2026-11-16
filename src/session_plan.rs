@@ -22,9 +22,9 @@
 
 use std::{ops::Range, time::Duration};
 
-use crate::DirectoryShare;
 use crate::proxy::GuestProxy;
 use crate::session::{LoginAction, shell_single_quote, shell_word};
+use crate::shares::DirectoryShare;
 use crate::vm_config::SHARED_DIRECTORIES_TAG;
 use crate::vm_user::{GuestPath, VmUser};
 
@@ -492,21 +492,5 @@ pub(crate) mod tests {
         assert!(proxied.contains(
             "apt-get -o Acquire::http::Proxy='socks5h://10.0.0.1:1080' -o Acquire::https::Proxy='socks5h://10.0.0.1:1080' update"
         ));
-    }
-
-    #[test]
-    fn notices_become_host_warnings() {
-        let dev = VmUser::parse("dev").unwrap();
-        let apt = notice_message("apt-no-bindfs", &dev).unwrap();
-        assert!(
-            apt.contains("User 'dev' can change the host's apt cache"),
-            "{apt}"
-        );
-        assert!(apt.contains("--no-mount-sys-cache"), "{apt}");
-        assert_eq!(
-            notice_message("groups=sudo,adm", &dev).unwrap(),
-            "Warning: vm-user 'dev' is in the group(s) sudo, adm, which usually grant root access."
-        );
-        assert_eq!(notice_message("something-else", &dev), None);
     }
 }

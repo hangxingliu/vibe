@@ -78,7 +78,8 @@ impl NetworkMode {
                 let (vm_socket_fd, helper_socket_fd) = create_datagram_pair();
                 let helper_raw_fd = helper_socket_fd.as_raw_fd();
 
-                let (helper_liveness_read_fd, helper_liveness_write_fd) = crate::create_pipe();
+                let (helper_liveness_read_fd, helper_liveness_write_fd) =
+                    crate::vm_io::create_pipe();
                 let helper_liveness_raw_fd = helper_liveness_read_fd.as_raw_fd();
 
                 unsafe {

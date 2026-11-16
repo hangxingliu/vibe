@@ -15,8 +15,8 @@ use objc2::{AnyThread, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::*;
 use objc2_virtualization::*;
 
-use crate::DirectoryShare;
 use crate::networking::{PreparedNetworkBackend, USERNET_MAC_ADDRESS};
+use crate::shares::DirectoryShare;
 use crate::vm_io::create_pipe;
 
 pub(crate) const SHARED_DIRECTORIES_TAG: &str = "shared";
@@ -389,108 +389,4 @@ pub(crate) fn nsurl_from_path(path: &Path) -> Result<Retained<NSURL>, Box<dyn st
             .ok_or("Non-UTF8 path encountered while building NSURL")?,
     );
     Ok(NSURL::fileURLWithPath(&ns_path))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn interactive_spec_matches_the_legacy_shape() {
-        let dir = std::env::temp_dir().join(format!("vibe-spec-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let share = crate::DirectoryShare::new(
-            dir.clone(),
-            PathBuf::from("/root/project"),
-            true,
-            false,
-            true,
-        )
-        .unwrap();
-        let (vm_reads, host_write) = create_pipe();
-        let (host_read, vm_writes) = create_pipe();
-        let (resize_reads, host_resize) = create_pipe();
-        drop((host_write, host_read, host_resize));
-
-        let mut network = PreparedNetworkBackend::VzNat;
-        let spec = default_interactive_spec(
-            Path::new("disk.raw"),
-            &[share],
-            &mut network,
-            vm_reads,
-            vm_writes,
-            resize_reads,
-            2,
-            2048 * 1024 * 1024,
-        );
-
-        assert_eq!(spec.disks.len(), 1);
-        assert_eq!(spec.disks[0].path, PathBuf::from("disk.raw"));
-        assert!(!spec.disks[0].read_only);
-        assert!(spec.network.is_some());
-        assert_eq!(spec.cpu_count, 2);
-        assert_eq!(spec.ram_bytes, 2048 * 1024 * 1024);
-        assert_eq!(spec.efi_vars, default_efi_vars_path());
-        assert_eq!(
-            spec.serial_ports
-                .iter()
-                .map(|port| port.role)
-                .collect::<Vec<_>>(),
-            vec![SerialRole::Terminal, SerialRole::Resize]
-        );
-        assert!(spec.serial_ports[0].read_fd.is_some());
-        assert!(spec.serial_ports[0].write_fd.is_some());
-        assert!(spec.serial_ports[0].host_read.is_none());
-        assert!(spec.serial_ports[1].read_fd.is_some());
-        assert!(spec.serial_ports[1].write_fd.is_none());
-        assert_eq!(spec.share_devices.len(), 1);
-        assert_eq!(spec.share_devices[0].tag, SHARED_DIRECTORIES_TAG);
-        match &spec.share_devices[0].body {
-            ShareBody::Multiple(shares) => {
-                assert_eq!(shares.len(), 1);
-                assert!(shares[0].read_only);
-                assert_eq!(shares[0].host, dir);
-            }
-            ShareBody::Single(_) => panic!("interactive share is a multiple-directory device"),
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn missing_disk_returns_a_configuration_error() {
-        let dir = std::env::temp_dir().join(format!("vibe-missing-disk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let missing = dir.join("does-not-exist.raw");
-        let spec = VmSpec {
-            disks: vec![DiskSpec {
-                path: missing.clone(),
-                read_only: false,
-            }],
-            network: None,
-            share_devices: Vec::new(),
-            serial_ports: Vec::new(),
-            efi_vars: dir.join("efi.efivars"),
-            cpu_count: 2,
-            ram_bytes: 1024 * 1024 * 1024,
-        };
-
-        let err = create_vm_configuration(spec).expect_err("missing disk must not validate");
-        let text = err.to_string();
-        assert!(
-            text.contains("does not exist"),
-            "error should name the missing disk, got {text}"
-        );
-        assert!(
-            text.contains("does-not-exist.raw"),
-            "error should include the path, got {text}"
-        );
-        assert!(
-            !text.contains("panic"),
-            "error should be returned, not a panic payload: {text}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

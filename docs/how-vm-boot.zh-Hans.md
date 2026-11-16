@@ -97,7 +97,7 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 `parse_cli`（`lexopt`）用于填充 `CliArgs`。`run_main` 负责创建缓存目录，调用 `ensure_signed`，并准备一个包裹 `NetworkMode::prepare` 的闭包。各命令自行构建缓存共享：`cache_share_specs(sys_cache, mise, agents_conf)` 按 `MISE_CACHE_SHARE`、`SYS_CACHE_SHARES`、`AGENT_CONF_SHARES` 的顺序选取，`create_cache_shares` 只创建这些宿主机目录。每个 `CacheShare` 为 `Global`（`apt`，位于 `<cache>/apt`）或 `User`（位于 `<cache>/user-<vm-user>/<name>`）。进入各命令分支之前，如果将要挂载的用户缓存有旧的顶层目录而没有新目录，`legacy_cache_notice` 打印一次提示。
 
-在调用 `run_vm` 之前，run 与 provision 都会打印 `describe_vm_files`：目录共享（`host -> guest (mode)`）以及 Vibe 写入 VM 的文件，没有时打印 `(none)`。
+在调用 `run_vm` 之前，run 与 provision 都会打印 `describe_vm_files`：目录共享（`host -> guest (mode)`）以及 Vibe 写入 VM 的文件，没有时打印 `(none)`。运行计划设置了 `restrict_apt_cache` 时，apt 缓存的模式显示为 `read-write, read-only for <user> via bindfs if the image has it`。
 
 在 `nat` 模式下，`guest_proxy` 为 `None`：`vibe-usernet` 辅助程序自身会应用 `--proxy`，因此客户机不会额外接收代理环境变量。在 `vznat` 模式下，`--proxy` 的 URL 会被传递到配置脚本和登录环境变量导出中。
 

@@ -97,7 +97,7 @@ Every published image has an empty `/etc/machine-id`. Each instance therefore ge
 
 `parse_cli` (`lexopt`) fills `CliArgs`. `run_main` creates the cache directory, calls `ensure_signed`, and prepares a closure over `NetworkMode::prepare`. Each command builds its own cache shares: `cache_share_specs(sys_cache, mise, agents_conf)` picks from `MISE_CACHE_SHARE`, `SYS_CACHE_SHARES`, and `AGENT_CONF_SHARES` (in that order), and `create_cache_shares` creates only those host directories. Each `CacheShare` is `Global` (`apt`, at `<cache>/apt`) or `User` (at `<cache>/user-<vm-user>/<name>`). Before the command branches, `legacy_cache_notice` prints one note when a user cache about to be mounted has an old top-level directory but no new one.
 
-Before `run_vm`, run and provision print `describe_vm_files`: the directory shares (`host -> guest (mode)`) and the files Vibe writes into the VM, or `(none)`.
+Before `run_vm`, run and provision print `describe_vm_files`: the directory shares (`host -> guest (mode)`) and the files Vibe writes into the VM, or `(none)`. When the run plan sets `restrict_apt_cache`, the apt cache mode reads `read-write, read-only for <user> via bindfs if the image has it`.
 
 In `nat` mode `guest_proxy` is `None`: the `vibe-usernet` helper applies `--proxy` itself, so the guest does not also receive proxy variables. In `vznat` mode the `--proxy` URL is passed into provisioning scripts and into login exports.
 

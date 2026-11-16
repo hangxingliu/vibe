@@ -18,12 +18,16 @@ $ vibe
   ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░
    ░▒▓██▓▒░  ░▒▓█▓▒░▒▓███████▓▒░░▒▓████████▓▒░
 
-Host                                      Guest                    Mode
-----------------------------------------  -----------------------  ----------
-/Users/dev/work/my-project                /root/my-project         read-write
-/Users/dev/.cache/vibe/.guest-mise-cache  /root/.local/share/mise  read-write
-/Users/dev/.m2                            /root/.m2                read-write
-/Users/dev/.cargo/registry                /root/.cargo/registry    read-write
+Host                                         Guest                    Mode
+-------------------------------------------  -----------------------  ----------
+/Users/dev/work/my-project                   /root/my-project         read-write
+/Users/dev/work/my-project/.git              /root/my-project/.git    read-only
+/Users/dev/.cache/vibe/user-root/mise-cache  /root/.local/share/mise  read-write
+/Users/dev/.cache/vibe/apt                   /var/cache/apt           read-write
+/Users/dev/.cache/vibe/user-root/cargo       /root/.cargo             read-write
+/Users/dev/.cache/vibe/user-root/yarn        /root/.yarn              read-write
+/Users/dev/.cache/vibe/user-root/m2          /root/.m2                read-write
+/Users/dev/.cache/vibe/user-root/go          /root/go                 read-write
 
 root@vibe:~/my-project#
 ```
@@ -53,8 +57,7 @@ I'm using virtual machines rather than containers because:
 Finally, as a matter of taste and style:
 
 - I wrote the entire README myself, 100% with my human brain.
-- The entire implementation is ~2000 lines of Rust.
-- The only Rust dependencies are the [Objc2](https://github.com/madsmtm/objc2) interop crates and the [lexopt](https://github.com/blyxxyz/lexopt) argument parser.
+- The Rust dependencies are the [Objc2](https://github.com/madsmtm/objc2) interop crates, the [lexopt](https://github.com/blyxxyz/lexopt) argument parser, and a few small crates (`libc`, `regex`, `base64`).
 - There are no emoji anywhere in this repository.
 
 
@@ -74,8 +77,8 @@ If you use [mise-en-place](https://mise.jdx.dev/):
 
     mise use github:lynaghk/vibe@latest
 
-I'm not making formal releases or keeping a change log.
-I recommend reading the commit history and pinning to a specific version.
+I'm not making formal releases.
+I recommend reading [CHANGELOG.md](CHANGELOG.md) and the commit history, and pinning to a specific version.
 
 If you're building from a checkout, use mise to get the Rust and Go compilers:
 
@@ -136,24 +139,42 @@ Options:
                                                             Provision: name of the image to create (default `default`).
   --cpus COUNT                                              Number of virtual CPUs (default 2).
   --ram MEGABYTES                                           RAM size in megabytes (default 2048 when running, 4096 when provisioning).
+  --vm-user NAME                                            Guest account the session is for (default `root`; run and provision).
+                                                            Vibe logs in as root, mounts the shares, then switches to NAME with `su --login`:
+                                                            login actions run as NAME, `exit` returns to the root shell, and `exit` there powers off.
+                                                            Relative guest paths (project directory, caches except apt, `--mount`, `.tmux`) are below NAME's HOME.
+                                                            Running checks that the account exists and uses bash; `provision` creates it (`useradd`, no extra groups).
+                                                            Provisioning for a non-root NAME needs a root password. Running warns when root has no password
+                                                            (NAME could then become root with `su -`).
+  --root-password PASSWORD                                  Root password used to log in (default: the VIBE_ROOT_PASSWORD environment variable).
+                                                            A provision that runs scripts sets it as the new image's root password.
+                                                            The value is visible in the host process list.
   --no-mount-sys-cache                                      Do not mount the shared apt, cargo, yarn, m2, and go caches (run and provision).
                                                             Tools installed into them during provisioning (e.g. Rust) are not available.
-  --no-mount-mise                                           Do not mount the shared mise data directory at /root/.local/share/mise (run and provision).
+  --no-mount-mise                                           Do not mount the shared mise data directory at ~/.local/share/mise (run and provision).
                                                             Tools installed into it by mise during provisioning are not available.
-  --no-mount-cwd                                            Do not share the current directory at /root/<project> or cd into it.
+  --no-mount-cwd                                            Do not share the current directory at ~/<project> or cd into it.
   --mount-tmux-conf                                         Share host ~/.tmux (read-only) and copy host ~/.tmux.conf into the VM.
   --mount-agents-conf                                       Mount the shared coding agent configuration directories
                                                             (codex, copilot, claude, gemini, pi, grok, opencode) from the cache directory.
-  --write-bashrc                                            Overwrite /root/.profile with Vibe's built-in bash configuration and source it.
+  --write-bashrc                                            Overwrite the vm-user's ~/.profile with Vibe's built-in bash configuration and load it.
                                                             Provisioning always does this.
 
   Each of the six options above also has the opposite form (`--mount-mise`, `--no-write-bashrc`, ...); the last one given wins.
   When running, `--no-mount-sys-cache` and `--no-mount-mise` require an existing default image (create it first with `vibe provision`).
-  Project directories (the current directory and `--mount` shares) always have `.vibe` and `.env` masked.
+  Project directories (the current directory and `--mount` shares) always have `.vibe` masked.
+  Files such as `.env` appear in the VM like any other file in the share; keep secrets outside the project directory.
+  `~` above means the HOME of the --vm-user (`/root` by default).
+  The caches except apt are kept per --vm-user in the cache directory, under user-NAME/ (for example user-root/cargo).
+  Writable shares can be written by every user in the VM; new files there belong to the host user running vibe.
+  Git may report `dubious ownership` in a shared repository; set `safe.directory` in the VM if you need to.
+  With a non-root --vm-user, the shared apt cache is mounted read-only for that user with bindfs (only root's apt
+  changes it); on images without bindfs it is mounted writable and a warning is printed.
 
   --env NAME                                                Export host environment variable NAME inside VM.
                                                             Errors if NAME is unset or empty.
   --mount HOST_PATH:GUEST_PATH[:read-only | :read-write]    Mount HOST_PATH inside VM at GUEST_PATH (default mode `:read-write`)
+                                                            A relative GUEST_PATH is below the vm-user's HOME.
                                                             Errors if HOST_PATH does not exist.
   --network <nat|vznat>                                     Guest networking mode (default `nat`).
                                                             `nat` uses Vibe's bundled user-mode network stack.
@@ -192,13 +213,13 @@ Options:
                                                             no: mask .git with tmpfs.
 							    
 
-Login actions (executed in order after root login, repeatable; not valid with `provision`):
+Login actions (executed in order in the vm-user's shell, repeatable; not valid with `provision`):
 
   --script PATH_TO_SCRIPT                                   Run script in VM; stop if it exits non-zero.
   --send SOME_COMMAND                                       Type SOME_COMMAND followed by newline into the VM.
   --expect STRING [timeout-seconds]                         Wait for STRING to appear in console output before executing next login action.
                                                             If STRING does not appear within timeout (default 30 seconds), shutdown VM with error.
-  --ssh-key <PUBLIC_KEY_FILE>                               Install SSH public key into VM and start SSH server.
+  --ssh-key <PUBLIC_KEY_FILE>                               Install SSH public key for the vm-user and start SSH server.
 
 Provisioning creates a new named image by running (built-in) scripts. Options:
 
@@ -210,9 +231,14 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                                                             the shell open so you can customise further before the image is saved.
                                                             If the image already exists (and --replace is not given): boots the existing image
                                                             directly for interactive use without re-running any scripts.
+                                                            With a non-root --vm-user, the shell is the vm-user's; `exit` returns to the
+                                                            root shell, and `exit` there powers off (and saves a new image).
   --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
   --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 4096).
 
+Built-in scripts install system packages as root and user-level tools (mise, rustup, coding agents) as the
+--vm-user. Your own scripts run as root with VIBE_VM_USER and VIBE_VM_HOME set; use `runuser -u "$VIBE_VM_USER" -- ...`
+to run commands as that user.
 A new Debian base is first prepared once in a headless Alpine maintenance VM; older bases and Vibe images are used as-is.
 Set the environment variable VIBE_KEEP_FAILED_WORK=1 to keep the work copy and maintenance files of a failed provision for debugging.
 
@@ -252,24 +278,53 @@ When running a VM:
 
 | What | Default | Option |
 | --- | --- | --- |
-| Current directory at `/root/<project>`, `cd` into it | on | `--no-mount-cwd` |
-| `.vibe`/`.env` masking, `node_modules`, `.git` handling of project directories (current directory and `--mount`) | always | - |
+| Current directory at `~/<project>`, `cd` into it | on | `--no-mount-cwd` |
+| `.vibe` masking (an empty read-only directory), `node_modules`, `.git` handling of project directories (current directory and `--mount`) | always | - |
 | Shared caches `apt`, `cargo`, `yarn`, `m2`, `go` | on | `--no-mount-sys-cache` |
-| Shared mise data at `/root/.local/share/mise` | on | `--no-mount-mise` |
+| Shared mise data at `~/.local/share/mise` | on | `--no-mount-mise` |
 | Host `~/.tmux` (read-only) and `~/.tmux.conf` | off | `--mount-tmux-conf` |
 | Agent configuration (codex, copilot, claude, gemini, pi, grok, opencode) from the cache directory | off | `--mount-agents-conf` |
 | Write Vibe's `.profile` and source it | off | `--write-bashrc` |
 | Write `.bash_logout` (power off on `exit`) | always | - |
 
 Every option also has the opposite form (`--mount-mise`, `--no-write-bashrc`, ...); the last one given wins.
+`~` is the HOME of the `--vm-user` (`/root` by default); the apt cache is always at `/var/cache/apt`.
+
+The shared caches live in the cache directory (`~/.cache/vibe`). All users share `apt/`. The other caches are kept per `--vm-user` under `user-<NAME>/`, for example `user-root/cargo` or `user-dev/mise-cache`.
+Before this layout, the caches sat directly in the cache directory (`cargo/`, `mise-cache/`, ...). Vibe no longer mounts those old directories, so tools that `default.raw` installed into them are missing.
+Vibe prints a note while an old directory exists and its new one does not, but never moves or deletes it. Move it into `user-root/` by hand while no VM runs, or provision the image again.
 Provisioning accepts `--[no-]mount-sys-cache` and `--[no-]mount-mise`, always writes and sources `.profile`, and never mounts the current directory, tmux, or agent configuration.
 
-The shared caches are where provisioning installs many tools: `@rust` installs Rust into `/root/.cargo`, and mise installs its tools into `/root/.local/share/mise`.
+The shared caches are where provisioning installs many tools: `@rust` installs Rust into `~/.cargo`, and mise installs its tools into `~/.local/share/mise`.
 So:
 
 - Running with `--no-mount-sys-cache` or `--no-mount-mise` hides the tools that provisioning put into the shared directories (Vibe prints a note).
 - Provisioning with `--no-mount-sys-cache` or `--no-mount-mise` installs those tools into the image itself. Run that image with the same options to use them; otherwise the shared directories are mounted over them and hide them.
 - The default image is shared by all projects, so `vibe` only creates it with the shared directories mounted. If `default.raw` does not exist yet, `vibe --no-mount-mise` fails and asks you to run `vibe provision` (with or without these options) first.
+
+## Running as a non-root user
+
+By default everything in the VM runs as root. To give the agent an ordinary account instead, provision an image for it and run with the same `--vm-user`:
+
+    vibe provision --image dev --vm-user dev --root-password 'something-secret' @codex
+    vibe --image dev --vm-user dev --root-password 'something-secret'
+
+Provisioning creates the account (`useradd`, its own group, bash, `/home/dev`), sets the root password, and installs the user-level tools of the built-in scripts (mise, rustup, coding agents) as `dev`. Your own provisioning scripts still run as root; they can use `runuser -u "$VIBE_VM_USER" -- ...`.
+`VIBE_ROOT_PASSWORD` can be used instead of `--root-password`.
+
+When running, Vibe logs in as root, mounts the shares below `/home/dev`, and then switches to `dev` with `su --login`. Login actions (`--send`, `--expect`, `--script`) run as `dev`.
+`exit` returns to the root shell, and `exit` there powers the VM off.
+In login actions, follow `--send exit` with `--expect 'back in the root shell'` before sending more; text sent while the user's shell closes is lost.
+Without a root password, `dev` could become root with `su -`, so Vibe warns about images whose root account has no password.
+
+Some things to know:
+
+- Shares are not separated by guest user: every user in the VM can write the writable shares, and new files there belong to your user on the Mac.
+  The separation comes from directories inside the VM (the staging directory and the HOME of `dev` are private) and from read-only shares and masks.
+  [docs/file-shares-between-vm.md](docs/file-shares-between-vm.md) explains the permission model and its limits.
+- The shared apt cache is mounted read-only for `dev` with `bindfs`, so only root's apt can change it. Images without `bindfs` (provisioning installs it) get a writable cache and a warning.
+- Git in a shared repository may report `dubious ownership`, because shared files appear to belong to whoever looked at them last. Set `safe.directory` in the VM if this bothers you.
+- An image provisioned for one user does not have the user-level tools of another user. Provision a new image from a fresh base for each user.
 
 ## Proxies
 
@@ -289,7 +344,7 @@ Every run starts with a short summary of what goes through the proxy and what do
       Bypass: 127.0.0.1,localhost,192.168.* (from no_proxy); gateway 192.168.5.2 -> host is always direct
 
 With a SOCKS5 proxy, UDP and the VM's DNS go through the proxy too. HTTP proxies only carry TCP, so Vibe warns that UDP and DNS go directly; add `--strict-proxy` to drop that traffic instead.
-See [docs/network-proxy.zh-Hans.md](docs/network-proxy.zh-Hans.md) for how each option affects each kind of traffic.
+See [docs/network-proxy.md](docs/network-proxy.md) for how each option affects each kind of traffic.
 
 ## Keeping images on another disk
 
@@ -395,19 +450,16 @@ Sorry excellent Apple programmers and hardware designers, I hope your management
 I wrote this software for myself, and I'm open to pull requests and otherwise collaborating on features that I'd personally use:
 
 - resizing disk images
-- forwarding ports from the host to a guest
 - running `vibe` against a disk image that's already running should connect to the already-running VM
   - the VM shouldn't shutdown until all host terminals have logged out
 - if not the above, at least a check and throw a nice error message when you try to start a VM that's already running
 - a way to make faster-booting even more minimal Linux virtual machines
   - this should be bootstrappable on Mac; i.e., if the only way to make a small Linux image is with Linux-only tools, the entire process should still be runnable on MacOS via intermediate VMs
 - propagate an exit code from within VM to the `vibe` command
-- don't propagate user typing until all provided `--expect` and `--send` actions have completed
-- CPU core / memory / networking configuration, possibly via flags or via extended attributes on the disk image file
 - a `--plan` flag which pretty-prints a CLI invocation with all of the default arguments shown
   - to keep ourselves honest, we should use the same codepath for the actual execution (maybe we can `exec` into the generated command?)
   - Being fully "explicit" is tricky due to flag interactions.
-    E.g., the friendly `--mount` would need to be decomposed into two flags: One that exposes the host directory in the guest's staging area at `/mnt/shared/` and another flag `--send 'mount --bind ...'`to bind this to the desired guest location.
+    E.g., the friendly `--mount` would need to be decomposed into two flags: One that exposes the host directory in the guest's staging area at `/mnt/root/virtiofs-shared/` and another flag `--send 'mount --bind ...'`to bind this to the desired guest location.
 
 I'm not sure about (but open to discussing proposals via GitHub issues):
 

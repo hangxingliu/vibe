@@ -16,6 +16,7 @@ use std::{
 use crate::cache::clone_file;
 use crate::control::FrameReader;
 use crate::session::LoginAction::*;
+use crate::session_plan::SessionPlan;
 use crate::vm_config::{DiskSpec, SerialPort, SerialRole, VmSpec, output_serial};
 use crate::vm_io::create_pipe;
 use crate::vm_lifecycle::{
@@ -122,15 +123,20 @@ fn check_read_only_second_disk() -> Result<(), Box<dyn std::error::Error>> {
             &disk,
             None,
             &[],
-            &[
-                Send(" echo VIBE_RO_$(cat /sys/block/vda/ro)_$(cat /sys/block/vdb/ro)".to_string()),
-                Expect {
-                    text: "VIBE_RO_0_1".to_string(),
-                    timeout: Duration::from_secs(30),
-                },
-                Send(" systemctl poweroff".to_string()),
-            ],
-            0..3,
+            &SessionPlan::root(
+                vec![
+                    Send(
+                        " echo VIBE_RO_$(cat /sys/block/vda/ro)_$(cat /sys/block/vdb/ro)"
+                            .to_string(),
+                    ),
+                    Expect {
+                        text: "VIBE_RO_0_1".to_string(),
+                        timeout: Duration::from_secs(30),
+                    },
+                    Send(" systemctl poweroff".to_string()),
+                ],
+                0..3,
+            ),
             we_read_from,
             we_write_to,
             we_write_resize_to,

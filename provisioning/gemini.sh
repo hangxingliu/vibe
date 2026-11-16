@@ -1,5 +1,6 @@
 #!/bin/bash
 # Install Google's Gemini (antigravity).
+# vibe:run-as-user
 set -euxo pipefail
 
 # Set this environment variable to prevent the Gemini CLI from failing to identify the sandbox command

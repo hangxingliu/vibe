@@ -1,5 +1,6 @@
 #!/bin/bash
 # Install Grok Build
+# vibe:run-as-user
 set -euxo pipefail
 
 retry_error=

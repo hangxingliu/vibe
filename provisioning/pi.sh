@@ -1,5 +1,6 @@
 #!/bin/bash
 # Install Earendil's Pi.
+# vibe:run-as-user
 set -euxo pipefail
 
 retry_error=

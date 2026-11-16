@@ -3,7 +3,6 @@
 
 use std::{
     cell::Cell,
-    ops::Range,
     os::unix::io::OwnedFd,
     path::Path,
     sync::{Arc, atomic::Ordering, mpsc},
@@ -16,16 +15,14 @@ use objc2_virtualization::VZVirtualMachineState;
 use crate::DirectoryShare;
 use crate::networking::PreparedNetworkBackend;
 use crate::session::{
-    DiskSource,
-    LoginAction::{self, *},
-    LoginFailure, RootPassword, VmOutput, action_prefix, legacy_login_prefix, needs_provision_hint,
-    spawn_login_actions_thread,
+    DiskSource, LoginAction, LoginFailure, RootPassword, VmOutput, action_prefix,
+    legacy_login_prefix, needs_provision_hint, spawn_login_actions_thread,
 };
-use crate::vm_config::{
-    SHARED_DIRECTORIES_TAG, VmSpec, create_vm_configuration, default_interactive_spec,
-};
+use crate::session_plan::{SessionPlan, expand_session, notice_message, passwordless_root_warning};
+use crate::vm_config::{VmSpec, create_vm_configuration, default_interactive_spec};
 use crate::vm_io::{OutputMonitor, create_pipe, spawn_vm_io};
 use crate::vm_lifecycle::{force_stop, request_stop, start_vm};
+use crate::vm_user::{VmUser, VmUserProblem};
 
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -45,23 +42,21 @@ pub(crate) struct RunOutcome {
 }
 
 /// Boots `disk_path` attached to the host terminal, logs in as root, runs the
-/// internal setup and then `login_actions`.
+/// internal setup and then the phases of `plan` (see `session_plan`).
 ///
 /// Returns an error when a login action fails or times out, and when the VM
 /// stops before the root login completed. `disk_source` selects the
 /// `vibe provision` suggestion attached to boot and login errors; `None`
-/// omits it. `user_actions` is the range of `login_actions` that the user
-/// wrote; errors number them `[action N: ...]` from 1. Vibe's own actions
-/// before that range report as `[login] setup ...` and the ones after it as
-/// `[shutdown] ...`. `actions_completed_notice` is printed once all actions
-/// finished.
+/// omits it. Errors number the actions the user wrote (`plan.numbered`)
+/// `[action N: ...]` from 1. Vibe's own actions before them report as
+/// `[login] setup ...` and the ones after them as `[shutdown] ...`.
+/// `actions_completed_notice` is printed once all actions finished.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_vm(
     disk_path: &Path,
     disk_source: Option<&DiskSource>,
     network_log_dir: Option<&Path>,
-    login_actions: &[LoginAction],
-    user_actions: Range<usize>,
+    plan: &SessionPlan,
     directory_shares: &[DirectoryShare],
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
     cpu_count: usize,
@@ -92,8 +87,7 @@ pub(crate) fn run_vm(
         disk_path,
         disk_source,
         directory_shares,
-        login_actions,
-        user_actions,
+        plan,
         we_read_from,
         we_write_to,
         we_write_resize_to,
@@ -108,8 +102,7 @@ pub(crate) fn drive_interactive(
     disk_path: &Path,
     disk_source: Option<&DiskSource>,
     directory_shares: &[DirectoryShare],
-    login_actions: &[LoginAction],
-    user_actions: Range<usize>,
+    plan: &SessionPlan,
     we_read_from: OwnedFd,
     we_write_to: OwnedFd,
     we_write_resize_to: OwnedFd,
@@ -129,39 +122,27 @@ pub(crate) fn drive_interactive(
         we_write_resize_to,
     );
 
-    let mut all_login_actions = legacy_login_prefix(LOGIN_EXPECT_TIMEOUT, root_password)?;
-
-    if !directory_shares.is_empty() {
-        all_login_actions.push(Send(" mkdir -p /mnt/shared".into()));
-        all_login_actions.push(Send(format!(
-            " mount -t virtiofs {SHARED_DIRECTORIES_TAG} /mnt/shared"
-        )));
-
-        for share in directory_shares {
-            let staging = format!("/mnt/shared/{}", share.tag());
-            let guest = share.guest.to_string_lossy();
-            all_login_actions.push(Send(format!(" mkdir -p {guest}")));
-            all_login_actions.push(Send(format!(" mount --bind {staging} {guest}")));
-        }
-    }
-
-    let caller_actions = all_login_actions.len()..all_login_actions.len() + login_actions.len();
-    let user_actions = caller_actions.start + user_actions.start.min(login_actions.len())
-        ..caller_actions.start + user_actions.end.min(login_actions.len());
-    for a in login_actions {
-        all_login_actions.push(a.clone());
-    }
-    all_login_actions.push(
-        Send(" [ -x \"${HOME}/.local/bin/mise\" ] && eval \"$(\"${HOME}/.local/bin/mise\" activate bash)\"".to_string()),
+    let session = expand_session(
+        legacy_login_prefix(LOGIN_EXPECT_TIMEOUT, root_password)?,
+        plan,
+        directory_shares,
     );
-    all_login_actions.push(Send(
-        " command -v fzf >/dev/null && eval \"$(fzf --bash)\"".to_string(),
-    ));
+    let caller_actions = session.caller;
+    let user_actions = session.user;
+    let all_login_actions = session.actions;
 
     let prefixes: Vec<String> = all_login_actions
         .iter()
         .enumerate()
         .map(|(index, action)| action_prefix(index, &caller_actions, &user_actions, action))
+        .collect();
+    // The account checked by each action whose exit codes report vm-user problems.
+    let vm_user_checks: Vec<Option<VmUser>> = all_login_actions
+        .iter()
+        .map(|action| match action {
+            LoginAction::StatusCommand { vm_user, .. } => vm_user.clone(),
+            _ => None,
+        })
         .collect();
 
     let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
@@ -205,15 +186,26 @@ pub(crate) fn drive_interactive(
                 )
             }
             VmOutput::LoginActionFailed { index, status } => {
-                format!("{} failed with exit code {status}", prefixes[index])
+                match (&vm_user_checks[index], VmUserProblem::from_status(status)) {
+                    (Some(user), Some(problem)) => login_error(LoginFailure::VmUser {
+                        user: user.clone(),
+                        problem,
+                    }),
+                    _ => format!("{} failed with exit code {status}", prefixes[index]),
+                }
             }
             VmOutput::LoginFailed(failure) => login_error(failure),
-            VmOutput::LoginReady {
-                password_prompted: _,
-            } => {
-                // `password_prompted` is carried for the warning printed when a
-                // non-root session starts on an image whose root account has
-                // no password. Nothing consumes it in this loop yet.
+            VmOutput::Notice(notice) => {
+                if let Some(message) = notice_message(&notice, &plan.vm_user) {
+                    // The terminal may be in raw mode; start on a fresh line.
+                    eprintln!("\r\n{message}\r");
+                }
+                return None;
+            }
+            VmOutput::LoginReady { password_prompted } => {
+                if !password_prompted && plan.warn_passwordless_root {
+                    eprintln!("\r\n{}\r", passwordless_root_warning(&plan.vm_user));
+                }
                 login_ready = true;
                 if std::env::var("VIBE_FORCE_STOP_AFTER_LOGIN").ok().as_deref() == Some("1") {
                     want_force.set(true);

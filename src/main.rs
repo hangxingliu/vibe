@@ -23,8 +23,10 @@ mod proxy;
 use provision::*;
 mod session;
 use session::*;
+mod session_plan;
+use session_plan::SessionPlan;
 mod vm_user;
-use vm_user::VmUser;
+use vm_user::{GuestPath, VmUser};
 mod vm_config;
 mod vm_io;
 use vm_io::*;
@@ -55,26 +57,27 @@ const INSTANCE_DIR_NAME: &str = ".vibe";
 const INSTANCE_DISK_IMAGE_NAME: &str = "instance.raw";
 
 /// CACHE_NAME:GUEST_VM_PATH. Mounted when running and provisioning unless `--no-mount-sys-cache`.
+/// Relative guest paths are below the HOME of the `--vm-user`.
 const SYS_CACHE_SHARES: &[&str] = &[
     "apt:/var/cache/apt",
-    "cargo:/root/.cargo",
-    "yarn:/root/.yarn",
-    "m2:/root/.m2",
-    "go:/root/go",
+    "cargo:.cargo",
+    "yarn:.yarn",
+    "m2:.m2",
+    "go:go",
 ];
 
 /// Mounted when running and provisioning unless `--no-mount-mise`.
-const MISE_CACHE_SHARE: &str = "mise-cache:/root/.local/share/mise";
+const MISE_CACHE_SHARE: &str = "mise-cache:.local/share/mise";
 
 /// Only mounted when running with `--mount-agents-conf`.
 const AGENT_CONF_SHARES: &[&str] = &[
-    "codex:/root/.codex",
-    "copilot:/root/.copilot",
-    "claude:/root/.claude",
-    "gemini:/root/.gemini",
-    "pi:/root/.pi",
-    "grok:/root/.grok",
-    "opencode:/root/.config/opencode",
+    "codex:.codex",
+    "copilot:.copilot",
+    "claude:.claude",
+    "gemini:.gemini",
+    "pi:.pi",
+    "grok:.grok",
+    "opencode:.config/opencode",
 ];
 
 const RUN_NO_MOUNT_MISE_NOTE: &str = "Note: --no-mount-mise: the shared mise directory is not mounted; tools that mise installed into it during provisioning are not available in this VM.";
@@ -85,9 +88,6 @@ const PROVISION_NO_MOUNT_SYS_CACHE_NOTE: &str = "Note: --no-mount-sys-cache: too
 /// Project subfolders masked with tmpfs to prevent host data leaking into the VM.
 const MASKED_SUBFOLDERS: &[&str] = &[".vibe"];
 
-/// Project files masked by bind-mounting an empty file over them to prevent host data leaking.
-const MASKED_FILES: &[&str] = &[".env"];
-
 include!(concat!(env!("OUT_DIR"), "/provisioning.rs"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,18 +97,35 @@ enum GitMode {
     No,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct DirectoryShare {
     host: PathBuf,
-    guest: PathBuf,
+    guest: GuestPath,
     read_only: bool,
     is_project_dir: bool,
 }
 
 impl DirectoryShare {
+    /// A relative `guest` path is below the HOME of the `--vm-user`.
     fn new(
         host: PathBuf,
-        mut guest: PathBuf,
+        guest: impl Into<PathBuf>,
+        read_only: bool,
+        create_host_dir: bool,
+        is_project_dir: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::at(
+            host,
+            GuestPath::new(guest),
+            read_only,
+            create_host_dir,
+            is_project_dir,
+        )
+    }
+
+    fn at(
+        host: PathBuf,
+        guest: GuestPath,
         read_only: bool,
         create_host_dir: bool,
         is_project_dir: bool,
@@ -120,15 +137,18 @@ impl DirectoryShare {
                 return Err(format!("Host path does not exist: {}", host.display()).into());
             }
         }
-        if !guest.is_absolute() {
-            guest = PathBuf::from("/root").join(guest);
-        }
         Ok(Self {
             host,
             guest,
             read_only,
             is_project_dir,
         })
+    }
+
+    /// The shared apt cache, which a non-root session mounts with `bindfs`.
+    fn is_apt_cache(&self) -> bool {
+        !self.is_project_dir
+            && self.guest == GuestPath::Absolute(session_plan::APT_CACHE_GUEST.into())
     }
 
     fn from_mount_spec(spec: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -249,24 +269,41 @@ Options:
                                                             Provision: name of the image to create (default `default`).
   --cpus COUNT                                              Number of virtual CPUs (default 2).
   --ram MEGABYTES                                           RAM size in megabytes (default 2048 when running, 4096 when provisioning).
+  --vm-user NAME                                            Guest account the session is for (default `root`; run and provision).
+                                                            Vibe logs in as root, mounts the shares, then switches to NAME with `su --login`:
+                                                            login actions run as NAME, `exit` returns to the root shell, and `exit` there powers off.
+                                                            Relative guest paths (project directory, caches except apt, `--mount`, `.tmux`) are below NAME's HOME.
+                                                            Running checks that the account exists and uses bash; `provision` creates it (`useradd`, no extra groups).
+                                                            Provisioning for a non-root NAME needs a root password. Running warns when root has no password
+                                                            (NAME could then become root with `su -`).
+  --root-password PASSWORD                                  Root password used to log in (default: the VIBE_ROOT_PASSWORD environment variable).
+                                                            A provision that runs scripts sets it as the new image's root password.
+                                                            The value is visible in the host process list.
   --no-mount-sys-cache                                      Do not mount the shared apt, cargo, yarn, m2, and go caches (run and provision).
                                                             Tools installed into them during provisioning (e.g. Rust) are not available.
-  --no-mount-mise                                           Do not mount the shared mise data directory at /root/.local/share/mise (run and provision).
+  --no-mount-mise                                           Do not mount the shared mise data directory at ~/.local/share/mise (run and provision).
                                                             Tools installed into it by mise during provisioning are not available.
-  --no-mount-cwd                                            Do not share the current directory at /root/<project> or cd into it.
+  --no-mount-cwd                                            Do not share the current directory at ~/<project> or cd into it.
   --mount-tmux-conf                                         Share host ~/.tmux (read-only) and copy host ~/.tmux.conf into the VM.
   --mount-agents-conf                                       Mount the shared coding agent configuration directories
                                                             (codex, copilot, claude, gemini, pi, grok, opencode) from the cache directory.
-  --write-bashrc                                            Overwrite /root/.profile with Vibe's built-in bash configuration and source it.
+  --write-bashrc                                            Overwrite the vm-user's ~/.profile with Vibe's built-in bash configuration and load it.
                                                             Provisioning always does this.
 
   Each of the six options above also has the opposite form (`--mount-mise`, `--no-write-bashrc`, ...); the last one given wins.
   When running, `--no-mount-sys-cache` and `--no-mount-mise` require an existing default image (create it first with `vibe provision`).
-  Project directories (the current directory and `--mount` shares) always have `.vibe` and `.env` masked.
+  Project directories (the current directory and `--mount` shares) always have `.vibe` masked.
+  Files such as `.env` appear in the VM like any other file in the share; keep secrets outside the project directory.
+  `~` above means the HOME of the --vm-user (`/root` by default).
+  Writable shares can be written by every user in the VM; new files there belong to the host user running vibe.
+  Git may report `dubious ownership` in a shared repository; set `safe.directory` in the VM if you need to.
+  With a non-root --vm-user, the shared apt cache is mounted read-only for that user with bindfs (only root's apt
+  changes it); on images without bindfs it is mounted writable and a warning is printed.
 
   --env NAME                                                Export host environment variable NAME inside VM.
                                                             Errors if NAME is unset or empty.
   --mount HOST_PATH:GUEST_PATH[:read-only | :read-write]    Mount HOST_PATH inside VM at GUEST_PATH (default mode `:read-write`)
+                                                            A relative GUEST_PATH is below the vm-user's HOME.
                                                             Errors if HOST_PATH does not exist.
   --network <nat|vznat>                                     Guest networking mode (default `nat`).
                                                             `nat` uses Vibe's bundled user-mode network stack.
@@ -305,13 +342,13 @@ Options:
                                                             no: mask .git with tmpfs.
 							    
 
-Login actions (executed in order after root login, repeatable; not valid with `provision`):
+Login actions (executed in order in the vm-user's shell, repeatable; not valid with `provision`):
 
   --script PATH_TO_SCRIPT                                   Run script in VM; stop if it exits non-zero.
   --send SOME_COMMAND                                       Type SOME_COMMAND followed by newline into the VM.
   --expect STRING [timeout-seconds]                         Wait for STRING to appear in console output before executing next login action.
                                                             If STRING does not appear within timeout (default 30 seconds), shutdown VM with error.
-  --ssh-key <PUBLIC_KEY_FILE>                               Install SSH public key into VM and start SSH server.
+  --ssh-key <PUBLIC_KEY_FILE>                               Install SSH public key for the vm-user and start SSH server.
 
 Provisioning creates a new named image by running (built-in) scripts. Options:
 
@@ -323,9 +360,14 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                                                             the shell open so you can customise further before the image is saved.
                                                             If the image already exists (and --replace is not given): boots the existing image
                                                             directly for interactive use without re-running any scripts.
+                                                            With a non-root --vm-user, the shell is the vm-user's; `exit` returns to the
+                                                            root shell, and `exit` there powers off (and saves a new image).
   --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
   --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 4096).
 
+Built-in scripts install system packages as root and user-level tools (mise, rustup, coding agents) as the
+--vm-user. Your own scripts run as root with VIBE_VM_USER and VIBE_VM_HOME set; use `runuser -u \"$VIBE_VM_USER\" -- ...`
+to run commands as that user.
 A new Debian base is first prepared once in a headless Alpine maintenance VM; older bases and Vibe images are used as-is.
 Set the environment variable VIBE_KEEP_FAILED_WORK=1 to keep the work copy and maintenance files of a failed provision for debugging.
 
@@ -434,10 +476,19 @@ Cache directory:
                     "Image '{image}' already exists at {}; booting it for interactive use (--repl).",
                     existing.display()
                 );
-                let login_actions = write_bashrc_actions()?;
+                let (login_actions, written_files) = existing_image_repl_actions(&args.vm_user)?;
+                let written_files: Vec<(&str, &str)> = written_files
+                    .iter()
+                    .map(|(guest, source)| (guest.as_str(), source.as_str()))
+                    .collect();
                 print!(
                     "{}",
-                    describe_vm_files("Provision", &provision_shares, PROVISION_WRITTEN_FILES)
+                    describe_vm_files(
+                        "Provision",
+                        &provision_shares,
+                        &written_files,
+                        &args.vm_user
+                    )
                 );
                 for note in &notes {
                     println!("{note}");
@@ -445,21 +496,31 @@ Cache directory:
                 // No caller actions are user actions; an empty range at the end
                 // keeps the `.profile` setup labelled as `[login] setup`.
                 let no_user_actions = login_actions.len()..login_actions.len();
+                // The account is only checked here; Vibe creates users only
+                // while provisioning scripts run.
+                let plan = SessionPlan {
+                    vm_user: args.vm_user.clone(),
+                    root_prepare: vm_user::check_vm_user_actions(&args.vm_user),
+                    warn_passwordless_root: !args.vm_user.is_root(),
+                    switch_user: !args.vm_user.is_root(),
+                    ..SessionPlan::root(login_actions, no_user_actions)
+                };
                 return run_vm(
                     existing,
                     Some(&DiskSource::CachedImage(image.clone())),
                     None,
-                    &login_actions,
-                    no_user_actions,
+                    &plan,
                     &provision_shares,
                     prepare_network_backend,
                     cpu_count,
                     ram_bytes,
-                    None,
+                    (!args.vm_user.is_root()).then_some(EXISTING_IMAGE_REPL_USER_NOTICE),
                     root_password,
                 )
                 .map(|_| ());
             }
+
+            check_provision_root_password(&args.vm_user, root_password.is_some())?;
 
             // An existing image is replaced in the directory where it was found;
             // a new one is created in the preferred directory.
@@ -503,6 +564,7 @@ Cache directory:
                 cpu_count,
                 ram_bytes,
                 root_password,
+                &args.vm_user,
             )
         }
         CliCommand::Run { disk, image } => {
@@ -539,6 +601,8 @@ Cache directory:
                         check_implicit_provision(
                             args.mount_sys_cache,
                             args.mount_mise,
+                            &args.vm_user,
+                            root_password.is_some(),
                             &default_raw,
                         )?;
                     }
@@ -549,6 +613,7 @@ Cache directory:
                         prepare_network_backend,
                         &guest_proxy,
                         root_password.clone(),
+                        &args.vm_user,
                     )?;
                     default_raw
                 } else {
@@ -564,24 +629,17 @@ Cache directory:
                 instance_raw
             };
 
-            let mut login_actions = Vec::new();
+            let vm_user = args.vm_user.clone();
             let mut directory_shares = Vec::new();
             // (guest path, source) of the files written into the VM, for the host log.
-            let mut written_files: Vec<(&str, String)> =
-                vec![("/root/.bash_logout", "built-in".to_string())];
+            let mut written_files: Vec<(String, String)> =
+                vec![("/root/.bash_logout".to_string(), "built-in".to_string())];
 
+            let project_dir = args.mount_cwd.then(|| GuestPath::new(&project_name));
             if args.mount_cwd {
-                login_actions.push(Send(format!(" cd {project_name}")));
-
                 directory_shares.push(
-                    DirectoryShare::new(
-                        project_root.clone(),
-                        PathBuf::from("/root/").join(&project_name),
-                        false,
-                        false,
-                        true,
-                    )
-                    .expect("Project directory must exist"),
+                    DirectoryShare::new(project_root.clone(), &project_name, false, false, true)
+                        .expect("Project directory must exist"),
                 );
             }
 
@@ -589,81 +647,9 @@ Cache directory:
                 directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
             }
 
-            // Project directories (the current directory and `--mount` shares) are
-            // always masked, so host secrets do not leak into the VM.
-            let mut extra_shares = Vec::new();
-
-            // Collect project dirs to mask. We use a separate vector to avoid borrow checker issues
-            // and because we want to add .git shares at the end of the list to ensure they are
-            // mounted after their parent directories.
-            let project_shares: Vec<DirectoryShare> = directory_shares
-                .iter()
-                .filter(|s| s.is_project_dir)
-                .cloned()
-                .collect();
-
-            for share in project_shares {
-                // Discourage read/write of project dir subfolders within the VM.
-                for subfolder in MASKED_SUBFOLDERS {
-                    if share.host.join(subfolder).exists() {
-                        login_actions.push(Send(format!(
-                            " mount -t tmpfs tmpfs {}",
-                            share.guest.join(subfolder).display()
-                        )));
-                    }
-                }
-
-                if share.host.join("node_modules").is_dir() {
-                    let share_tag = share.tag();
-                    let node_modules_share = DirectoryShare::new(
-                        cache_dir.join(format!("guest_node_modules/{share_tag}")),
-                        share.guest.join("node_modules"),
-                        false,
-                        true,
-                        false,
-                    );
-                    extra_shares.push(node_modules_share?);
-                }
-
-                // Handle .git directory masking or read-only sharing
-                let git_path = share.host.join(".git");
-                if git_path.exists() {
-                    match args.git_mode {
-                        GitMode::No => {
-                            login_actions.push(Send(format!(
-                                " mount -t tmpfs tmpfs {}",
-                                share.guest.join(".git").display()
-                            )));
-                        }
-                        GitMode::Ro => {
-                            // VirtioFS can only share directories; skip if .git is a file
-                            // (e.g. git submodules store a gitdir pointer file, not a directory).
-                            if git_path.is_dir() {
-                                extra_shares.push(DirectoryShare::new(
-                                    git_path,
-                                    share.guest.join(".git"),
-                                    true,
-                                    false,
-                                    false,
-                                )?);
-                            }
-                        }
-                        GitMode::Rw => {}
-                    }
-                }
-
-                // Mask individual files by bind-mounting an empty file over them to prevent
-                // host file contents (e.g. secrets) from being readable inside the VM.
-                for filename in MASKED_FILES {
-                    if share.host.join(filename).exists() {
-                        login_actions.push(Send(format!(
-                        r#" [ -n "$__masked_tmp_file" ] || __masked_tmp_file="$(mktemp)"; mount -o bind "$__masked_tmp_file" {}"#,
-                        share.guest.join(filename).display()
-                    )));
-                    }
-                }
-            }
-            directory_shares.extend(extra_shares);
+            let (masks, project_extra_shares) =
+                project_masks_and_shares(&directory_shares, args.git_mode, &cache_dir)?;
+            directory_shares.extend(project_extra_shares);
 
             directory_shares.extend(create_cache_shares(
                 &cache_dir,
@@ -674,63 +660,54 @@ Cache directory:
                 ),
             )?);
 
+            let mut tmux_conf = None;
             if args.mount_tmux_conf {
-                let (tmux_share, tmux_conf) = tmux_conf_mounts(&home)?;
+                let (tmux_share, conf) = tmux_conf_mounts(&home)?;
                 directory_shares.extend(tmux_share);
-                if let Some((action, host_path)) = tmux_conf {
-                    login_actions.push(action);
-                    written_files
-                        .push(("/root/.tmux.conf", format!("from {}", host_path.display())));
+                if let Some((content, host_path)) = conf {
+                    tmux_conf = Some(content);
+                    written_files.push((
+                        GuestPath::new(".tmux.conf").display(&vm_user),
+                        format!("from {}", host_path.display()),
+                    ));
                 }
             }
-
-            // Written before the `--env` exports so `.profile` cannot override them.
             if args.write_bashrc {
-                login_actions.extend(write_bashrc_actions()?);
-                written_files.push(("/root/.profile", "built-in".to_string()));
+                written_files.push((
+                    GuestPath::new(".profile").display(&vm_user),
+                    "built-in".to_string(),
+                ));
             }
 
-            login_actions.extend(env_login_actions(&args.env));
+            let ssh_key = args
+                .ssh_key
+                .as_ref()
+                .map(|path| {
+                    fs::read_to_string(path)
+                        .map_err(|err| format!("Failed to read SSH key {}: {err}", path.display()))
+                })
+                .transpose()?;
 
-            // Enable bash history
-            login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
-
-            if let Some(motd_action) = motd_login_action(&directory_shares) {
-                login_actions.push(motd_action);
-            }
-
-            // Set proxy environment variables for interactive use
-            if let Some(guest) = &guest_proxy {
-                login_actions.push(Send(format!(
-                    " {}",
-                    generate_http_proxy_env_export_cmds(&guest.url, &guest.no_proxy)
-                )));
-            }
-
-            // Install SSH public key and start SSH server
-            if let Some(ssh_key_path) = &args.ssh_key {
-                let key_content = fs::read_to_string(ssh_key_path).map_err(|err| {
-                    format!("Failed to read SSH key {}: {err}", ssh_key_path.display())
-                })?;
-                let b64 = general_purpose::STANDARD.encode(key_content.trim());
-                login_actions.push(Send(format!(
-                    " mkdir -p /root/.ssh && echo '{b64}' | base64 --decode > /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys"
-                )));
-                login_actions.push(Send(" systemctl start ssh".to_string()));
-                login_actions.push(Send(" ip -4 -br addr".to_string()));
-            }
-
-            // Any user-provided login actions must come after our system ones
-            let user_actions = login_actions.len()..login_actions.len() + args.login_actions.len();
-            login_actions.extend(args.login_actions);
+            let plan = run_session_plan(RunSession {
+                vm_user: &vm_user,
+                project_dir: project_dir.as_ref(),
+                masks,
+                tmux_conf,
+                write_bashrc: args.write_bashrc,
+                env: &args.env,
+                guest_proxy: &guest_proxy,
+                ssh_key: ssh_key.as_deref(),
+                shares: &directory_shares,
+                login_actions: args.login_actions,
+            })?;
 
             let written_files: Vec<(&str, &str)> = written_files
                 .iter()
-                .map(|(guest, source)| (*guest, source.as_str()))
+                .map(|(guest, source)| (guest.as_str(), source.as_str()))
                 .collect();
             print!(
                 "{}",
-                describe_vm_files("Run", &directory_shares, &written_files)
+                describe_vm_files("Run", &directory_shares, &written_files, &vm_user)
             );
             for note in run_share_notes(args.mount_sys_cache, args.mount_mise) {
                 println!("{note}");
@@ -740,8 +717,7 @@ Cache directory:
                 &disk_path,
                 Some(&disk_source),
                 log_to_instance.then_some(instance_dir.as_path()),
-                &login_actions,
-                user_actions,
+                &plan,
                 &directory_shares[..],
                 prepare_network_backend,
                 args.cpu_count,
@@ -752,6 +728,195 @@ Cache directory:
             .map(|_| ())
         }
     }
+}
+
+/// Printed when `provision --repl` on an existing image hands over the
+/// shell of a non-root vm-user.
+const EXISTING_IMAGE_REPL_USER_NOTICE: &str = "Dropping into the vm-user's shell (--repl).\r\n\
+Type `exit` to return to the root shell for system-level changes; `exit` there (or `systemctl poweroff`) powers off.";
+
+/// (guest path, source) of the files written into a VM, for the host log.
+type WrittenFiles = Vec<(String, String)>;
+
+/// Actions and written files (guest path, source) of `provision --repl` on
+/// an existing image. Root gets `/root/.profile` (sourced) as before; a
+/// non-root `vm_user` only gets its own `~/.profile`, which its login shell
+/// reads.
+fn existing_image_repl_actions(
+    vm_user: &VmUser,
+) -> Result<(Vec<LoginAction>, WrittenFiles), Box<dyn std::error::Error>> {
+    let actions = if vm_user.is_root() {
+        write_bashrc_actions()?
+    } else {
+        vec![write_user_bashrc_action(vm_user)?]
+    };
+    let written_files = vec![
+        (
+            GuestPath::new(".profile").display(vm_user),
+            "built-in".to_string(),
+        ),
+        ("/root/.bash_logout".to_string(), "built-in".to_string()),
+    ];
+    Ok((actions, written_files))
+}
+
+/// Inputs of [`run_session_plan`] that do not touch the host file system.
+struct RunSession<'a> {
+    vm_user: &'a VmUser,
+    /// The guest path of the shared current directory, if it is shared.
+    project_dir: Option<&'a GuestPath>,
+    masks: Vec<GuestPath>,
+    /// Host `~/.tmux.conf`, written to the target user's `~/.tmux.conf`.
+    tmux_conf: Option<String>,
+    write_bashrc: bool,
+    env: &'a HashMap<String, String>,
+    guest_proxy: &'a Option<proxy::GuestProxy>,
+    ssh_key: Option<&'a str>,
+    shares: &'a [DirectoryShare],
+    /// The user's `--send`, `--expect`, and `--script` actions.
+    login_actions: Vec<LoginAction>,
+}
+
+/// The session of `vibe` (run): root sets up tmux, `.profile`, and SSH for
+/// the target user; then the session, in the target user's login shell when
+/// it is not root, changes into the project, exports `--env`, shows the share
+/// table, and runs the user's login actions.
+fn run_session_plan(run: RunSession<'_>) -> Result<SessionPlan, Box<dyn std::error::Error>> {
+    let vm_user = run.vm_user;
+    let is_root = vm_user.is_root();
+    let mut root_actions = Vec::new();
+    if let Some(conf) = run.tmux_conf {
+        root_actions.push(Send(write_user_file_into_vm(".tmux.conf", &conf, vm_user)?));
+    }
+    // Written before the `--env` exports so `.profile` cannot override them.
+    // A non-root user's login shell reads it after the switch.
+    if run.write_bashrc {
+        if is_root {
+            root_actions.extend(write_bashrc_actions()?);
+        } else {
+            root_actions.push(write_user_bashrc_action(vm_user)?);
+        }
+    }
+    // Install SSH public key and start SSH server
+    if let Some(key) = run.ssh_key {
+        root_actions.push(Send(ssh_key_command(key, vm_user)));
+        root_actions.push(Send(" systemctl start ssh".to_string()));
+        root_actions.push(Send(" ip -4 -br addr".to_string()));
+    }
+
+    let mut user_actions = Vec::new();
+    if !is_root {
+        // `su --login` starts with a fresh environment.
+        user_actions.push(Send(
+            " export HISTCONTROL=ignorespace; unset HISTFILE".to_string(),
+        ));
+    }
+    if let Some(project_dir) = run.project_dir {
+        user_actions.push(Send(format!(" cd {}", project_dir.to_user_shell(vm_user))));
+    }
+    user_actions.extend(env_login_actions(run.env));
+    // Enable bash history
+    user_actions.push(Send(if is_root {
+        " export HISTFILE=/root/.bash_history".to_string()
+    } else {
+        " export HISTFILE=\"$HOME\"/.bash_history".to_string()
+    }));
+    user_actions.extend(motd_login_action(run.shares, vm_user));
+    // Set proxy environment variables for interactive use
+    if let Some(guest) = run.guest_proxy {
+        user_actions.push(Send(format!(
+            " {}",
+            generate_http_proxy_env_export_cmds(&guest.url, &guest.no_proxy)
+        )));
+    }
+    // Any user-provided login actions must come after our system ones
+    let first = root_actions.len() + user_actions.len();
+    let numbered = first..first + run.login_actions.len();
+    user_actions.extend(run.login_actions);
+
+    Ok(SessionPlan {
+        vm_user: vm_user.clone(),
+        root_prepare: vm_user::check_vm_user_actions(vm_user),
+        masks: run.masks,
+        restrict_apt_cache: !is_root,
+        root_actions,
+        user_actions,
+        numbered,
+        warn_passwordless_root: !is_root,
+        switch_user: !is_root,
+    })
+}
+
+/// Root shell command that installs `key` as the target user's only
+/// `~/.ssh/authorized_keys`. For a non-root user the directory and file are
+/// created by that user (see [`write_user_file_into_vm`]).
+fn ssh_key_command(key: &str, vm_user: &VmUser) -> String {
+    let b64 = general_purpose::STANDARD.encode(key.trim());
+    if vm_user.is_root() {
+        return format!(
+            " mkdir -p /root/.ssh && echo '{b64}' | base64 --decode > /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys"
+        );
+    }
+    let home = GuestPath::new("").to_shell(vm_user);
+    format!(
+        " echo '{b64}' | runuser -u \"$VIBE_VM_USER\" -- sh -c 'umask 077 && mkdir -p \"$1/.ssh\" && chmod 700 \"$1/.ssh\" && base64 --decode > \"$1/.ssh/authorized_keys\" && chmod 600 \"$1/.ssh/authorized_keys\"' sh {home}"
+    )
+}
+
+/// Masks and extra shares for the project directories (the current directory
+/// and `--mount` shares) among `shares`: `.vibe` is always masked; `.git` is
+/// masked or shared read-only by `git_mode`; `node_modules` gets a separate
+/// share from the cache directory. The extra shares come after their parent
+/// directories so they are mounted on top of them.
+fn project_masks_and_shares(
+    shares: &[DirectoryShare],
+    git_mode: GitMode,
+    cache_dir: &Path,
+) -> Result<(Vec<GuestPath>, Vec<DirectoryShare>), Box<dyn std::error::Error>> {
+    let mut masks = Vec::new();
+    let mut extra_shares = Vec::new();
+    for share in shares.iter().filter(|share| share.is_project_dir) {
+        // Discourage read/write of project dir subfolders within the VM.
+        for subfolder in MASKED_SUBFOLDERS {
+            if share.host.join(subfolder).exists() {
+                masks.push(share.guest.join(subfolder));
+            }
+        }
+
+        if share.host.join("node_modules").is_dir() {
+            let share_tag = share.tag();
+            extra_shares.push(DirectoryShare::at(
+                cache_dir.join(format!("guest_node_modules/{share_tag}")),
+                share.guest.join("node_modules"),
+                false,
+                true,
+                false,
+            )?);
+        }
+
+        // Handle .git directory masking or read-only sharing
+        let git_path = share.host.join(".git");
+        if git_path.exists() {
+            match git_mode {
+                GitMode::No => masks.push(share.guest.join(".git")),
+                GitMode::Ro => {
+                    // VirtioFS can only share directories; skip if .git is a file
+                    // (e.g. git submodules store a gitdir pointer file, not a directory).
+                    if git_path.is_dir() {
+                        extra_shares.push(DirectoryShare::at(
+                            git_path,
+                            share.guest.join(".git"),
+                            true,
+                            false,
+                            false,
+                        )?);
+                    }
+                }
+                GitMode::Rw => {}
+            }
+        }
+    }
+    Ok((masks, extra_shares))
 }
 
 struct CliArgs {
@@ -788,8 +953,8 @@ struct CliArgs {
     ssh_key: Option<PathBuf>,
     publish: Vec<String>,
     git_mode: GitMode,
-    /// Checked and stored. The session still logs in as root.
-    #[allow(dead_code)]
+    /// The account the guest paths and checks are prepared for. Run checks
+    /// it exists; a provision creates it. The session's shell is still root.
     vm_user: VmUser,
     root_password: Option<RootPassword>,
 }
@@ -1220,7 +1385,7 @@ fn create_cache_share(
     share: &str,
 ) -> Result<DirectoryShare, Box<dyn std::error::Error>> {
     let (name, guest_path) = share.split_once(':').unwrap();
-    DirectoryShare::new(cache_dir.join(name), guest_path.into(), false, true, false)
+    DirectoryShare::new(cache_dir.join(name), guest_path, false, true, false)
 }
 
 /// The cache directory shares to mount, in mount order: mise, the system
@@ -1250,6 +1415,18 @@ fn create_cache_shares(
         .collect()
 }
 
+/// Err when a provision that runs scripts would create a non-root `--vm-user`
+/// while root has no password: the user could then become root with `su -`.
+fn check_provision_root_password(vm_user: &VmUser, has_root_password: bool) -> Result<(), String> {
+    if vm_user.is_root() || has_root_password {
+        return Ok(());
+    }
+    let name = vm_user.as_str();
+    Err(format!(
+        "--vm-user {name} needs --root-password (or VIBE_ROOT_PASSWORD) when provisioning: without a root password, user '{name}' could become root with 'su -'. Vibe sets the given password for root in the new image."
+    ))
+}
+
 /// Err when run options cannot be applied to the implicit provision of the
 /// default image. The default image is shared by every project, so it is always
 /// provisioned with the shared caches mounted; a different layout has to be
@@ -1257,8 +1434,20 @@ fn create_cache_shares(
 fn check_implicit_provision(
     mount_sys_cache: bool,
     mount_mise: bool,
+    vm_user: &VmUser,
+    has_root_password: bool,
     default_raw: &Path,
 ) -> Result<(), String> {
+    if !vm_user.is_root() && !has_root_password {
+        let name = vm_user.as_str();
+        return Err(format!(
+            "--vm-user {name} needs a root password while the default image does not exist yet ({}).\n\
+Creating the default image creates user '{name}'; without a root password, '{name}' could become root with 'su -'. Either:\n\
+  - pass --root-password <password> (or set VIBE_ROOT_PASSWORD), or\n\
+  - run `vibe provision --vm-user {name} --root-password <password> [@script ...]` to create the image explicitly.",
+            default_raw.display()
+        ));
+    }
     let given: Vec<&str> = [
         (!mount_sys_cache).then_some("--no-mount-sys-cache"),
         (!mount_mise).then_some("--no-mount-mise"),
@@ -1283,7 +1472,12 @@ The default image is created once and shared by all projects. Create it first, e
 
 /// Host log of what a VM gets from the host: the directory shares and the
 /// files Vibe writes into it. `written` holds (guest path, source) pairs.
-fn describe_vm_files(stage: &str, shares: &[DirectoryShare], written: &[(&str, &str)]) -> String {
+fn describe_vm_files(
+    stage: &str,
+    shares: &[DirectoryShare],
+    written: &[(&str, &str)],
+    vm_user: &VmUser,
+) -> String {
     let mut text = format!("{stage}: directory shares:\n");
     if shares.is_empty() {
         text.push_str("  (none)\n");
@@ -1297,7 +1491,7 @@ fn describe_vm_files(stage: &str, shares: &[DirectoryShare], written: &[(&str, &
         text.push_str(&format!(
             "  {} -> {} ({mode})\n",
             share.host.display(),
-            share.guest.display()
+            share.guest.display(vm_user)
         ));
     }
     text.push_str(&format!("{stage}: files written into the VM:\n"));
@@ -1333,32 +1527,22 @@ fn provision_share_notes(mount_sys_cache: bool, mount_mise: bool) -> Vec<&'stati
 }
 
 /// tmux configuration for `--mount-tmux-conf`: host `~/.tmux` shared read-only
-/// and the action that copies host `~/.tmux.conf` into the VM, each only when
-/// it exists on the host.
+/// and the content and path of host `~/.tmux.conf`, each only when it exists
+/// on the host.
 #[allow(clippy::type_complexity)]
 fn tmux_conf_mounts(
     home: &Path,
-) -> Result<(Option<DirectoryShare>, Option<(LoginAction, PathBuf)>), Box<dyn std::error::Error>> {
+) -> Result<(Option<DirectoryShare>, Option<(String, PathBuf)>), Box<dyn std::error::Error>> {
     let tmux_dir = home.join(".tmux");
     let share = if tmux_dir.is_dir() {
-        Some(DirectoryShare::new(
-            tmux_dir,
-            "/root/.tmux".into(),
-            true,
-            false,
-            false,
-        )?)
+        Some(DirectoryShare::new(tmux_dir, ".tmux", true, false, false)?)
     } else {
         None
     };
 
     let tmux_conf = home.join(".tmux.conf");
     let conf = if tmux_conf.is_file() {
-        let action = Send(write_file_into_vm(
-            "/root/.tmux.conf",
-            &fs::read_to_string(&tmux_conf)?,
-        )?);
-        Some((action, tmux_conf))
+        Some((fs::read_to_string(&tmux_conf)?, tmux_conf))
     } else {
         None
     };
@@ -1908,17 +2092,194 @@ mod tests {
         assert!(!invalid_flag.contains("from-env"), "{invalid_flag}");
     }
 
+    fn run_session_test_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vibe-run-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project = dir.join("proj");
+        for sub in [".vibe", ".git", "node_modules"] {
+            fs::create_dir_all(project.join(sub)).unwrap();
+        }
+        fs::write(project.join(".env"), "SECRET=1\n").unwrap();
+        dir
+    }
+
+    /// The whole Run session for `vm_user`, rendered one action per line.
+    fn rendered_run_session(dir: &Path, vm_user: &VmUser) -> (Vec<String>, SessionPlan) {
+        let project = DirectoryShare::new(dir.join("proj"), "proj", false, false, true).unwrap();
+        let mut shares = vec![project];
+        let (masks, extra) =
+            project_masks_and_shares(&shares, GitMode::No, &dir.join("cache")).unwrap();
+        shares.extend(extra);
+        shares.extend(
+            create_cache_shares(&dir.join("cache"), &["apt:/var/cache/apt", "cargo:.cargo"])
+                .unwrap(),
+        );
+        let env = HashMap::new();
+        let project_dir = shares[0].guest.clone();
+        let plan = run_session_plan(RunSession {
+            vm_user,
+            project_dir: Some(&project_dir),
+            masks,
+            tmux_conf: None,
+            write_bashrc: false,
+            env: &env,
+            guest_proxy: &None,
+            ssh_key: None,
+            shares: &shares,
+            login_actions: vec![Send(" echo hi".into())],
+        })
+        .unwrap();
+        let session = session_plan::expand_session(Vec::new(), &plan, &shares);
+        let lines = session
+            .actions
+            .iter()
+            .map(session_plan::tests::render)
+            .collect();
+        assert_eq!(session.user.len(), 1);
+        assert_eq!(
+            session_plan::tests::render(&session.actions[session.user.start]),
+            " echo hi"
+        );
+        (lines, plan)
+    }
+
+    #[test]
+    fn run_session_masks_vibe_and_git_but_not_env() {
+        let dir = run_session_test_dir();
+        let (lines, plan) = rendered_run_session(&dir, &VmUser::root());
+        let text = lines.join("\n");
+        assert!(plan.root_prepare.is_empty() && !plan.restrict_apt_cache);
+        assert!(
+            text.contains("mount -t tmpfs -o mode=0555,uid=0,gid=0 tmpfs /root/proj/.vibe"),
+            "{text}"
+        );
+        assert!(text.contains("tmpfs /root/proj/.git"), "{text}");
+        assert!(!text.contains(".env"), "{text}");
+        assert!(text.contains("/root/proj/node_modules"), "{text}");
+        assert!(text.contains(" cd /root/proj"), "{text}");
+        assert!(!text.contains("bindfs"), "{text}");
+        // Masks come after every mount, and the project share before its node_modules.
+        let last_mount = lines
+            .iter()
+            .rposition(|l| l.contains("mount --bind"))
+            .unwrap();
+        let first_mask = lines.iter().position(|l| l.contains("tmpfs")).unwrap();
+        assert!(last_mount < first_mask, "{text}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn run_session_for_a_non_root_user_checks_it_and_mounts_below_its_home() {
+        let dir = run_session_test_dir();
+        let dev = VmUser::parse("dev").unwrap();
+        let (lines, plan) = rendered_run_session(&dir, &dev);
+        let text = lines.join("\n");
+        assert!(plan.warn_passwordless_root && plan.restrict_apt_cache);
+        assert!(lines[0].starts_with("[check vm-user]"), "{text}");
+        assert!(lines[1].contains("export VIBE_VM_USER="), "{text}");
+        assert!(text.contains("\"${VIBE_VM_HOME}\"/proj/.vibe"), "{text}");
+        assert!(text.contains("[mount apt cache]"), "{text}");
+        assert!(text.contains("\"${VIBE_VM_HOME}\"/.cargo"), "{text}");
+        assert!(!text.contains("/root/proj"), "{text}");
+        assert!(!text.contains(".env"), "{text}");
+        // The user actions run in the user's login shell after the switch,
+        // where only $HOME is set.
+        let switch = lines
+            .iter()
+            .position(|l| l == "<switch to vm-user>")
+            .unwrap();
+        assert_eq!(
+            &lines[switch + 1..switch + 4],
+            [
+                " export HISTCONTROL=ignorespace; unset HISTFILE",
+                " cd \"$HOME\"/proj",
+                " export HISTFILE=\"$HOME\"/.bash_history",
+            ]
+        );
+        let last_mask = lines.iter().rposition(|l| l.contains("tmpfs")).unwrap();
+        assert!(last_mask < switch, "{text}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn run_session_writes_tmux_profile_and_ssh_key_for_the_target_user() {
+        let plan_for = |vm_user: &VmUser| {
+            run_session_plan(RunSession {
+                vm_user,
+                project_dir: None,
+                masks: Vec::new(),
+                tmux_conf: Some("set -g mouse on\n".to_string()),
+                write_bashrc: true,
+                env: &HashMap::new(),
+                guest_proxy: &None,
+                ssh_key: Some("ssh-ed25519 AAAA key\n"),
+                shares: &[],
+                login_actions: Vec::new(),
+            })
+            .unwrap()
+        };
+        let render = |plan: &SessionPlan| -> Vec<String> {
+            plan.root_actions
+                .iter()
+                .map(session_plan::tests::render)
+                .collect()
+        };
+
+        let root = render(&plan_for(&VmUser::root()));
+        assert!(root[0].contains("> '/root/.tmux.conf'"), "{root:?}");
+        assert!(root[1].contains("> '/root/.profile'"), "{root:?}");
+        assert_eq!(root[2], " . /root/.profile");
+        assert!(root[3].starts_with(" mkdir -p /root/.ssh && echo '"));
+        assert!(!plan_for(&VmUser::root()).switch_user);
+
+        let dev = render(&plan_for(&VmUser::parse("dev").unwrap()));
+        assert_eq!(dev.len(), 5, "{dev:?}");
+        assert!(
+            dev[0].ends_with(" sh \"${VIBE_VM_HOME}\"/.tmux.conf"),
+            "{dev:?}"
+        );
+        assert!(
+            dev[1].ends_with(" sh \"${VIBE_VM_HOME}\"/.profile"),
+            "{dev:?}"
+        );
+        assert!(
+            dev[2].contains(
+                "| runuser -u \"$VIBE_VM_USER\" -- sh -c 'umask 077 && mkdir -p \"$1/.ssh\""
+            ),
+            "{dev:?}"
+        );
+        assert!(dev[2].ends_with(" sh \"${VIBE_VM_HOME}\""), "{dev:?}");
+        assert_eq!(dev[3], " systemctl start ssh");
+        assert!(!dev.iter().any(|l| l.contains("/root/")), "{dev:?}");
+    }
+
+    #[test]
+    fn provision_with_a_non_root_vm_user_needs_a_root_password() {
+        let dev = VmUser::parse("dev").unwrap();
+        let err = check_provision_root_password(&dev, false).unwrap_err();
+        assert!(err.contains("--root-password"), "{err}");
+        assert!(err.contains("su -"), "{err}");
+        assert!(check_provision_root_password(&dev, true).is_ok());
+        assert!(check_provision_root_password(&VmUser::root(), false).is_ok());
+    }
+
     #[test]
     fn cache_share_specs_select_each_group_in_mount_order() {
         assert_eq!(
             cache_share_specs(true, true, false),
             [
-                "mise-cache:/root/.local/share/mise",
+                "mise-cache:.local/share/mise",
                 "apt:/var/cache/apt",
-                "cargo:/root/.cargo",
-                "yarn:/root/.yarn",
-                "m2:/root/.m2",
-                "go:/root/go",
+                "cargo:.cargo",
+                "yarn:.yarn",
+                "m2:.m2",
+                "go:go",
             ]
         );
         assert_eq!(cache_share_specs(true, false, false), SYS_CACHE_SHARES);
@@ -1932,15 +2293,19 @@ mod tests {
     #[test]
     fn implicit_provision_rejects_only_the_given_no_mount_options() {
         let raw = Path::new("/cache/vibe/default.raw");
-        assert_eq!(check_implicit_provision(true, true, raw), Ok(()));
+        let root = VmUser::root();
+        assert_eq!(
+            check_implicit_provision(true, true, &root, false, raw),
+            Ok(())
+        );
 
-        let mise = check_implicit_provision(true, false, raw).unwrap_err();
+        let mise = check_implicit_provision(true, false, &root, false, raw).unwrap_err();
         assert!(mise.contains("--no-mount-mise"), "{mise}");
         assert!(!mise.contains("--no-mount-sys-cache"), "{mise}");
         assert!(mise.contains("/cache/vibe/default.raw"), "{mise}");
         assert!(mise.contains("vibe provision --no-mount-mise"), "{mise}");
 
-        let both = check_implicit_provision(false, false, raw).unwrap_err();
+        let both = check_implicit_provision(false, false, &root, false, raw).unwrap_err();
         assert!(
             both.contains("vibe provision --no-mount-sys-cache --no-mount-mise"),
             "{both}"
@@ -1948,10 +2313,51 @@ mod tests {
     }
 
     #[test]
+    fn implicit_provision_for_a_non_root_vm_user_needs_a_root_password() {
+        let raw = Path::new("/cache/vibe/default.raw");
+        let dev = VmUser::parse("dev").unwrap();
+        let error = check_implicit_provision(true, true, &dev, false, raw).unwrap_err();
+        assert!(
+            error.starts_with("--vm-user dev needs a root password"),
+            "{error}"
+        );
+        assert!(
+            error.contains("vibe provision --vm-user dev --root-password <password>"),
+            "{error}"
+        );
+        assert_eq!(
+            check_implicit_provision(true, true, &dev, true, raw),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn existing_image_repl_writes_the_profile_of_the_vm_user_only() {
+        let (root_actions, root_files) = existing_image_repl_actions(&VmUser::root()).unwrap();
+        assert_eq!(root_files[0].0, "/root/.profile");
+        assert!(root_actions.iter().any(|action| matches!(
+            action,
+            LoginAction::Send(text) if text == " . /root/.profile"
+        )));
+
+        let dev = VmUser::parse("dev").unwrap();
+        let (dev_actions, dev_files) = existing_image_repl_actions(&dev).unwrap();
+        assert_eq!(dev_actions.len(), 1);
+        assert!(!dev_files.iter().any(|(path, _)| path == "/root/.profile"));
+        match &dev_actions[0] {
+            LoginAction::Send(text) => {
+                assert!(text.contains("runuser -u \"$VIBE_VM_USER\""), "{text}");
+                assert!(!text.contains("source"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn describe_vm_files_lists_shares_and_written_files() {
         let share = |host: &str, guest: &str, read_only| DirectoryShare {
             host: host.into(),
-            guest: guest.into(),
+            guest: GuestPath::new(guest),
             read_only,
             is_project_dir: false,
         };
@@ -1965,6 +2371,7 @@ mod tests {
                 ("/root/.bash_logout", "built-in"),
                 ("/root/.tmux.conf", "from /home/me/.tmux.conf"),
             ],
+            &VmUser::root(),
         );
         assert_eq!(
             text,
@@ -1980,7 +2387,15 @@ mod tests {
             .join("\n")
         );
 
-        let empty = describe_vm_files("Provision", &[], &[]);
+        let dev = VmUser::parse("dev").unwrap();
+        let relative =
+            describe_vm_files("Run", &[share("/home/me/proj", "proj", false)], &[], &dev);
+        assert!(
+            relative.contains("/home/me/proj -> ~dev/proj (read-write)"),
+            "{relative}"
+        );
+
+        let empty = describe_vm_files("Provision", &[], &[], &VmUser::root());
         assert_eq!(
             empty,
             "Provision: directory shares:\n  (none)\nProvision: files written into the VM:\n  (none)\n"

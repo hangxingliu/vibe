@@ -106,27 +106,30 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 1. 按照上文所述解析磁盘。`DiskSource` 为 `External` 或 `Instance`。仅针对实例磁盘时，网络日志目录才为 `.vibe/`。
    使用默认镜像且 `default.raw` 尚不存在时，`check_implicit_provision` 先拒绝 `--no-mount-sys-cache` / `--no-mount-mise`（错误中列出这些选项、`default.raw` 的路径以及 `vibe provision` 的用法），此时 `ensure_default_image` 尚未查找或下载任何东西。`ensure_default_image` 接收缓存目录，只在需要 provision 时才创建共享，并且总是使用 `cache_share_specs(true, true, false)`。
-2. 除非指定了 `--no-mount-cwd`：将项目目录挂载共享到 `/root/<project>`（`is_project_dir`）并 `cd` 进去。`--mount` 共享同样是 `is_project_dir`。对每个项目目录始终：使用 tmpfs 遮蔽 `.vibe`，使用绑定挂载的空文件遮蔽 `.env`；当宿主机目录存在时从缓存共享 `node_modules`；根据 `--git` 参数共享或遮蔽 `.git`（默认为只读；如果是子模块中的 `.git` 文件则跳过）。然后追加 `cache_share_specs(mount_sys_cache, mount_mise, mount_agents_conf)`；Agent 配置目录（`codex`、`copilot`、`claude`、`gemini`、`pi`、`grok`、`opencode`）仅在 `--mount-agents-conf` 时追加。指定 `--mount-tmux-conf` 时，`tmux_conf_mounts` 在 `~/.tmux` 为目录时将其只读共享，并在宿主机存在 `~/.tmux.conf` 时排队一个写入 `/root/.tmux.conf` 的 `Send` 动作；两者都不存在时打印警告。
-3. 指定 `--write-bashrc` 时追加 `write_bashrc_actions`（把 `src/bashrc.sh` 写入 `/root/.profile`，随后执行 ` . /root/.profile`）。未指定时不写也不 source `.profile`；登录 shell 已经读取过镜像自带的那一份。随后追加宿主机的 `--env` 导出变量（`env_login_actions`）、`HISTFILE`、共享目录表（`motd_login_action`）、设置了 `guest_proxy` 时的代理导出，以及 `--ssh-key` 命令（`authorized_keys`、`systemctl start ssh`、`ip -4 -br addr`）。
-4. 追加用户的 `--script`、`--send` 和 `--expect` 动作。`user_actions` 记录了它们的索引范围，以便后续报错时仅针对这些动作编号。
-5. 打印 `describe_vm_files("Run", ...)`（`/root/.bash_logout`，以及写入时的 `/root/.profile`、`/root/.tmux.conf`）；指定 `--no-mount-mise` / `--no-mount-sys-cache` 时打印共享目录中的工具不可用的提示。调用 `run_vm`。
+2. 除非指定了 `--no-mount-cwd`：将项目目录共享到 `--vm-user` 的 HOME 下的 `<project>`（root 为 `/root/<project>`；`is_project_dir`）并 `cd` 进去。`--mount` 共享同样是 `is_project_dir`。客户机路径是 `GuestPath`（`src/vm_user.rs`）：绝对路径，或相对于该 HOME 的路径。对 root，相对路径展开为 `/root/<path>`；对其他用户展开为 `"${VIBE_VM_HOME}"/<path>`。`project_masks_and_shares` 处理每个项目目录：使用 tmpfs 遮蔽 `.vibe`；当宿主机目录存在时从缓存共享 `node_modules`；根据 `--git` 参数共享或遮蔽 `.git`（默认为只读；如果是子模块中的 `.git` 文件则跳过）。`.env` 等文件不再被遮蔽。然后追加 `cache_share_specs(mount_sys_cache, mount_mise, mount_agents_conf)`：apt 仍在 `/var/cache/apt`，其他缓存相对于 HOME（`.cargo`、`.local/share/mise` 等）；Agent 配置目录（`codex`、`copilot`、`claude`、`gemini`、`pi`、`grok`、`opencode`）仅在 `--mount-agents-conf` 时追加。指定 `--mount-tmux-conf` 时，`tmux_conf_mounts` 在 `~/.tmux` 为目录时将其只读共享到 `.tmux`，并在宿主机存在 `~/.tmux.conf` 时排队一个 `Send` 动作，把它写入用户 HOME 下的 `.tmux.conf`（`write_user_file_into_vm`；非 root 用户由该用户经 `runuser` 自己写入）；两者都不存在时打印警告。
+3. `run_session_plan` 构建一个 `SessionPlan`（`src/session_plan.rs`）。其 `root_prepare` 检查非 root 的 `--vm-user`（`check_vm_user_actions`，见下文）。其 `root_actions` 依次为 tmux 的 `Send`、`--write-bashrc`（root 使用 `write_bashrc_actions`：把 `src/bashrc.sh` 写入 `/root/.profile`，随后执行 ` . /root/.profile`；其他用户使用 `write_user_bashrc_action` 写入该用户的 `~/.profile`，由 `su --login` 读取；未指定时不写也不 source `.profile`），以及 `--ssh-key` 命令（用户的 `authorized_keys`，非 root 用户经 `runuser` 写入；`systemctl start ssh`；`ip -4 -br addr`）。非 root 用户会设置 `switch_user`，会话在 `root_actions` 与 `user_actions` 之间切换到该用户（见下文）。其 `user_actions` 依次为 `cd` 进项目、宿主机的 `--env` 导出变量（`env_login_actions`）、`HISTFILE`、共享目录表（`motd_login_action`，非 root 用户显示为 `~dev/proj` 之类的路径）、设置了 `guest_proxy` 时的代理导出，最后是用户的 `--script`、`--send` 和 `--expect` 动作。`numbered` 记录了用户动作的索引范围，以便后续报错时仅针对这些动作编号。非 root 用户会设置 `restrict_apt_cache` 和 `warn_passwordless_root`。
+4. 打印 `describe_vm_files("Run", ...)`（`/root/.bash_logout`，以及写入时用户 HOME 下的 `.profile`、`.tmux.conf`）；指定 `--no-mount-mise` / `--no-mount-sys-cache` 时打印共享目录中的工具不可用的提示。调用 `run_vm`。
+
+root 的所有动作都在 root shell 中运行，没有切换。其他用户的 `user_actions`（包括 `--send`、`--expect` 和 `--script`）在该用户的 shell 中运行。
 
 ### Provision 命令
 
 `CliCommand::Provision` 处理流程如下：
 
 - 缓存共享为 `cache_share_specs(mount_sys_cache, mount_mise, false)`。指定 `--no-mount-sys-cache` / `--no-mount-mise` 时打印提示：工具会装进镜像自身，运行该镜像时需要使用同样的选项才能看到它们。
-- 带 `--repl` 且镜像已存在、同时未指定 `--replace` 时，打印一行提示和共享日志（`Provision`），并对该镜像调用 `run_vm`（`DiskSource::CachedImage`），唯一的动作是 `write_bashrc_actions`。不运行任何脚本，也不探测该镜像。
+- 非 root 的 `--vm-user` 而没有 root 密码（`--root-password` 或 `VIBE_ROOT_PASSWORD`）时，在复制或启动任何东西之前报错（`check_provision_root_password`）：否则该用户可以用 `su -` 成为 root。
+- 带 `--repl` 且镜像已存在、同时未指定 `--replace` 时，打印一行提示和共享日志（`Provision`），并对该镜像调用 `run_vm`（`DiskSource::CachedImage`），动作来自 `existing_image_repl_actions`（root：`write_bashrc_actions`；其他用户：只有 `write_user_bashrc_action`）。非 root 的 `--vm-user` 由 `check_vm_user_actions` 检查（从不创建），适用 root 无密码的警告，会话会切换到该用户，并提示 `exit` 返回 root shell。不运行任何脚本，也不探测该镜像。
 - 否则解析 `--base`。包含 `/` 的值表示文件系统路径。不含 `/` 的值代表缓存中的 `image_path`。未指定 `--base` 时，由 `ensure_base_image` 提供 Debian raw 镜像。
 - 调用 `provision_image`。
 
-除非指定了 `--replace`，否则 `provision_image`（`src/provision.rs`）会拒绝覆盖已存在的 `<name>.raw`。它会复制基础镜像，调用 `ensure_bootable`，扩容文件，随后构建登录动作。登录动作以 `write_bashrc_actions` 开头：把 `src/bashrc.sh` 写入 `/root/.profile` 并 source，使 PATH 与 mise 激活对脚本生效，该文件也随镜像保存（此处的错误显示为 `[login] setup send`）。然后：
+除非指定了 `--replace`，否则 `provision_image`（`src/provision.rs`）会拒绝覆盖已存在的 `<name>.raw`。它会复制基础镜像，调用 `ensure_bootable`，扩容文件，随后由 `build_provision_plan` 构建 `SessionPlan`。其 `root_prepare` 在共享挂载之前运行：给出密码时先执行 `set_root_password_actions`，然后对非 root 的 `--vm-user` 执行 `ensure_vm_user_actions`（`src/guest/ensure_vm_user.sh`：账号不存在时执行 `useradd --create-home --home-dir /home/<name> --shell /bin/bash --user-group <name>`；已有账号保持不变），之后做与 run 相同的检查。共享与 run 一样挂载在该用户的路径下。其 `root_actions` 以 `install_bindfs_action` 开头（标签为 `install bindfs` 的 `StatusCommand`；`apt-get install bindfs`，`vznat` 的客户机代理直接传给 apt），使任何镜像之后都能以非 root 的 `--vm-user` 运行。然后是 `write_bashrc_actions`：把 `src/bashrc.sh` 写入 `/root/.profile` 并 source，使 PATH 与 mise 激活对脚本生效，该文件也随镜像保存（此处的错误显示为 `[login] setup send`）。非 root 的 `--vm-user` 也会得到同样内容的 `.profile`（`write_user_bashrc_action`）。然后：
 
-1. 一个导出 `VIBE_PROVISION_IMAGE`、`VIBE_PROVISION_BASE`、`VIBE_GIT_SHA`、`VIBE_BUILD_DATE` 和 `VIBE_PROVISION_SCRIPTS` 的 `Send` 动作。
-2. `Script` 动作：首先是来自 `build_provision_script` 的 `@base`（如果设置了 `guest_proxy`，则填充 `provisioning/base.sh` 中的 `INJECT_PROXY_CODE` 区域），然后是其他额外脚本。此范围属于 `user_actions`，因此脚本执行失败会显示为 `[action N: script '...']`。
-3. `finalize-machine-id`。未指定 `--repl` 时，执行 `CLEAR_MACHINE_ID_SCRIPT`，它会拒绝挂载覆盖（mount overlay）或符号链接，并截断清空 `/etc/machine-id` 及常规的 `/var/lib/dbus/machine-id`。指定了 `--repl` 时，执行 `REPL_FINALIZE_SCRIPT`：在 `/run` 下创建一个临时的 `vibe-finalize-template` unit，在关机时清空 id，以便当前打开的 shell 仍保留 systemd 在启动时写入的 id。
-4. 针对 `VIBE_PROVISION_SUCCESS` 的 `Send` / `Expect` 动作。
-5. 未指定 `--repl` 时，执行 `systemctl poweroff; sleep 100`。指定了 `--repl` 时，`run_vm` 会打印交互提示并等待用户退出。
+1. 一个导出 `VIBE_PROVISION_IMAGE`、`VIBE_PROVISION_BASE`、`VIBE_GIT_SHA`、`VIBE_BUILD_DATE`、`VIBE_PROVISION_SCRIPTS` 和 `VIBE_PROVISION_VM_USER` 的 `Send` 动作（`provisioning/base.sh` 把它作为 `vm_user:` 记入 provision 历史）。
+2. 脚本动作：首先是来自 `build_provision_script` 的 `@base`（如果设置了 `guest_proxy`，则填充 `provisioning/base.sh` 中的 `INJECT_PROXY_CODE` 区域），然后是其他额外脚本。此范围是计划中的 `numbered`，因此脚本执行失败会显示为 `[action N: script '...']`。root，以及所有非内置脚本，每个脚本是一个由 root 运行的 `Script`（自定义脚本可以看到 `VIBE_VM_USER` 与 `VIBE_VM_HOME`）。非 root 用户时，内置脚本在 `# vibe:run-as-user` 一行处拆分（`split_run_as_user`）：之前的部分是由 root 运行的 `Script`（没有命令时跳过），之后的部分加上 shebang 行，是以该用户运行的 `UserScript`。每部分自带 `set -euxo pipefail` 与辅助函数。`@base` 只在镜像第一次 provision 时安装 mise：root 部分创建 `/run/vibe/base-first-run`，用户部分在该文件不存在或 `~/.local/state/vibe/base-user.done` 已存在时直接结束。之后再 provision 一个没有该标记的镜像时，会打印用户级工具缺失的警告。
+3. 非 root 用户时执行 `check-vm-user-home`：一个 root `Script`，当用户 HOME（同一文件系统内，跳过挂载点）中有属主为 root 的文件时失败，以免本应属于用户的工具被 root 安装。它的失败显示为 `[shutdown]`。
+4. `finalize-machine-id`。未指定 `--repl` 时，执行 `CLEAR_MACHINE_ID_SCRIPT`，它会拒绝挂载覆盖（mount overlay）或符号链接，并截断清空 `/etc/machine-id` 及常规的 `/var/lib/dbus/machine-id`。指定了 `--repl` 时，执行 `REPL_FINALIZE_SCRIPT`：在 `/run` 下创建一个临时的 `vibe-finalize-template` unit，在关机时清空 id，以便当前打开的 shell 仍保留 systemd 在启动时写入的 id。
+5. 针对 `VIBE_PROVISION_SUCCESS` 的 `Send` / `Expect` 动作。
+6. 未指定 `--repl` 时，执行 `systemctl poweroff; sleep 100`。指定了 `--repl` 时，`run_vm` 会打印交互提示并等待用户退出。`--repl` 且为非 root 用户时，计划设置 `switch_user`，shell 是该用户的；`exit` 返回 root，在 root 中再 `exit` 关机并保存镜像。
 
 调用 `run_vm` 之前会打印 `describe_vm_files(stage, ...)`（`Provision`，或由 `ensure_default_image` 传入的 `Provision (implicit, for the default image)`）以及调用方传入的提示。调用 `run_vm` 时传入 `disk_source: None`，因此本次启动失败不会追加“配置此磁盘（provision this disk）”的提示。虚拟机停止后，如果动作未完成或最终状态不是 `Stopped`，`incomplete_run_error` 会拒绝该次运行。随后 `probe_disk` 必须报告 `MachineIdFact::EmptyFile`，否则会报错 `[verify]` 且镜像不会被发布。最后通过 `fs::rename` 发布该工作副本。
 
@@ -158,12 +161,16 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
 
 `spawn_vm_io` 启动终端线程。客户机的输出会被复制到宿主机终端并输入到 `OutputMonitor`（`wait_for_text`、`wait_for_any`、`wait_for_line_after` 返回 `Found`、`Timeout` 或 `Closed`）。stdin 线程调用 `decide_user_input`：在 `input_open` 设置之前按键会被丢弃，在输入门控关闭时连续按下两次 Ctrl-C 会设置 `stop_requested`。当宿主机终端大小改变时，resize 线程会向 `hvc1` 写入 `rows cols`。
 
-`drive_interactive` 构建完整的动作列表：
+`drive_interactive` 通过 `expand_session`（`src/session_plan.rs`）构建完整的动作列表：
 
 1. `legacy_login_prefix(LOGIN_EXPECT_TIMEOUT, root_password)`，其中 `LOGIN_EXPECT_TIMEOUT` = 120 秒。`root_password` 来自 `--root-password`；未给出该选项时来自 `VIBE_ROOT_PASSWORD`。
-2. 存在共享目录时：执行 `mkdir -p /mnt/shared`、`mount -t virtiofs shared /mnt/shared`，然后为每个共享执行 `mkdir` 和 `mount --bind`。
-3. 来自 `run_main` 或 `provision_image` 的调用方动作。
-4. 尾部两个 `Send` 动作：当命令存在时激活 `mise` 和 `fzf`。
+2. 计划中的 `root_prepare`：root 密码，然后是 `--vm-user` 步骤。对非 root 用户，该步骤导出 `VIBE_VM_USER`、`VIBE_VM_UID`、`VIBE_VM_GID` 和 `VIBE_VM_HOME`，供后续路径与挂载使用。
+3. 存在共享目录时：执行 `mkdir -p /mnt/root/virtiofs-shared && chmod -R 700 /mnt/root && mount -t virtiofs shared /mnt/root/virtiofs-shared`，使 staging 目录只有 root 能到达。然后为每个共享创建目标并把 staging 子目录 `mount --bind` 上去。在非 root 用户的 HOME 下，每个缺失的目录用 `install -d -o "$VIBE_VM_UID" -g "$VIBE_VM_GID"` 逐级创建。设置 `restrict_apt_cache` 时，apt 缓存是一个标签为 `mount apt cache` 的 `StatusCommand`：`bindfs -u _apt -g 0 -p 0755,af-x`，文件显示为 `_apt` 所有，其他用户只能读不能写，root 的 apt 仍下载到宿主机缓存中。缺少 `bindfs` 或 `_apt` 账号时（例如 Vibe 开始安装 `bindfs` 之前 provision 的镜像），回退为可写的绑定挂载，宿主机打印警告并建议重新 provision 或使用 `--no-mount-sys-cache`。
+4. 遮蔽：`mount -t tmpfs -o mode=0555,uid=0,gid=0 tmpfs <path>`，一个属于 root、其他用户无法写入的空目录。
+5. 调用方动作：计划中的 `root_actions`，然后（设置了 `switch_user` 时）是切换，再是 `user_actions`。切换先键入 ` sysctl -q -w dev.tty.legacy_tiocsti=0 2>/dev/null || true`，使用户的程序不能把输入塞回 root shell 的终端；然后 `LoginAction::SwitchUser` 键入 `SWITCH_USER_COMMAND`：` su --login --pty "$VIBE_VM_USER"; echo; echo 'Vibe: back in the root shell. ...'`。root shell 读取的是整行，所以提示只在用户的 shell 退出后出现。随后发送一个与 root 就绪探测相同方式的探测（拆分的标记，然后是 `id -un` 与 `id -u`），每 10 秒重试，最长 120 秒；结果必须是该用户名且 uid 不为 0，否则报错 `LoginFailure::SwitchFailed`（`[login] Switching to vm-user ...`）。切换动作标记为 `[login] setup`。
+6. 尾部两个 `Send` 动作：当命令存在时激活 `mise` 和 `fzf`。
+
+`StatusCommand` 把命令放在一个 stdin 来自 `/dev/null` 的命令组中运行（这样 apt-get 之类的工具无法吃掉其后输入的行），然后打印 `VIBE_STEP_STATUS_<id>` 及 `<退出码> <notice>`。非零退出码使该动作失败。非空的 `__vibe_notice` 会成为 `VmOutput::Notice`，由 `drive_interactive` 打印为警告（例如 `--vm-user` 属于 `sudo` 或 `adm` 组）。
 
 `action_prefix` 标记每个索引。用户范围内的动作用 `[action N: ...]` 标记，从 1 开始计数。该范围之后的调用方动作（provision 的收尾与关机）标记为 `[shutdown] ...`。调用方范围之前的动作以及位于其后的尾部 `mise` 和 `fzf` 发送动作均标记为 `[login] setup ...`。`Send` 动作的 `LoginAction::label` 为单词 `send`，不包含实际输入的文本。
 
@@ -183,11 +190,17 @@ Virtualization.framework 的完成处理程序（completion handler）在进程�
    - 其他匹配不会键入密码，直接进入就绪探测。
 4. 输入就绪探测命令。`readiness_probe_command_and_marker` 构建一个 `printf` 命令，其标记 `VIBE_READY_<nonce>` 被拆分在两个参数中，从而确保回显的命令行本身不包含完整标记。下一行必须是 `id -u` 且结果等于 `0`。其他任何情况均为 `ProbeTimeout` 或 `ProbeNotRoot`（`[login]`）。
 
-当探测返回 uid 0 时发送 `LoginReady`。若客户机要求密码且密码被接受，其中会记录 `password_prompted`。目前不会据此打印警告。在 `ActionsCompleted`（即 setup 发送、共享挂载和调用方动作均完成）之前，`input_open` 始终为 false。在此之前，键盘输入均会被丢弃。
+当探测返回 uid 0 时发送 `LoginReady`。若客户机要求密码且密码被接受，其中会记录 `password_prompted`。该值为 false 且计划设置了 `warn_passwordless_root`（以非 root 的 `--vm-user` 进行 run 或对已有镜像 `--repl`）时，`drive_interactive` 打印 `Warning: root has no password in this image; user '<name>' can become root with 'su -'. ...` 并继续运行。在 `ActionsCompleted`（即 setup 发送、共享挂载和调用方动作均完成）之前，`input_open` 始终为 false。在此之前，键盘输入均会被丢弃。
 
-`legacy_login_prefix` 内的 setup 发送动作包括：`HISTCONTROL=ignorespace` 和 `unset HISTFILE`（使自动执行的命令不计入历史记录）、`stty -F /dev/hvc0 sane`、一个从 `/dev/hvc1` 读取 `rows cols` 并应用到 `hvc0` 的后台循环，随后通过 `write_file_into_vm` 将 `src/bash_logout.sh` 写入 `/root/.bash_logout`。它从不写入或 source `/root/.profile`；provision 与 `--write-bashrc` 改为在调用方的动作中加入 `write_bashrc_actions`。注销脚本在正常退出时会运行 `systemctl poweroff`。如果 shell 属于 SSH 会话、位于 tmux 内或 tmux 存在活动会话，则跳过关机。
+`legacy_login_prefix` 内的 setup 发送动作包括：`HISTCONTROL=ignorespace` 和 `unset HISTFILE`（使自动执行的命令不计入历史记录）、`stty -F /dev/hvc0 sane`、一个从 `/dev/hvc1` 读取 `rows cols` 并应用到 `hvc0` 的后台循环，随后通过 `write_file_into_vm` 将 `src/bash_logout.sh` 写入 `/root/.bash_logout`。它从不写入或 source `/root/.profile`；provision 与 `--write-bashrc` 改为在调用方的动作中加入 `write_bashrc_actions`。注销脚本在正常退出时会运行 `systemctl poweroff`。如果 shell 属于 SSH 会话、位于 tmux 内、tmux 存在活动会话，或有任何 tmux 服务器进程在运行（`pgrep '^tmux: server'`，匹配 tmux 为服务器进程设置的进程名；root 的 `tmux list-sessions` 看不到其他用户的服务器），则跳过关机。
 
-`Script` 动作（`script_command_and_status_marker`）将内容 base64 解码到 `/tmp/vibe-scripts/<id>.sh`，在 stdin 重定向自 `/dev/null` 的情况下运行该文件，并等待 `VIBE_SCRIPT_STATUS_<id>` 及其退出码。非零状态视为 `LoginActionFailed`。脚本超时时间为 24 小时。
+`Script` 动作（`script_command`）将内容 base64 解码到 `/tmp/vibe-scripts-<uid>/<id>.sh`，在 stdin 重定向自 `/dev/null` 的情况下运行该文件，并等待 `VIBE_SCRIPT_STATUS_<id>` 及其退出码。该目录以 0700 权限创建；已存在的目录只有在是当前用户拥有的真实目录时才会复用，否则动作失败。只有 uid 0 才会在脚本前清空页缓存。非零状态视为 `LoginActionFailed`。脚本超时时间为 24 小时。
+
+`UserScript` 动作使用同一个包装，并设置 `as_vm_user`。root 以 0700 创建 `/tmp/vibe-scripts-$VIBE_VM_UID` 并交给该用户（已存在的目录只有在是属于该 UID 的真实目录时才复用）。文件由该用户经 `runuser` 写入，因此其中的符号链接不能让 root 写到别处。脚本随后在用户 HOME 中以 `runuser -u "$VIBE_VM_USER" -- env ... HOME=... USER=... LOGNAME=... SHELL=/bin/bash bash --login -c 'exec "$0"' <file>` 运行：不带 `--login` 的 `runuser` 保留 root 导出的变量（`vznat` 的代理、`VIBE_PROVISION_*`），`env -u` 去掉 root 的 mise 会话变量，登录 shell 读取用户的 `.profile` 后再 `exec` 脚本。必须 `exec`：登录 shell 退出时会执行 `~/.bash_logout`，Debian 默认的该文件最后执行 `clear_console`，其退出码会取代脚本的退出码。
+
+### vm-user 检查
+
+`check_vm_user_actions`（`src/vm_user.rs`）以标签为 `check vm-user` 的 `StatusCommand` 运行 `src/guest/check_vm_user.sh`。退出码 10 到 15 分别表示：账号不存在、UID 为 0、登录 shell 不是 bash、HOME 不是可用的目录、HOME 不属于该账号、HOME 为 `/root`。`drive_interactive` 把它们转为 `LoginFailure::VmUser`：`[login] vm-user '<name>' ...`。账号不存在时建议 `vibe provision --base <disk> --image <new-name> --vm-user <name>`；其他问题说明 Vibe 不修改已有账号。检查成功时，若账号属于 `root`、`sudo`、`adm`、`wheel` 或 `admin` 组，脚本输出 `groups=<list>`，宿主机将其打印为警告。root 跳过该检查。
 
 ### 启动失败提示
 
@@ -340,5 +353,7 @@ Debian 的 SSH 服务端默认拒绝空密码（`PermitEmptyPasswords no`）。�
 | `tests/disk_prepare.rs` | `prepare` | 通过 `src/vm_checks/prepare.rs` 运行 `ensure_bootable`。旧版 Debian 镜像返回 `AlreadyCompatible` 且保持空缓存不变。新版 Debian 镜像则会被处理。 |
 | `tests/alpine_maintenance.rs` | `maintenance-all` | 运行 `src/vm_checks/maintenance.rs`：下载、shadow 编辑、新旧镜像预处理、重复预处理、反向异常磁盘用例、needs-recovery、SSH `PermitEmptyPasswords` 以及日志保留。缓存的 Alpine raw 的 SHA-256 必须保持不变。`maintenance-<name>` 运行其中某一项检查。 |
 | `src/vm_checks/prepare.rs` | `probe` | 对 `VIBE_VM_CHECK_DISK` 执行 `probe_disk`。打印分类、machine-id 状态以及 root 密码字段是否为空。不打印 shadow 字节。 |
+| `tests/vm_user.rs` | `vm-user` | `src/vm_checks/vm_user.rs` 以子进程运行 `vibe` CLI。它从 `VIBE_VM_CHECK_DISK` 的克隆为 `dev` provision 一个 `t-vmcheck-dev` 镜像（带 root 密码），放在临时镜像目录中；检查不存在的 `--vm-user` 会失败；然后以 `dev` 运行一个会话，其脚本检查 uid、项目目录、在项目、可写 `--mount` 与缓存中写入、只读 `--mount`、`.vibe` 屏蔽、`.env` 未被屏蔽、只读的 `.git`（也通过 `.GIT` 与 `.Git`）、staging 目录、`umount`，以及 `bindfs` 下的 apt 缓存。之后键入 `exit`，检查回到了 root shell 且 root 的 apt 可用。 |
+| `tests/vm_user.rs` | `root-password` | 使用同样的 CLI 驱动：provision 一个带密码的 root 镜像，然后分别用正确的密码、错误的密码（`[login]`，且不打印密码）和不带密码（错误中提到 `--root-password`）登录。 |
 
-被忽略的测试依赖于 `VIBE_TEST_DEBIAN_NEW_RAW`、`VIBE_TEST_DEBIAN_OLD_RAW` 和 `VIBE_TEST_ALPINE_RAW`。维护镜像的编辑操作使用来自 `VIBE_E2FS_SBIN` 或 `PATH` 中的 e2fsprogs。`tests/fixtures/make-ext4.sh` 用于重建进程内 ext4 与探测测试所需的 gzip ext4 小镜像。这些镜像被 gitignore；当所需镜像缺失时，测试会运行该脚本。`VIBE_VM_CHECK_DISK` 和 `VIBE_VM_CHECK_CACHE` 为 `probe` 和 `prepare` 选择测试磁盘及 Alpine 缓存路径。设置 `VIBE_MAINT_TEST_PARTUUID` 可以替换写入清单中的 PARTUUID，以便通过反向检查强制触发目标不匹配错误。
+被忽略的测试依赖于 `VIBE_TEST_DEBIAN_NEW_RAW`、`VIBE_TEST_DEBIAN_OLD_RAW` 和 `VIBE_TEST_ALPINE_RAW`。维护镜像的编辑操作使用来自 `VIBE_E2FS_SBIN` 或 `PATH` 中的 e2fsprogs。`tests/fixtures/make-ext4.sh` 用于重建进程内 ext4 与探测测试所需的 gzip ext4 小镜像。这些镜像被 gitignore；当所需镜像缺失时，测试会运行该脚本。`VIBE_VM_CHECK_DISK` 和 `VIBE_VM_CHECK_CACHE` 为 `probe` 和 `prepare` 选择测试磁盘及 Alpine 缓存路径。`vm-user` 与 `root-password` 以 `VIBE_VM_CHECK_DISK` 为基础镜像（只克隆，不修改），并把以空白分隔的 `VIBE_VM_CHECK_ARGS` 加到每次 `vibe` 调用中，例如 `VIBE_VM_CHECK_ARGS="--proxy socks5://127.0.0.1:1080 --dns 1.1.1.1"`。设置 `VIBE_MAINT_TEST_PARTUUID` 可以替换写入清单中的 PARTUUID，以便通过反向检查强制触发目标不匹配错误。

@@ -1,5 +1,6 @@
 #!/bin/bash
 # Install Anthropic's Claude.
+# vibe:run-as-user
 set -euxo pipefail
 
 retry_error=

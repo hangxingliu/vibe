@@ -1,5 +1,6 @@
 #!/bin/bash
 # Install OpenAI's Codex.
+# vibe:run-as-user
 set -euxo pipefail
 
 retry_error=

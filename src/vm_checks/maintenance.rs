@@ -24,6 +24,7 @@ use crate::{
     maintenance::process_disk,
     networking::PreparedNetworkBackend,
     session::LoginAction::{Expect, Script, Send},
+    session_plan::SessionPlan,
     vm_config::{DiskSpec, SerialRole, VmSpec, output_serial},
     vm_lifecycle::{FrameDecision, HeadlessDeadlines, run_headless},
     vm_run::run_vm,
@@ -286,8 +287,7 @@ fn check_recovery(alpine: &Path) -> Result<(), Box<dyn std::error::Error>> {
         &disk,
         None,
         None,
-        &[],
-        0..0,
+        &SessionPlan::root(Vec::new(), 0..0),
         &[],
         |_| PreparedNetworkBackend::VzNat,
         2,
@@ -373,16 +373,18 @@ ssh_check 2>&1 | tee /run/vibe-ssh-check.log
         &copy,
         None,
         None,
-        &[
-            Script {
-                name: "sshd".into(),
-                content: script,
-            },
-            // Matching the script's end marker drains its output from the
-            // monitor, so print the result lines again before powering off.
-            Send(" grep -E '^(SSH|SSHD)_' /run/vibe-ssh-check.log; systemctl poweroff".into()),
-        ],
-        0..2,
+        &SessionPlan::root(
+            vec![
+                Script {
+                    name: "sshd".into(),
+                    content: script,
+                },
+                // Matching the script's end marker drains its output from the
+                // monitor, so print the result lines again before powering off.
+                Send(" grep -E '^(SSH|SSHD)_' /run/vibe-ssh-check.log; systemctl poweroff".into()),
+            ],
+            0..2,
+        ),
         &[],
         |_| PreparedNetworkBackend::VzNat,
         2,
@@ -890,15 +892,17 @@ fn legacy_boot(disk: &Path) -> Result<(), Box<dyn std::error::Error>> {
         disk,
         None,
         None,
-        &[
-            Send(" echo VIBE_SHELL_$(id -u)".into()),
-            Expect {
-                text: "VIBE_SHELL_0".into(),
-                timeout: Duration::from_secs(60),
-            },
-            Send(" systemctl poweroff".into()),
-        ],
-        0..3,
+        &SessionPlan::root(
+            vec![
+                Send(" echo VIBE_SHELL_$(id -u)".into()),
+                Expect {
+                    text: "VIBE_SHELL_0".into(),
+                    timeout: Duration::from_secs(60),
+                },
+                Send(" systemctl poweroff".into()),
+            ],
+            0..3,
+        ),
         &[],
         |_| PreparedNetworkBackend::VzNat,
         2,

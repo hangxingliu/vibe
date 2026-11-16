@@ -1,5 +1,6 @@
 #!/bin/bash
 # Install Github Copilot.
+# vibe:run-as-user
 set -euxo pipefail
 
 retry_error=

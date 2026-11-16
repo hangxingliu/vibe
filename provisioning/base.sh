@@ -17,6 +17,7 @@ fi
   printf 'base: %s\n' "${VIBE_PROVISION_BASE:-unknown}"
   printf 'vibe_git_sha: %s\n' "${VIBE_GIT_SHA:-unknown}"
   printf 'vibe_build_date: %s\n' "${VIBE_BUILD_DATE:-unknown}"
+  printf 'vm_user: %s\n' "${VIBE_PROVISION_VM_USER:-root}"
   echo 'scripts:'
   if [[ -n "${VIBE_PROVISION_SCRIPTS:-}" ]]; then
     while IFS= read -r script; do
@@ -26,8 +27,19 @@ fi
 } >>"${image_history}"
 
 if [[ "${base_first_run}" != true ]]; then
+  # User-level tools are only installed on the first run. A vm-user created
+  # on an image that was already provisioned does not get them.
+  vm_home="${VIBE_VM_HOME:-/root}"
+  if [[ ! -e "${vm_home}/.local/state/vibe/base-user.done" && ! -x "${vm_home}/.local/bin/mise" ]]; then
+    echo "Warning: this image was already provisioned for another user; user-level tools (mise and the tools it installs) are not installed for vm-user '${VIBE_VM_USER:-root}'." >&2
+    echo "Warning: create a new image from a fresh base instead, for example: vibe provision --image <new-name> --vm-user ${VIBE_VM_USER:-root} --root-password <password>" >&2
+  fi
   exit 0
 fi
+
+# Tells the user part below that this is the first run.
+mkdir -p /run/vibe
+touch /run/vibe/base-first-run
 
 # Don't wait too long for slow mirrors.
 echo 'Acquire::http::Timeout "2";' | tee /etc/apt/apt.conf.d/99timeout
@@ -158,7 +170,34 @@ resize2fs /dev/vda1
 # Set hostname to "vibe" so it's clear that you're inside the VM.
 hostnamectl set-hostname vibe
 
-cd /root
+# vibe:run-as-user
+# User-level tools, installed by the vm-user (root by default).
+set -euxo pipefail
+
+retry_error=
+retryable() {
+  if [ -z "$retry_error" ]; then retry_error=0; return 0; fi
+  if [ "$1" == "0" ]; then retry_error=; return 1; fi
+
+  retry_error="$((retry_error+1))";
+  if [[ "$retry_error" -le 3 ]]; then
+    echo "Warn:  waiting 10s and try again (error=${retry_error}) ..." >&2;
+    sleep 10;
+    return 0;
+  fi
+  echo "Error: too many errors and retry attempts, exiting ..." >&2;
+  exit 1;
+}
+exec_retry() {
+  while retryable "$?"; do "${@}"; done
+}
+
+base_user_done="${HOME}/.local/state/vibe/base-user.done"
+if [[ -e "${base_user_done}" || ! -e /run/vibe/base-first-run ]]; then
+  exit 0
+fi
+
+cd "${HOME}"
 mkdir -p .ssh
 
 
@@ -180,7 +219,7 @@ cat > .config/mise/config.toml <<MISE
 python.uv_venv_auto = true
 
 # Trust everything by default, since we're already in a VM sandbox
-trusted_config_paths = ["/root"]
+trusted_config_paths = ["${HOME}"]
 
 # Trust everything by default, since we're already in a VM sandbox
 experimental = true
@@ -203,5 +242,8 @@ touch .config/mise/mise.lock
 
 exec_retry \
 mise install
+
+mkdir -p "$(dirname "${base_user_done}")"
+touch "${base_user_done}"
 
 true;

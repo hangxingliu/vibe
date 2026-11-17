@@ -9,6 +9,7 @@
 use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
 use crate::disk_prepare::ensure_bootable;
+use crate::guest_template::{replace_region, replace_region_if_present, shell_assign};
 use crate::image_dirs::ImageDirs;
 use crate::image_probe::{self, MachineIdFact};
 use crate::images::{ensure_base_image, locate_debian_base};
@@ -327,17 +328,7 @@ fn build_provision_script(
             exports = generate_http_proxy_env_export_cmds(&guest.url, &guest.no_proxy)
         );
 
-        let re = regex::Regex::new(
-            r"(?m)^#\s+region\s+INJECT_PROXY_CODE\n(?:.*\n)*?#\s+endregion\s+INJECT_PROXY_CODE",
-        )
-        .expect("valid INJECT_PROXY_CODE region regex");
-
-        content = re
-            .replace(
-                &content,
-                format!("# region INJECT_PROXY_CODE\n{proxy_code}\n# endregion INJECT_PROXY_CODE"),
-            )
-            .into_owned();
+        content = replace_region_if_present(&content, "INJECT_PROXY_CODE", &proxy_code);
     }
 
     let name = script.name.to_string();

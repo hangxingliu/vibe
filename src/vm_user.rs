@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 
 use std::time::Duration;
 
-use base64::{Engine, engine::general_purpose};
-
+use crate::guest_template::sh_command;
 use crate::session::{LoginAction, shell_word};
 
 const CHECK_VM_USER_SCRIPT: &str = include_str!("guest/check_vm_user.sh");
@@ -85,13 +84,10 @@ impl VmUserProblem {
     }
 }
 
-/// Runs a bundled guest script with `sh`, passing the account name.
-fn run_guest_script(script: &str, user: &VmUser) -> String {
-    let b64 = general_purpose::STANDARD.encode(script);
-    format!(
-        "echo '{b64}' | base64 --decode | sh -s -- {}",
-        shell_word(user.as_str())
-    )
+/// Runs a bundled guest script in a child `sh` before the VirtioFS mount.
+/// `name` is `$0`. The account name is `$1`. stdin stays free.
+fn run_guest_script(script: &str, name: &str, user: &VmUser) -> String {
+    sh_command(script, name, &[user.as_str().to_string()])
 }
 
 /// Exports `VIBE_VM_USER`, `VIBE_VM_UID`, `VIBE_VM_GID`, and `VIBE_VM_HOME`
@@ -117,7 +113,7 @@ pub(crate) fn check_vm_user_actions(user: &VmUser) -> Vec<LoginAction> {
             label: "check vm-user".to_string(),
             command: format!(
                 "__vibe_notice=$({})",
-                run_guest_script(CHECK_VM_USER_SCRIPT, user)
+                run_guest_script(CHECK_VM_USER_SCRIPT, "check_vm_user.sh", user)
             ),
             timeout: VM_USER_STEP_TIMEOUT,
             vm_user: Some(user.clone()),
@@ -138,8 +134,8 @@ pub(crate) fn ensure_vm_user_actions(user: &VmUser) -> Vec<LoginAction> {
             label: "create vm-user".to_string(),
             command: format!(
                 "__vibe_notice=$({} && {})",
-                run_guest_script(ENSURE_VM_USER_SCRIPT, user),
-                run_guest_script(CHECK_VM_USER_SCRIPT, user)
+                run_guest_script(ENSURE_VM_USER_SCRIPT, "ensure_vm_user.sh", user),
+                run_guest_script(CHECK_VM_USER_SCRIPT, "check_vm_user.sh", user)
             ),
             timeout: VM_USER_STEP_TIMEOUT,
             vm_user: Some(user.clone()),
@@ -355,6 +351,26 @@ mod tests {
             );
             assert_eq!(stdout, "", "{entry:?}");
         }
+    }
+
+    #[test]
+    fn vm_user_scripts_use_a_child_shell_and_leave_stdin_free() {
+        let dev = dev();
+        let actions = check_vm_user_actions(&dev);
+        let LoginAction::StatusCommand { command, .. } = &actions[0] else {
+            panic!("expected the check");
+        };
+        assert!(command.contains("sh -c \"$(echo '"), "{command}");
+        assert!(command.contains(" check_vm_user.sh "), "{command}");
+        assert!(!command.contains("sh -s"), "{command}");
+
+        let ensure = ensure_vm_user_actions(&dev);
+        let LoginAction::StatusCommand { command, .. } = &ensure[0] else {
+            panic!("expected create");
+        };
+        assert!(command.contains(" ensure_vm_user.sh "), "{command}");
+        assert!(command.contains(" check_vm_user.sh "), "{command}");
+        assert!(!command.contains("sh -s"), "{command}");
     }
 
     fn dev() -> VmUser {

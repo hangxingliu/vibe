@@ -101,6 +101,9 @@ pub(crate) struct DirectoryShare {
     pub(crate) guest: GuestPath,
     pub(crate) read_only: bool,
     pub(crate) is_project_dir: bool,
+    /// Reachable only through the VirtioFS staging directory. Not bind-mounted,
+    /// and omitted from the host file list and the guest share table.
+    pub(crate) staging_only: bool,
 }
 
 impl DirectoryShare {
@@ -140,7 +143,25 @@ impl DirectoryShare {
             guest,
             read_only,
             is_project_dir,
+            staging_only: false,
         })
+    }
+
+    /// A read-only share that stays on the VirtioFS staging mount.
+    /// `host` must be an existing directory. It is not bind-mounted.
+    pub(crate) fn staging_only(host: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        if !host.is_dir() {
+            return Err(format!("Host path is not a directory: {}", host.display()).into());
+        }
+        let mut share = Self::at(
+            host,
+            GuestPath::new(session_plan::STAGING_DIR),
+            true,
+            false,
+            false,
+        )?;
+        share.staging_only = true;
+        Ok(share)
     }
 
     /// The shared apt cache, which a non-root session mounts with `bindfs`.
@@ -310,7 +331,7 @@ Vibe does not move or delete them. To reuse one, move it by hand while no VM run
 /// Host log of what a VM gets from the host: the directory shares and the
 /// files Vibe writes into it. `written` holds (guest path, source) pairs.
 /// With `restrict_apt_cache` the apt cache is marked as read-only for the
-/// `vm_user` (mounted with `bindfs`).
+/// `vm_user` (mounted with `bindfs`). A staging-only share is omitted.
 pub(crate) fn describe_vm_files(
     stage: &str,
     shares: &[DirectoryShare],
@@ -319,10 +340,11 @@ pub(crate) fn describe_vm_files(
     restrict_apt_cache: bool,
 ) -> String {
     let mut text = format!("{stage}: directory shares:\n");
-    if shares.is_empty() {
+    let listed: Vec<&DirectoryShare> = shares.iter().filter(|share| !share.staging_only).collect();
+    if listed.is_empty() {
         text.push_str("  (none)\n");
     }
-    for share in shares {
+    for share in listed {
         let mode = if share.read_only {
             "read-only".to_string()
         } else if restrict_apt_cache && share.is_apt_cache() {
@@ -467,6 +489,40 @@ mod tests {
         let dev = VmUser::parse("dev").unwrap();
         let notice = legacy_cache_notice(&dir, &specs, &dev).unwrap();
         assert!(notice.contains("user-dev/"), "{notice}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn describe_vm_files_omits_a_staging_only_share() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibe-describe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let project = dir.join("proj");
+        let session_host = dir.join("sess");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&session_host).unwrap();
+        let visible = DirectoryShare::new(project, "proj", false, false, true).unwrap();
+        let session = DirectoryShare::staging_only(session_host).unwrap();
+        let text = describe_vm_files(
+            "Run",
+            &[visible, session.clone()],
+            &[],
+            &VmUser::root(),
+            false,
+        );
+        assert!(text.contains("proj"), "{text}");
+        assert!(
+            !text.contains(&session.host.display().to_string()),
+            "{text}"
+        );
+        let only = describe_vm_files("Run", &[session], &[], &VmUser::root(), false);
+        assert!(only.contains("  (none)\n"), "{only}");
         fs::remove_dir_all(dir).unwrap();
     }
 }

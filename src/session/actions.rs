@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use crate::session_dir::GuestFile;
 use crate::vm_io::{OutputMonitor, VmInput, WaitResult};
 
 use super::LoginAction;
@@ -116,8 +117,8 @@ impl ActionRunner<'_> {
         match action {
             Expect { text, timeout } => self.expect(index, &text, timeout),
             Send(text) => send_text(self.input_tx, text),
-            Script { content, .. } => self.script(index, &content, false),
-            UserScript { content, .. } => self.script(index, &content, true),
+            Script { content, file, .. } => self.script(index, &content, file.as_ref(), false),
+            UserScript { content, file, .. } => self.script(index, &content, file.as_ref(), true),
             LegacyLogin { timeout, password } => self.legacy_login(timeout, password.as_deref()),
             SwitchUser { user, timeout } => {
                 self.login_step(switch_user(&user, timeout, self.monitor, self.input_tx))
@@ -149,9 +150,15 @@ impl ActionRunner<'_> {
         }
     }
 
-    fn script(&self, index: usize, content: &str, as_vm_user: bool) -> Step {
+    fn script(
+        &self,
+        index: usize,
+        content: &str,
+        file: Option<&GuestFile>,
+        as_vm_user: bool,
+    ) -> Step {
         let id = format!("script_{index}");
-        let (command, status_marker) = script_command(&id, content, as_vm_user);
+        let (command, status_marker) = script_command(&id, content, file, as_vm_user);
         match send_text(self.input_tx, command) {
             Step::Stop => Step::Stop,
             Step::Continue => self.await_status(
@@ -290,6 +297,7 @@ mod tests {
         let actions = vec![Script {
             name: "sleep.sh".to_string(),
             content: "sleep 3600\n".to_string(),
+            file: None,
         }];
         let (_input_rx, output_rx, handle) = actions_thread(actions, &monitor);
         thread::sleep(SHORT);
@@ -318,16 +326,18 @@ mod tests {
             Script {
                 name: "fail.sh".to_string(),
                 content: "exit 3\n".to_string(),
+                file: None,
             },
             Send("never".to_string()),
         ];
         let (input_rx, output_rx, handle) = actions_thread(actions, &monitor);
         assert_eq!(typed_line(&input_rx), "echo hi");
         let id = "script_1";
-        // The wrapper is several lines; its last line prints the status marker.
-        while !typed_line(&input_rx).contains("VIBE_SCRIPT_STATUS_") {}
+        // The wrapper is one eval line. It does not contain the status marker.
+        let typed = typed_line(&input_rx);
+        assert!(!typed.contains("VIBE_SCRIPT_STATUS_"), "{typed}");
         // Reply with the status line the wrapper prints after the script.
-        let (_, marker) = script_command(id, "exit 3\n", false);
+        let (_, marker) = script_command(id, "exit 3\n", None, false);
         monitor.push(format!("\r\n{marker}\r\n3\r\n").as_bytes());
         handle.join().unwrap();
         let started: Vec<usize> = output_rx

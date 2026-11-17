@@ -364,6 +364,7 @@ where
                 login_actions.push(Script {
                     name: path,
                     content,
+                    file: None,
                 });
             }
             Long("send") => {

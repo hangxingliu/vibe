@@ -38,6 +38,8 @@
   详见 [docs/network-proxy.md](docs/network-proxy.md)。
 - `--dns <ADDR>` 为虚拟机设置上游 DNS 服务器。多次使用该参数以设置其他服务器。
 - `--ssh-key <PUBLIC_KEY_FILE>` 为 vm-user 安装公钥并启动 SSH 服务。
+  安装脚本： [src/guest/install_ssh_key.sh](src/guest/install_ssh_key.sh)。
+  root 使用同一脚本。`authorized_keys` 以换行结尾。
 - `--git <rw | ro | no>` 控制项目的 `.git` 目录。
   默认值 `ro` 以只读方式共享。
   `rw` 以读写方式共享。
@@ -88,6 +90,7 @@
   使用非 root 的 `--vm-user` 运行会将共享的 apt 缓存通过 `bindfs` 挂载。
   只有 root 的 apt 才能修改该缓存。
   若没有 `bindfs`，缓存将以可写方式挂载 (此时 Vibe 会打印警告)。
+  安装脚本： [src/guest/install_bindfs.sh](src/guest/install_bindfs.sh)。
 - `--root-password <PASSWORD>` 是用于登录的 root 密码。
   省略该参数时，Vibe 会读取 `VIBE_ROOT_PASSWORD`。
   该参数优先级更高，即使其值被拒绝。
@@ -151,6 +154,16 @@
 - VirtioFS 暂存目录为 `/mnt/root/virtiofs-shared`。该目录已从 `/mnt/shared` 迁出。`/mnt/root` 仅 root 可访问。
 - 来自 `--script` 和配置准备的脚本会写入 `/tmp/vibe-scripts-<uid>`（权限为 0700）。
   它们已从 `/tmp/vibe-scripts` 迁出。
+- 运行和配置准备会创建 `<cache>/sessions/<pid>-<nonce>/`（权限 0700），并以只读方式放到 VirtioFS 暂存挂载上。
+  该共享不做 bind 挂载。宿主机文件日志和客户机共享表都不列出它。
+  虚拟机正常停止后删除该目录。不正常停止的情况下之后某次运行发现其 pid 已不存在也会删除这个目录。
+- 非 root 运行在挂载 apt 共享时执行 `src/guest/mount_apt_cache.sh`。
+  `bindfs` 的标准输出转到标准错误。只有 `mount --bind` 成功后才打印回退提示词。
+- 配置准备脚本和 `--script` 文件经只读会话共享进入虚拟机，不再在控制台键入。
+  每个脚本是会话目录中的 `scripts/NNN-<name>.sh`，所以保留的目录能显示实际运行的内容。
+  非 root `--vm-user` 的 run `--script` 仍内嵌传入，因为该用户读不到会话目录。
+- 控制台不再显示脚本包装器，每个脚本只显示一行 `eval`。
+- 配置准备从会话目录 source `provision-env.sh`。它导出 `DEBIAN_FRONTEND=noninteractive` 以及 `VIBE_PROVISION_*`、`VIBE_GIT_SHA`、`VIBE_BUILD_DATE` 变量。
 
 ### 移除
 

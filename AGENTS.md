@@ -23,14 +23,16 @@ Read the module before you change it. Each line names the entry symbols.
 - `src/main.rs`: constants, built-in script table, `run_main` (builds `CommandContext` and dispatches).
 - `src/cli.rs`: CLI parsing (`lexopt`), `CliArgs`, `CliCommand`, `parse_cli_from`. Tests in `src/cli/tests.rs`.
 - `src/help.rs`: `help_text`, `REPO_URL`, the section renderer (`render_section`, 90-column limit), `provisioning_scripts_banner`.
-- `src/run_command.rs`, `src/provision_command.rs`: `run_run` and `run_provision`, the two command bodies of `run_main`.
+- `src/run_command.rs`, `src/provision_command.rs`: `run_run` and `run_provision`, the two command bodies of `run_main`. `run_run` writes `src/guest/install_ssh_key.sh` and, for a non-root user with the apt share, `src/guest/mount_apt_cache.sh`.
 - `src/shares.rs`: cache shares (`CacheShare`, `cache_share_specs`, `legacy_cache_notice`), project masks (`project_masks_and_shares`), `DirectoryShare`, `describe_vm_files`.
 - `src/signing.rs`: `ensure_signed`.
 - `src/vm_user.rs`: `VmUser`, `GuestPath`, guest checks `src/guest/check_vm_user.sh` and `src/guest/ensure_vm_user.sh` (exit codes 10-15 map to `VmUserProblem`).
-- `src/session_plan.rs`: `SessionPlan` phases and `expand_session`. Share staging, bind mounts, masks, bindfs apt cache, switch to the vm-user.
-- `src/session.rs`: `LoginAction`, `legacy_login_prefix`, re-exports of `src/session/*`: `password.rs` (`RootPassword`), `failure.rs` (`LoginFailure`), `shell.rs` (script wrappers, `script_command`), `login.rs` (`legacy_login`, `switch_user`), `actions.rs` (login thread).
+- `src/guest_template.rs`: `replace_region`, `replace_region_if_present`, `shell_assign`, `sh_command`.
+- `src/session_dir.rs`: `SessionDir` (`stage_scripts` writes `scripts/NNN-<name>.sh`), `GuestFile`. Directory `<cache>/sessions/<pid>-<nonce>/` (mode 0700), shared read-only and not bind-mounted.
+- `src/session_plan.rs`: `SessionPlan` phases and `expand_session`. Share staging, bind mounts (not for a staging-only share), masks, `src/guest/mount_apt_cache.sh`, `src/guest/install_bindfs.sh`, switch to the vm-user.
+- `src/session.rs`: `LoginAction`, `legacy_login_prefix`, re-exports of `src/session/*`: `password.rs` (`RootPassword`), `failure.rs` (`LoginFailure`), `shell.rs` (`script_command` renders `src/guest/script_wrapper.sh`), `login.rs` (`legacy_login`, `switch_user`), `actions.rs` (login thread).
 - `src/vm_run.rs`, `src/vm_lifecycle.rs`, `src/vm_config.rs`, `src/vm_io.rs`: boot and drive a VM, headless runs, VM configuration, terminal I/O and input gate.
-- `src/provision.rs`: `ensure_default_image`, `provision_image`, `build_provision_script`, `split_run_as_user`.
+- `src/provision.rs`: `ensure_default_image`, `provision_image`, `build_provision_script`, `split_run_as_user`. `build_provision_plan` writes `src/guest/install_bindfs.sh` and `src/guest/provision-env.sh`. Guest scripts `src/guest/check_vm_user_home.sh`, `src/guest/clear_machine_id.sh`, `src/guest/repl_finalize.sh`.
 - `src/disk_prepare.rs`, `src/maintenance.rs`, `src/alpine.rs`, `src/seed.rs`, `src/guest/maint.sh`, `src/control.rs`: Alpine maintenance VM that prepares new Debian bases.
 - `src/image_probe.rs`, `src/gpt.rs`, `src/ext4ro.rs` (with `src/ext4ro/`), `src/cache.rs`: read-only disk inspection, file locks, clones.
 - `src/images.rs`, `src/image_dirs.rs`: image download, names, lookup across image directories.
@@ -48,6 +50,7 @@ Read the module before you change it. Each line names the entry symbols.
 - Login as root first, mount shares, then switch to a non-root `--vm-user`. Relative `GuestPath`s resolve below that user's HOME.
 - Keep `apt` a `CacheShare::global`. Other caches are `CacheShare::user` (`<cache>/user-<vm-user>/<name>`).
 - Mark the start of user-level work in built-in scripts with `# vibe:run-as-user`. Custom scripts are never split and run as root.
+- Never write secrets into the session directory. It holds scripts and the SSH public key only.
 - Keep dependencies small: `objc2` crates, `lexopt`, `libc`, `regex`, `base64`. Ask before adding a crate.
 - Use no emoji in CLI output or docs. The readme is written by humans; keep edits short and in its voice.
 
@@ -68,6 +71,7 @@ These tests are `#[ignore]` and need a Mac host. Run them with `cargo test -- --
 - Change guest provisioning: edit `provisioning/base.sh`. Existing `default.raw` images do not change.
 - Change proxy rules: edit `src/proxy.rs` and the helper side in `helpers/gvisor-tap-vsock/pkg/services/{noproxy,netproxy,dns,forwarder}` and `pkg/virtualnetwork/proxy.go`. Update `docs/network-proxy.md`.
 - Change shares or masks: update `docs/file-shares-between-vm.md`.
+- Change a guest script that Rust fills in: edit `src/guest/*.sh`. The header names the `# region INJECT_<NAME>_CONFIG` block that Rust replaces.
 - Change boot, login, or provision flow: update `docs/how-vm-boot.md`.
 - Keep each `*.zh-Hans.md` file in sync with its English file.
 

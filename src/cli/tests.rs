@@ -273,7 +273,11 @@ fn run_accepts_its_own_options() {
     assert!(matches!(
         &args.login_actions[..],
         [
-            LoginAction::Script { name, content },
+            LoginAction::Script {
+                name,
+                content,
+                file: None
+            },
             LoginAction::Send(send),
             LoginAction::Expect { text, timeout },
         ] if name == &path_arg

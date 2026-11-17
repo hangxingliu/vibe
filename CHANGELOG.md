@@ -38,6 +38,8 @@ Version 1.0.0 lists everything this fork changes compared to it (upstream versio
   See [docs/network-proxy.md](docs/network-proxy.md).
 - `--dns <ADDR>` sets an upstream DNS server for the VM. Repeat the flag for another server.
 - `--ssh-key <PUBLIC_KEY_FILE>` installs a public key for the vm-user and starts the SSH server.
+  Install script: [src/guest/install_ssh_key.sh](src/guest/install_ssh_key.sh).
+  Root uses the same script. `authorized_keys` ends with a newline.
 - `--git <rw | ro | no>` controls the project's `.git` directory.
   The default `ro` shares it read-only.
   `rw` shares it read-write.
@@ -88,6 +90,7 @@ Version 1.0.0 lists everything this fork changes compared to it (upstream versio
   A run with a non-root `--vm-user` mounts the shared apt cache through `bindfs`.
   Only root's apt can change that cache.
   Without `bindfs`, the cache is mounted writable (Vibe then prints a warning).
+  Install script: [src/guest/install_bindfs.sh](src/guest/install_bindfs.sh).
 - `--root-password <PASSWORD>` is the root password used to log in.
   When the flag is omitted, Vibe reads `VIBE_ROOT_PASSWORD`.
   The flag wins, including when its value is rejected.
@@ -151,6 +154,16 @@ Version 1.0.0 lists everything this fork changes compared to it (upstream versio
 - The VirtioFS staging directory is `/mnt/root/virtiofs-shared`. It moved there from `/mnt/shared`. `/mnt/root` is accessible only by root.
 - Scripts from `--script` and from provisioning are written to `/tmp/vibe-scripts-<uid>` (mode 0700).
   They moved there from `/tmp/vibe-scripts`.
+- Run and provision create `<cache>/sessions/<pid>-<nonce>/` (mode 0700) and share it read-only on the VirtioFS staging mount.
+  The share is not bind-mounted. The host file log and the guest share table omit it.
+  The directory is removed when the VM stops normally. In case of an abnormal stop, a later run that finds the pid no longer exists will also remove this directory.
+- A non-root run that mounts the apt share runs `src/guest/mount_apt_cache.sh`.
+  `bindfs` stdout goes to stderr. The fallback notice is printed only after `mount --bind` succeeds.
+- Provision scripts and `--script` files reach the VM through the read-only session share. They are no longer typed on the console.
+  Each one is `scripts/NNN-<name>.sh` in the session directory, so a kept directory shows what ran.
+  A run `--script` with a non-root `--vm-user` still goes inline, because that user cannot read the session directory.
+- The console no longer shows the script wrapper. It shows one `eval` line per script.
+- Provision sources `provision-env.sh` from the session directory. It exports `DEBIAN_FRONTEND=noninteractive` and the `VIBE_PROVISION_*`, `VIBE_GIT_SHA`, and `VIBE_BUILD_DATE` variables.
 
 ### Removed
 

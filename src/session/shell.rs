@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use base64::{Engine, engine::general_purpose};
 
+use crate::guest_template::{replace_region, shell_assign};
+use crate::session_dir::GuestFile;
 use crate::shares::DirectoryShare;
 use crate::vm_user::VmUser;
 
@@ -100,91 +102,51 @@ pub(crate) fn generate_http_proxy_env_export_cmds(proxy_url: &str, no_proxy: &st
     )
 }
 
-/// Variables of the root shell's mise activation; they would point the
-/// user's own mise at root's state.
-pub(super) const ROOT_MISE_VARIABLES: &str =
-    "-u MISE_SHELL -u __MISE_DIFF -u __MISE_ORIG_PATH -u __MISE_SESSION";
+const SCRIPT_WRAPPER: &str = include_str!("../guest/script_wrapper.sh");
 
 /// Command and status marker of a [`LoginAction::Script`], or with
 /// `as_vm_user` of a [`LoginAction::UserScript`].
 ///
-/// The command is one shell `if` typed into the root shell:
-/// 1. As root, print memory use and drop the page cache.
-/// 2. Make (or reuse) the private script directory
-///    `/tmp/vibe-scripts-<uid>` and write the base64-decoded script there.
-/// 3. Run the script with stdin from /dev/null and keep its exit status.
-///    A failed write sets the status to 1.
-/// 4. After a success, activate mise again so later actions see new tools.
-/// 5. Print an empty line, the marker line, and the status line.
-///
-/// Each uid gets its own directory with mode 700. Users cannot read each
-/// other's scripts, and a directory that root made does not block another user.
-///
-/// The status lines look like this; `printf` joins the two marker halves:
+/// The command is one `eval` of [`SCRIPT_WRAPPER`], base64-encoded so the
+/// console shows that line and not the wrapper. A leading space keeps it out
+/// of shell history. When `file` is set, the wrapper reads that path.
+/// Otherwise it decodes `script`. The wrapper copies the script into
+/// `/tmp/vibe-scripts-<uid>`, runs it with stdin from /dev/null, reactivates
+/// mise after success, and prints:
 ///
 /// ```text
 /// VIBE_SCRIPT_STATUS_<id>
 /// <exit status>
 /// ```
-pub(super) fn script_command(id: &str, script: &str, as_vm_user: bool) -> (String, String) {
-    let b64 = general_purpose::STANDARD.encode(script);
-
-    const STATUS_MARKER_PREFIX: &str = "VIBE_SCRIPT_STATUS_";
-    let status_marker = format!("{STATUS_MARKER_PREFIX}{id}");
-
-    // Run the script with stdin from /dev/null so long-running tools spawned by
-    // the script cannot consume queued wrapper lines before the parent shell
-    // sees them. Print a leading newline before the marker so terminal echo and
-    // control sequences cannot merge the echoed printf command with the marker
-    // line that wait_for_line_after expects. Reactivate mise after each
-    // successful script so later scripts can use newly installed commands.
-    // Only root can drop caches. Each uid gets its own private script
-    // directory, so a directory created by root does not block another user
-    // and users cannot read each other's scripts; an existing directory is
-    // only reused when it is a real directory owned by the current user.
-    //
-    // For the vm-user, root creates the user's directory (or reuses it when
-    // the user owns it) and the user writes the script into it, so a symlink
-    // there cannot make root write elsewhere. A login shell reads the user's
-    // profile and then execs the script: exiting a login shell would run
-    // `~/.bash_logout`, whose last command replaces the script's status.
-    let (prepare, write, run) = if as_vm_user {
-        (
-            "__vibe_script_dir=/tmp/vibe-scripts-$VIBE_VM_UID\n\
-__vibe_script=\"$__vibe_script_dir/{id}.sh\"\n\
-if { { mkdir -m 700 \"$__vibe_script_dir\" 2>/dev/null && chown \"$VIBE_VM_UID:$VIBE_VM_GID\" \"$__vibe_script_dir\"; } || { [ -d \"$__vibe_script_dir\" ] && [ ! -L \"$__vibe_script_dir\" ] && [ \"$(stat -c %u \"$__vibe_script_dir\")\" = \"$VIBE_VM_UID\" ]; }; }",
-            "echo '{b64}' | runuser -u \"$VIBE_VM_USER\" -- sh -c 'base64 --decode >\"$1\" && chmod +x \"$1\"' sh \"$__vibe_script\"",
-            format!(
-                "(cd \"$VIBE_VM_HOME\" && runuser -u \"$VIBE_VM_USER\" -- env {ROOT_MISE_VARIABLES} HOME=\"$VIBE_VM_HOME\" USER=\"$VIBE_VM_USER\" LOGNAME=\"$VIBE_VM_USER\" SHELL=/bin/bash bash --login -c 'exec \"$0\"' \"$__vibe_script\") </dev/null"
-            ),
-        )
+///
+/// The marker is not part of the typed command. The host waits for the line
+/// the wrapper prints.
+pub(super) fn script_command(
+    id: &str,
+    script: &str,
+    file: Option<&GuestFile>,
+    as_vm_user: bool,
+) -> (String, String) {
+    let src = file.map(GuestFile::as_str).unwrap_or("");
+    let b64 = if file.is_none() {
+        general_purpose::STANDARD.encode(script)
     } else {
-        (
-            "__vibe_script_dir=/tmp/vibe-scripts-$(id -u)\n\
-__vibe_script=\"$__vibe_script_dir/{id}.sh\"\n\
-if { mkdir -m 700 \"$__vibe_script_dir\" 2>/dev/null || { [ -d \"$__vibe_script_dir\" ] && [ ! -L \"$__vibe_script_dir\" ] && [ -O \"$__vibe_script_dir\" ]; }; }",
-            "echo '{b64}' | base64 --decode >\"$__vibe_script\" && chmod +x \"$__vibe_script\"",
-            "\"$__vibe_script\" </dev/null".to_string(),
-        )
+        String::new()
     };
-    let prepare = prepare.replace("{id}", id);
-    let write = write.replace("{b64}", &b64);
-    let command = format!(
-        " if [ \"$(id -u)\" = 0 ]; then free -h; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; fi\n\
-{prepare} && {write}; then\n\
-{run}\n\
-status=$?\n\
-else\n\
-echo \"Vibe: cannot write the script into $__vibe_script_dir\" >&2\n\
-status=1\n\
-fi\n\
-if [ \"$status\" -eq 0 ] && [ -x \"$HOME/.local/bin/mise\" ]; then\n\
-eval \"$(\"$HOME/.local/bin/mise\" activate bash)\"\n\
-fi\n\
-printf '\\n%s%s\\n%s\\n' '{STATUS_MARKER_PREFIX}' '{id}' \"$status\""
+    // The directory default lives in the replaced region, so the render keeps it.
+    let body = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        shell_assign("__vibe_script_id", id),
+        shell_assign("__vibe_script_src", src),
+        shell_assign("__vibe_script_b64", &b64),
+        shell_assign("__vibe_as_vm_user", if as_vm_user { "1" } else { "0" }),
+        shell_assign("__vibe_script_dir_base", "/tmp/vibe-scripts"),
     );
-
-    (command, status_marker)
+    let rendered = replace_region(SCRIPT_WRAPPER, "INJECT_SCRIPT_WRAPPER_CONFIG", &body)
+        .expect("script_wrapper.sh has region INJECT_SCRIPT_WRAPPER_CONFIG");
+    let encoded = general_purpose::STANDARD.encode(rendered);
+    let command = format!(" eval \"$(echo '{encoded}' | base64 --decode)\"");
+    (command, format!("VIBE_SCRIPT_STATUS_{id}"))
 }
 
 /// Builds the command of a [`LoginAction::StatusCommand`] and the marker that
@@ -217,7 +179,13 @@ pub(crate) fn motd_login_action(
     directory_shares: &[DirectoryShare],
     vm_user: &VmUser,
 ) -> Option<LoginAction> {
-    if directory_shares.is_empty() {
+    // A staging-only share is internal. The guest table lists the same shares
+    // as the host file log.
+    let shares: Vec<&DirectoryShare> = directory_shares
+        .iter()
+        .filter(|share| !share.staging_only)
+        .collect();
+    if shares.is_empty() {
         return Some(Send(" clear".into()));
     }
 
@@ -227,9 +195,9 @@ pub(crate) fn motd_login_action(
     let mut host_width = host_header.len();
     let mut guest_width = guest_header.len();
     let mut mode_width = mode_header.len();
-    let mut rows = Vec::with_capacity(directory_shares.len());
+    let mut rows = Vec::with_capacity(shares.len());
 
-    for share in directory_shares {
+    for share in shares {
         let host = share.host.to_string_lossy().into_owned();
         let guest = share.guest.display(vm_user);
         let mode = if share.read_only {
@@ -286,6 +254,35 @@ mod tests {
     use crate::session::legacy_login_prefix;
     use crate::session::test_support::*;
     use crate::vm_io::{OutputMonitor, WaitResult};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn motd_omits_a_staging_only_share() {
+        let visible = DirectoryShare {
+            host: std::path::PathBuf::from("/cache/apt"),
+            guest: crate::vm_user::GuestPath::new("/var/cache/apt"),
+            read_only: false,
+            is_project_dir: false,
+            staging_only: false,
+        };
+        let hidden = DirectoryShare {
+            host: std::path::PathBuf::from("/cache/sessions/1"),
+            guest: crate::vm_user::GuestPath::new("/mnt/root/virtiofs-shared"),
+            read_only: true,
+            is_project_dir: false,
+            staging_only: true,
+        };
+        let Send(command) = motd_login_action(&[visible, hidden.clone()], &VmUser::root()).unwrap()
+        else {
+            panic!("expected a Send action");
+        };
+        assert!(command.contains("/cache/apt"), "{command}");
+        assert!(!command.contains("/cache/sessions"), "{command}");
+        let Send(only) = motd_login_action(&[hidden], &VmUser::root()).unwrap() else {
+            panic!("expected a Send action");
+        };
+        assert_eq!(only, " clear");
+    }
 
     fn sent(actions: &[LoginAction]) -> Vec<&str> {
         actions
@@ -367,51 +364,242 @@ mod tests {
         );
     }
 
-    #[test]
-    fn script_wrapper_uses_a_private_directory_per_uid() {
-        let (command, _) = script_command("script_0", "true\n", false);
-        assert!(command.contains("/tmp/vibe-scripts-$(id -u)"), "{command}");
-        assert!(command.contains("mkdir -m 700"), "{command}");
-        assert!(
-            command.starts_with(
-                " if [ \"$(id -u)\" = 0 ]; then free -h; echo 3 > /proc/sys/vm/drop_caches"
-            ),
-            "{command}"
-        );
+    fn decode_eval_line(command: &str) -> String {
+        let marker = "echo '";
+        let start = command.find(marker).expect(command) + marker.len();
+        let end = command[start..].find("' | base64").expect(command) + start;
+        let bytes = general_purpose::STANDARD
+            .decode(&command[start..end])
+            .expect("eval payload is base64");
+        String::from_utf8(bytes).expect("wrapper is utf-8")
     }
 
     #[test]
-    fn user_script_wrapper_runs_the_script_as_the_vm_user() {
-        let (command, marker) = script_command("script_4", "true\n", true);
-        assert_eq!(marker, "VIBE_SCRIPT_STATUS_script_4");
+    fn script_command_types_one_eval_line() {
+        let script = "#!/bin/sh\nexit 4\n";
+        let (command, marker) = script_command("script_0", script, None, false);
+        assert_eq!(marker, "VIBE_SCRIPT_STATUS_script_0");
+        assert_eq!(command.lines().count(), 1, "{command}");
+        assert!(command.starts_with(' '), "{command}");
+        assert!(!command.contains("VIBE_SCRIPT_STATUS_"), "{command}");
+        assert!(!command.contains("exit 4"), "{command}");
+        let rendered = decode_eval_line(&command);
+        let b64 = general_purpose::STANDARD.encode(script);
         assert!(
-            command.contains("__vibe_script_dir=/tmp/vibe-scripts-$VIBE_VM_UID\n"),
-            "{command}"
+            rendered.contains(&format!("__vibe_script_b64='{b64}'")),
+            "{rendered}"
+        );
+        assert!(rendered.contains("__vibe_script_src=''"), "{rendered}");
+        assert!(rendered.contains("__vibe_as_vm_user='0'"), "{rendered}");
+
+        let private = std::path::Path::new("/tmp")
+            .join(format!("vibe-scripts-{}", unsafe { libc::getuid() }));
+        let _ = std::fs::remove_dir_all(&private);
+        let run = eval_wrapper(&command);
+        assert!(
+            run.stdout.contains("VIBE_SCRIPT_STATUS_script_0\n4\n"),
+            "{}",
+            run.stdout
+        );
+        assert_clean_shell(&run);
+        let _ = std::fs::remove_dir_all(&private);
+
+        let cache = scratch_wrapper();
+        let mut session = crate::session_dir::SessionDir::create(&cache).unwrap();
+        let file = session.write("scripts/000-demo.sh", script).unwrap();
+        let (command, marker) = script_command("script_2", script, Some(&file), true);
+        assert_eq!(marker, "VIBE_SCRIPT_STATUS_script_2");
+        assert_eq!(command.lines().count(), 1, "{command}");
+        assert!(command.starts_with(' '), "{command}");
+        assert!(!command.contains("VIBE_SCRIPT_STATUS_"), "{command}");
+        assert!(!command.contains("exit 4"), "{command}");
+        let rendered = decode_eval_line(&command);
+        assert!(
+            rendered.contains(&format!("__vibe_script_src='{}'", file.as_str())),
+            "{rendered}"
+        );
+        assert!(rendered.contains("__vibe_script_b64=''"), "{rendered}");
+        assert!(rendered.contains("__vibe_as_vm_user='1'"), "{rendered}");
+        session.finish(true).unwrap();
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    const SCRIPT_WRAPPER: &str = super::SCRIPT_WRAPPER;
+
+    fn render_wrapper(id: &str, src: &str, b64: &str, dir_base: &str) -> String {
+        use crate::guest_template::{replace_region, shell_assign};
+        let body = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            shell_assign("__vibe_script_id", id),
+            shell_assign("__vibe_script_src", src),
+            shell_assign("__vibe_script_b64", b64),
+            shell_assign("__vibe_as_vm_user", "0"),
+            shell_assign("__vibe_script_dir_base", dir_base),
+        );
+        replace_region(SCRIPT_WRAPPER, "INJECT_SCRIPT_WRAPPER_CONFIG", &body)
+            .expect("script_wrapper.sh has region INJECT_SCRIPT_WRAPPER_CONFIG")
+    }
+
+    struct WrapperRun {
+        stdout: String,
+        stderr: String,
+    }
+
+    fn eval_wrapper(script: &str) -> WrapperRun {
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(
+                "eval \"$(cat)\"\n\
+                 echo alive\n\
+                 printf 'VARS=%s\\n' \"$(compgen -v __vibe_ || true)\"\n\
+                 printf 'FUNCS=%s\\n' \"$(declare -F __vibe_script_text || true)\"\n",
+            )
+            .env("HOME", "/no-such-mise-home")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            output.status.success(),
+            "status {:?}\nstdout {stdout}\nstderr {stderr}",
+            output.status
+        );
+        WrapperRun { stdout, stderr }
+    }
+
+    fn assert_clean_shell(run: &WrapperRun) {
+        assert!(run.stdout.contains("\nalive\n"), "{}", run.stdout);
+        assert!(run.stdout.contains("VARS=\n"), "{}", run.stdout);
+        assert!(run.stdout.contains("FUNCS=\n"), "{}", run.stdout);
+        assert!(!run.stdout.contains("VARS=__vibe"), "{}", run.stdout);
+    }
+
+    fn script_dir(base: &std::path::Path) -> std::path::PathBuf {
+        let uid = unsafe { libc::getuid() };
+        base.join(format!("vibe-scripts-{uid}"))
+    }
+
+    fn scratch_wrapper() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "vibe-wrapper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn script_wrapper_root_branch_runs_a_file_and_reports_its_status() {
+        let dir = scratch_wrapper();
+        let source = dir.join("exit3.sh");
+        std::fs::write(&source, "#!/bin/sh\nexit 3\n").unwrap();
+        let base = dir.join("vibe-scripts");
+        let script = render_wrapper(
+            "script_0",
+            &source.to_string_lossy(),
+            "",
+            &base.to_string_lossy(),
+        );
+        let run = eval_wrapper(&script);
+        let marker = "VIBE_SCRIPT_STATUS_script_0\n";
+        let at = run.stdout.find(marker).expect(&run.stdout);
+        assert!(
+            run.stdout[at + marker.len()..].starts_with("3\n"),
+            "{}",
+            run.stdout
+        );
+        assert_clean_shell(&run);
+        let created = script_dir(&dir);
+        let mode = std::fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_wrapper_root_branch_runs_inline_base64() {
+        let dir = scratch_wrapper();
+        let b64 = general_purpose::STANDARD.encode("#!/bin/sh\nexit 3\n");
+        let base = dir.join("vibe-scripts");
+        let script = render_wrapper("script_1", "", &b64, &base.to_string_lossy());
+        let run = eval_wrapper(&script);
+        let marker = "VIBE_SCRIPT_STATUS_script_1\n";
+        let at = run.stdout.find(marker).expect(&run.stdout);
+        assert!(
+            run.stdout[at + marker.len()..].starts_with("3\n"),
+            "{}",
+            run.stdout
+        );
+        assert_clean_shell(&run);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_wrapper_reports_a_missing_source_file() {
+        let dir = scratch_wrapper();
+        let missing = dir.join("missing.sh");
+        let base = dir.join("vibe-scripts");
+        let script = render_wrapper(
+            "script_2",
+            &missing.to_string_lossy(),
+            "",
+            &base.to_string_lossy(),
+        );
+        let run = eval_wrapper(&script);
+        assert!(
+            run.stdout.contains("VIBE_SCRIPT_STATUS_script_2\n1\n"),
+            "{}",
+            run.stdout
         );
         assert!(
-            command.contains("chown \"$VIBE_VM_UID:$VIBE_VM_GID\" \"$__vibe_script_dir\""),
-            "{command}"
+            run.stderr.contains("cannot write the script"),
+            "{}",
+            run.stderr
+        );
+        assert_clean_shell(&run);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_wrapper_refuses_a_symlinked_script_directory() {
+        let dir = scratch_wrapper();
+        let base = dir.join("vibe-scripts");
+        let link = script_dir(&dir);
+        std::os::unix::fs::symlink("/tmp", &link).unwrap();
+        let source = dir.join("exit3.sh");
+        std::fs::write(&source, "#!/bin/sh\nexit 3\n").unwrap();
+        let script = render_wrapper(
+            "script_3",
+            &source.to_string_lossy(),
+            "",
+            &base.to_string_lossy(),
+        );
+        let run = eval_wrapper(&script);
+        assert!(
+            run.stdout.contains("VIBE_SCRIPT_STATUS_script_3\n1\n"),
+            "{}",
+            run.stdout
         );
         assert!(
-            command.contains("[ \"$(stat -c %u \"$__vibe_script_dir\")\" = \"$VIBE_VM_UID\" ]"),
-            "{command}"
+            run.stderr.contains("cannot write the script"),
+            "{}",
+            run.stderr
         );
-        // The user writes the file, not root.
-        assert!(
-            command.contains("| runuser -u \"$VIBE_VM_USER\" -- sh -c 'base64 --decode"),
-            "{command}"
-        );
-        assert!(
-            command.contains(
-                "(cd \"$VIBE_VM_HOME\" && runuser -u \"$VIBE_VM_USER\" -- env -u MISE_SHELL"
-            ),
-            "{command}"
-        );
-        assert!(
-            command.contains(
-                "SHELL=/bin/bash bash --login -c 'exec \"$0\"' \"$__vibe_script\") </dev/null\n"
-            ),
-            "{command}"
-        );
+        assert_clean_shell(&run);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

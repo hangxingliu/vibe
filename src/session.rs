@@ -3,6 +3,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use crate::session_dir::GuestFile;
 use crate::vm_user::VmUser;
 
 mod actions;
@@ -35,6 +36,8 @@ pub(crate) enum LoginAction {
     Script {
         name: String,
         content: String,
+        /// Session-share path. `None` embeds `content` in the wrapper.
+        file: Option<GuestFile>,
     },
     /// Like [`LoginAction::Script`], but typed into the root shell and run as
     /// the `--vm-user` (`VIBE_VM_*` must be set) with `runuser` and a login
@@ -43,6 +46,8 @@ pub(crate) enum LoginAction {
     UserScript {
         name: String,
         content: String,
+        /// Session-share path. `None` embeds `content` in the wrapper.
+        file: Option<GuestFile>,
     },
     /// Logs in as root on the serial console and confirms with a readiness
     /// probe that a root shell is accepting input. Each wait is bounded by
@@ -162,6 +167,7 @@ mod tests {
         let script = Script {
             name: "base".to_string(),
             content: String::new(),
+            file: None,
         };
         // Caller actions 7..12: two Vibe setup actions, three user actions,
         // then one Vibe shutdown action.
@@ -186,6 +192,7 @@ mod tests {
         let finalize = Script {
             name: "finalize-machine-id".to_string(),
             content: String::new(),
+            file: None,
         };
         assert_eq!(
             action_prefix(12, &caller, &user, &finalize),

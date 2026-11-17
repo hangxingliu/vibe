@@ -259,6 +259,7 @@ ssh_check 2>&1 | tee /run/vibe-ssh-check.log
                 Script {
                     name: "sshd".into(),
                     content: script,
+                    file: None,
                 },
                 // Matching the script's end marker drains its output from the
                 // monitor, so print the result lines again before powering off.

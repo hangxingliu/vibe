@@ -1,7 +1,6 @@
 #!/bin/sh
 # Maintenance script for the Alpine maintenance VM (POSIX sh / busybox ash).
-# shellcheck -s sh src/guest/maint.sh
-# shellcheck is not a build dependency.
+# $ shellcheck -s sh src/guest/maint.sh   # shellcheck is not a build dependency.
 #
 # The manifest nonce is inside the seed, so the seed is mounted and parsed
 # before PREP-READY. Frames after that still follow

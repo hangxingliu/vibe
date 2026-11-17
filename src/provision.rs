@@ -21,7 +21,8 @@ use crate::session::{
     RootPassword, generate_http_proxy_env_export_cmds, set_root_password_actions,
     shell_single_quote, write_bashrc_actions, write_user_bashrc_action,
 };
-use crate::session_plan::{SessionPlan, install_bindfs_action};
+use crate::session_dir::{self, SessionDir};
+use crate::session_plan::{SessionPlan, install_bindfs_action, render_install_bindfs};
 use crate::shares::{DirectoryShare, cache_share_specs, create_cache_shares, describe_vm_files};
 use crate::vm_run::run_vm;
 use crate::vm_user::{GuestPath, VmUser, ensure_vm_user_actions};
@@ -84,105 +85,14 @@ fn is_builtin(script: &ProvisionScript) -> bool {
         .any(|builtin| builtin.name == script.name && builtin.content == script.content)
 }
 
-/// Fails when a file below the vm-user's HOME, other than a mount point, is
-/// owned by root, so user-level tools installed by root are not published.
-const CHECK_VM_USER_HOME_SCRIPT: &str = r#"#!/bin/sh
-set -eu
-root_owned=$(find "$VIBE_VM_HOME" -xdev -user 0 2>/dev/null | while IFS= read -r path; do
-    mountpoint -q "$path" || printf '%s\n' "$path"
-done)
-if [ -n "$root_owned" ]; then
-    echo "refusing to publish: files below $VIBE_VM_HOME are owned by root:" >&2
-    printf '%s\n' "$root_owned" | head -n 20 >&2
-    exit 1
-fi
-"#;
-
-/// Truncate the on-disk machine-id after systemd has committed it.
-/// A mount over `/etc/machine-id` means the commit has not happened yet, and
-/// truncating it would only clear the overlay.
-const CLEAR_MACHINE_ID_SCRIPT: &str = r#"#!/bin/sh
-set -eu
-overlay=$(findmnt -n /etc/machine-id || true)
-if [ -n "$overlay" ]; then
-    echo "refusing to publish: /etc/machine-id is still a mount overlay" >&2
-    exit 1
-fi
-if [ -L /etc/machine-id ] || [ ! -f /etc/machine-id ]; then
-    echo "refusing to publish: /etc/machine-id is not a regular file" >&2
-    exit 1
-fi
-: > /etc/machine-id
-if [ -s /etc/machine-id ]; then
-    echo "refusing to publish: /etc/machine-id is not empty" >&2
-    exit 1
-fi
-db=/var/lib/dbus/machine-id
-if [ -L "$db" ]; then
-    target=$(readlink "$db") || exit 1
-    case $target in
-        /etc/machine-id|../../../etc/machine-id) ;;
-        *)
-            echo "refusing to publish: dbus machine-id symlink is not /etc/machine-id" >&2
-            exit 1
-            ;;
-    esac
-elif [ -f "$db" ]; then
-    : > "$db"
-elif [ -e "$db" ]; then
-    echo "refusing to publish: dbus machine-id has an unexpected file type" >&2
-    exit 1
-fi
-sync
-"#;
-
-/// Install a transient unit that clears machine-id at poweroff. The unit and
-/// its script live under `/run` and are not part of the published image.
-/// `ExecStop` runs on both `exit` (`.bash_logout` powers off) and
-/// `systemctl poweroff`. `/run` is mounted `noexec`, so the script is run
-/// through `/bin/sh` instead of being executed directly.
-const REPL_FINALIZE_SCRIPT: &str = r#"#!/bin/sh
-set -eu
-overlay=$(findmnt -n /etc/machine-id || true)
-if [ -n "$overlay" ]; then
-    echo "refusing to publish: /etc/machine-id is still a mount overlay" >&2
-    exit 1
-fi
-mkdir -p /run/vibe-finalize
-cat > /run/vibe-finalize/clear-machine-id.sh << 'EOF'
-#!/bin/sh
-set -eu
-if [ -L /etc/machine-id ] || [ ! -f /etc/machine-id ]; then
-    echo "vibe-finalize-template: /etc/machine-id is not a regular file" >&2
-    exit 1
-fi
-: > /etc/machine-id
-db=/var/lib/dbus/machine-id
-if [ -L "$db" ]; then
-    target=$(readlink "$db") || exit 1
-    case $target in
-        /etc/machine-id|../../../etc/machine-id) ;;
-        *)
-            echo "vibe-finalize-template: dbus machine-id symlink is not /etc/machine-id" >&2
-            exit 1
-            ;;
-    esac
-elif [ -f "$db" ]; then
-    : > "$db"
-elif [ -e "$db" ]; then
-    echo "vibe-finalize-template: dbus machine-id has an unexpected file type" >&2
-    exit 1
-fi
-sync
-EOF
-systemd-run \
-    --unit=vibe-finalize-template \
-    -p Type=oneshot \
-    -p RemainAfterExit=yes \
-    -p 'ExecStop=/bin/sh /run/vibe-finalize/clear-machine-id.sh' \
-    /bin/true
-systemctl is-active --quiet vibe-finalize-template.service
-"#;
+/// `src/guest/check_vm_user_home.sh`.
+const CHECK_VM_USER_HOME_SCRIPT: &str = include_str!("guest/check_vm_user_home.sh");
+/// `src/guest/clear_machine_id.sh`.
+const CLEAR_MACHINE_ID_SCRIPT: &str = include_str!("guest/clear_machine_id.sh");
+/// `src/guest/repl_finalize.sh`.
+const REPL_FINALIZE_SCRIPT: &str = include_str!("guest/repl_finalize.sh");
+/// `src/guest/provision-env.sh`.
+const PROVISION_ENV_SCRIPT: &str = include_str!("guest/provision-env.sh");
 
 fn keep_failed_work() -> bool {
     env::var("VIBE_KEEP_FAILED_WORK").ok().as_deref() == Some("1")
@@ -286,6 +196,7 @@ pub(crate) fn ensure_default_image(
         create_cache_shares(cache_dir, &cache_share_specs(true, true, false), vm_user)?;
     provision_image(
         dirs,
+        cache_dir,
         &base.raw,
         default_raw,
         false,
@@ -333,7 +244,11 @@ fn build_provision_script(
 
     let name = script.name.to_string();
     if vm_user.is_root() || !is_builtin(script) {
-        return vec![Script { name, content }];
+        return vec![Script {
+            name,
+            content,
+            file: None,
+        }];
     }
     let (root_part, user_part) = split_run_as_user(&content);
     let mut actions = Vec::new();
@@ -341,15 +256,47 @@ fn build_provision_script(
         actions.push(Script {
             name: name.clone(),
             content: root_part,
+            file: None,
         });
     }
     if let Some(user_part) = user_part {
         actions.push(UserScript {
             name,
             content: user_part,
+            file: None,
         });
     }
     actions
+}
+
+/// Renders [`PROVISION_ENV_SCRIPT`]. The root shell sources the file, so the
+/// provisioning scripts inherit `DEBIAN_FRONTEND` and the `VIBE_PROVISION_*`
+/// variables.
+fn render_provision_env(
+    image_name: &str,
+    base_raw: &str,
+    git_sha: &str,
+    build_date: &str,
+    script_names: &str,
+    vm_user: &str,
+) -> String {
+    let body = format!(
+        "export DEBIAN_FRONTEND=noninteractive\n\
+         export {}\n\
+         export {}\n\
+         export {}\n\
+         export {}\n\
+         export {}\n\
+         export {}\n",
+        shell_assign("VIBE_PROVISION_IMAGE", image_name),
+        shell_assign("VIBE_PROVISION_BASE", base_raw),
+        shell_assign("VIBE_GIT_SHA", git_sha),
+        shell_assign("VIBE_BUILD_DATE", build_date),
+        shell_assign("VIBE_PROVISION_SCRIPTS", script_names),
+        shell_assign("VIBE_PROVISION_VM_USER", vm_user),
+    );
+    replace_region(PROVISION_ENV_SCRIPT, "INJECT_PROVISION_ENV_CONFIG", &body)
+        .expect("provision-env.sh has region INJECT_PROVISION_ENV_CONFIG")
 }
 
 /// The session of a provision that runs scripts. Before the mounts, root
@@ -358,6 +305,12 @@ fn build_provision_script(
 /// After the mounts, `bindfs` is installed, then `.profile` is written and
 /// the scripts run (numbered `[action N: ...]`), followed by the finalize
 /// and poweroff steps.
+///
+/// `session` receives `install_bindfs.sh` and `provision-env.sh`.
+/// The root shell sources `provision-env.sh`, which exports `DEBIAN_FRONTEND`
+/// and the `VIBE_PROVISION_*` variables. `install_bindfs.sh` runs in a child
+/// process and exports `DEBIAN_FRONTEND` itself.
+#[allow(clippy::too_many_arguments)]
 fn build_provision_plan(
     image_name: &str,
     base_raw: &Path,
@@ -366,6 +319,7 @@ fn build_provision_plan(
     repl: bool,
     root_password: Option<Arc<RootPassword>>,
     vm_user: &VmUser,
+    session: &mut SessionDir,
 ) -> Result<SessionPlan, Box<dyn std::error::Error>> {
     let mut root_prepare = Vec::new();
     if let Some(password) = root_password {
@@ -374,8 +328,14 @@ fn build_provision_plan(
     root_prepare.extend(ensure_vm_user_actions(vm_user));
 
     // Every provision installs bindfs, so any image can later run with a
-    // non-root `--vm-user`.
-    let mut login_actions = vec![install_bindfs_action(guest_proxy)];
+    // non-root `--vm-user`. The install script sets DEBIAN_FRONTEND itself.
+    let bindfs_script = render_install_bindfs(guest_proxy);
+    let bindfs_file = session
+        .write("install_bindfs.sh", &bindfs_script)
+        .map_err(|err| {
+            format!("[prepare] cannot write install_bindfs.sh into the session directory: {err}")
+        })?;
+    let mut login_actions = vec![install_bindfs_action(&bindfs_file)];
 
     // `.profile` sets up PATH and mise activation for the scripts, and is
     // saved with the image. A non-root `vm_user` gets its own copy, read by
@@ -390,21 +350,20 @@ fn build_provision_plan(
         .map(|script| script.name.as_ref())
         .collect::<Vec<_>>()
         .join("\n");
-
-    login_actions.push(Send(format!(
-        " export VIBE_PROVISION_IMAGE='{}'\n\
-export VIBE_PROVISION_BASE='{}'\n\
-export VIBE_GIT_SHA='{}'\n\
-export VIBE_BUILD_DATE='{}'\n\
-export VIBE_PROVISION_SCRIPTS='{}'\n\
-export VIBE_PROVISION_VM_USER='{}'",
-        shell_single_quote(image_name),
-        shell_single_quote(&base_raw.to_string_lossy()),
+    let env_script = render_provision_env(
+        image_name,
+        &base_raw.to_string_lossy(),
         env!("GIT_SHA"),
         env!("BUILD_DATE"),
-        shell_single_quote(&script_names),
-        vm_user.as_str()
-    )));
+        &script_names,
+        vm_user.as_str(),
+    );
+    let env_file = session
+        .write("provision-env.sh", &env_script)
+        .map_err(|err| {
+            format!("[prepare] cannot write provision-env.sh into the session directory: {err}")
+        })?;
+    login_actions.push(Send(format!(" . {}", env_file.as_shell())));
 
     // `[action N: ...]` numbers the provisioning script actions (`@base`
     // first); a built-in script split for a non-root `vm_user` takes two.
@@ -418,6 +377,7 @@ export VIBE_PROVISION_VM_USER='{}'",
         login_actions.push(Script {
             name: "check-vm-user-home".to_string(),
             content: CHECK_VM_USER_HOME_SCRIPT.to_string(),
+            file: None,
         });
     }
 
@@ -431,6 +391,7 @@ export VIBE_PROVISION_VM_USER='{}'",
         } else {
             CLEAR_MACHINE_ID_SCRIPT.to_string()
         },
+        file: None,
     });
 
     login_actions.push(Send(format!(" echo {PROVISION_SUCCESS_MARKER}")));
@@ -465,11 +426,13 @@ Type `exit` to return to the root shell for system-level changes; `exit` there (
     }
 }
 
+/// `cache_dir` holds the session directory for this provision.
 /// `stage` names the provision in the host log of shares and written files;
 /// `notes` are printed after that log, before the VM starts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn provision_image(
     dirs: &ImageDirs,
+    cache_dir: &Path,
     base_raw: &Path,
     image_raw: &Path,
     replace: bool,
@@ -550,7 +513,9 @@ pub(crate) fn provision_image(
         .collect();
 
         let login_password = root_password.clone();
-        let plan = build_provision_plan(
+        let mut session = SessionDir::create(cache_dir)
+            .map_err(|err| format!("[prepare] cannot create the session directory: {err}"))?;
+        let mut plan = match build_provision_plan(
             &image_name,
             base_raw,
             &scripts,
@@ -558,9 +523,23 @@ pub(crate) fn provision_image(
             repl,
             root_password,
             vm_user,
-        )?;
+            &mut session,
+        ) {
+            Ok(plan) => plan,
+            Err(err) => {
+                session_dir::close_session(session, false)?;
+                return Err(err);
+            }
+        };
+        if let Err(err) = session.stage_scripts(&mut plan) {
+            session_dir::close_session(session, false)?;
+            return Err(err);
+        }
 
         let actions_completed_notice = repl.then(|| provision_repl_notice(vm_user));
+
+        let mut shares = directory_shares.to_vec();
+        shares.push(session.share().clone());
 
         let written_files = provision_written_files(vm_user);
         let written_files: Vec<(&str, &str)> = written_files
@@ -569,7 +548,7 @@ pub(crate) fn provision_image(
             .collect();
         print!(
             "{}",
-            describe_vm_files(stage, directory_shares, &written_files, vm_user, false)
+            describe_vm_files(stage, &shares, &written_files, vm_user, false)
         );
         for note in notes {
             println!("{note}");
@@ -580,13 +559,22 @@ pub(crate) fn provision_image(
             None,
             None,
             &plan,
-            directory_shares,
+            &shares,
             prepare_network_backend,
             cpu_count,
             ram_bytes,
             actions_completed_notice,
             login_password,
-        )?;
+        );
+        let stopped = outcome.as_ref().is_ok_and(|item| item.stopped_normally);
+        if let Err(err) = session_dir::close_session(session, stopped) {
+            if let Err(vm_err) = outcome {
+                eprintln!("{err}");
+                return Err(vm_err);
+            }
+            return Err(err);
+        }
+        let outcome = outcome?;
         if let Some(error) = incomplete_run_error(
             &image_name,
             outcome.actions_completed,
@@ -623,8 +611,8 @@ pub(crate) fn provision_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        RUN_AS_USER_MARKER, build_provision_plan, build_provision_script, has_commands,
-        incomplete_run_error, split_run_as_user,
+        RUN_AS_USER_MARKER, SessionPlan, build_provision_plan, build_provision_script,
+        has_commands, incomplete_run_error, render_provision_env, split_run_as_user,
     };
     use crate::proxy::GuestProxy;
     use crate::session::{LoginAction, RootPassword};
@@ -633,6 +621,79 @@ mod tests {
     use std::borrow::Cow;
     use std::path::Path;
     use std::sync::Arc;
+
+    fn provision_plan(
+        scripts: &[&ProvisionScript],
+        repl: bool,
+        root_password: Option<Arc<RootPassword>>,
+        vm_user: &VmUser,
+    ) -> (SessionPlan, String) {
+        let cache = std::env::temp_dir().join(format!(
+            "vibe-provision-plan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&cache).unwrap();
+        let mut session = crate::session_dir::SessionDir::create(&cache).unwrap();
+        let plan = build_provision_plan(
+            "demo",
+            Path::new("/bases/debian.raw"),
+            scripts,
+            &None,
+            repl,
+            root_password,
+            vm_user,
+            &mut session,
+        )
+        .unwrap();
+        let env = std::fs::read_to_string(session.host().join("provision-env.sh")).unwrap();
+        let _ = session.finish(true);
+        let _ = std::fs::remove_dir_all(&cache);
+        (plan, env)
+    }
+
+    fn sourced_provision_env(script: &str) -> Vec<String> {
+        let command = "\
+. /dev/stdin
+printf '%s\\0' \"$DEBIAN_FRONTEND\"
+printf '%s\\0' \"$VIBE_PROVISION_IMAGE\"
+printf '%s\\0' \"$VIBE_PROVISION_BASE\"
+printf '%s\\0' \"$VIBE_GIT_SHA\"
+printf '%s\\0' \"$VIBE_BUILD_DATE\"
+printf '%s\\0' \"$VIBE_PROVISION_SCRIPTS\"
+printf '%s\\0' \"$VIBE_PROVISION_VM_USER\"
+";
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .env_clear()
+            .env("PATH", "/bin:/usr/bin")
+            .env("HOME", "/tmp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        let mut parts = text.split('\0');
+        (0..7).map(|_| parts.next().unwrap().to_string()).collect()
+    }
 
     fn script_content(name: &'static str, guest_proxy: &Option<GuestProxy>) -> String {
         let script = ProvisionScript {
@@ -713,16 +774,7 @@ mod tests {
             description: Cow::Borrowed(""),
             content: Cow::Borrowed("echo extra\n"),
         };
-        let plan = build_provision_plan(
-            "demo",
-            Path::new("/bases/debian.raw"),
-            &[&base, &extra],
-            &None,
-            false,
-            Some(password),
-            &VmUser::root(),
-        )
-        .unwrap();
+        let (plan, env) = provision_plan(&[&base, &extra], false, Some(password), &VmUser::root());
 
         // Root needs no account step; the password is set first.
         assert_eq!(plan.root_prepare.len(), 2);
@@ -737,8 +789,26 @@ mod tests {
             other => panic!("expected the chpasswd command, got {other:?}"),
         }
         assert_eq!(plan.root_actions[0].label(), "install bindfs");
+        assert!(plan.root_actions.iter().any(|action| matches!(
+            action,
+            LoginAction::Send(text)
+                if text.starts_with(" . ") && text.contains("provision-env.sh")
+        )));
+        assert!(!plan.root_actions.iter().any(|action| matches!(
+            action,
+            LoginAction::Send(text) if text.contains("export DEBIAN_FRONTEND")
+                || text.contains("export VIBE_PROVISION_")
+        )));
+        let sourced = sourced_provision_env(&env);
+        assert_eq!(sourced[0], "noninteractive");
+        assert_eq!(sourced[1], "demo");
+        assert_eq!(sourced[2], "/bases/debian.raw");
+        assert_eq!(sourced[3], env!("GIT_SHA"));
+        assert_eq!(sourced[4], env!("BUILD_DATE"));
+        assert_eq!(sourced[5], "base\nextra");
+        assert_eq!(sourced[6], "root");
         assert!(plan.user_actions.is_empty());
-        assert!(!plan.restrict_apt_cache && !plan.warn_passwordless_root);
+        assert!(plan.apt_cache_script.is_none() && !plan.warn_passwordless_root);
         assert!(plan.numbered.start > 1);
         match &plan.root_actions[plan.numbered.start] {
             LoginAction::Script { name, .. } => assert_eq!(name, "base"),
@@ -752,21 +822,9 @@ mod tests {
             action,
             LoginAction::Send(text) if text.contains("systemctl poweroff")
         )));
-        assert!(plan.root_actions.iter().any(|action| matches!(
-            action,
-            LoginAction::Send(text) if text.contains("export VIBE_PROVISION_VM_USER='root'")
-        )));
+        assert!(env.contains("export VIBE_PROVISION_VM_USER='root'"));
 
-        let repl = build_provision_plan(
-            "demo",
-            Path::new("/bases/debian.raw"),
-            &[&base],
-            &None,
-            true,
-            None,
-            &VmUser::root(),
-        )
-        .unwrap();
+        let (repl, _) = provision_plan(&[&base], true, None, &VmUser::root());
         assert!(repl.root_prepare.is_empty());
         assert!(repl.root_actions.iter().all(|action| match action {
             LoginAction::Send(text) => !text.contains("chpasswd") && !text.contains("VIBE_PW_"),
@@ -787,16 +845,7 @@ mod tests {
             content: Cow::Borrowed("echo base\n"),
         };
         let dev = VmUser::parse("dev").unwrap();
-        let plan = build_provision_plan(
-            "demo",
-            Path::new("/bases/debian.raw"),
-            &[&base],
-            &None,
-            false,
-            Some(password),
-            &dev,
-        )
-        .unwrap();
+        let (plan, env) = provision_plan(&[&base], false, Some(password), &dev);
 
         let labels: Vec<String> = plan.root_prepare.iter().map(|a| a.label()).collect();
         assert_eq!(labels[1], "set root password");
@@ -812,11 +861,30 @@ mod tests {
         assert_eq!(plan.vm_user, dev);
         assert_eq!(plan.root_actions[0].label(), "install bindfs");
         // Scripts still run as root and see every share at its root path.
-        assert!(!plan.restrict_apt_cache);
-        assert!(plan.root_actions.iter().any(|action| matches!(
-            action,
-            LoginAction::Send(text) if text.contains("export VIBE_PROVISION_VM_USER='dev'")
-        )));
+        assert!(plan.apt_cache_script.is_none());
+        assert!(env.contains("export VIBE_PROVISION_VM_USER='dev'"));
+        assert_eq!(sourced_provision_env(&env)[6], "dev");
+    }
+
+    #[test]
+    fn provision_env_source_keeps_quotes_newlines_and_dollars() {
+        let image = "o'brien";
+        let base = "/bases/o'brien.raw";
+        let scripts = "base\nextra's $HOME";
+        let script = render_provision_env(image, base, "sha'1", "2026-11-17", scripts, "dev");
+        let sourced = sourced_provision_env(&script);
+        assert_eq!(
+            sourced,
+            vec![
+                "noninteractive".to_string(),
+                image.to_string(),
+                base.to_string(),
+                "sha'1".to_string(),
+                "2026-11-17".to_string(),
+                scripts.to_string(),
+                "dev".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -927,16 +995,7 @@ mod tests {
         let password = Arc::new(RootPassword::parse("pw", "--root-password").unwrap());
         let dev = VmUser::parse("dev").unwrap();
         let scripts = [builtin("base"), builtin("codex")];
-        let plan = build_provision_plan(
-            "demo",
-            Path::new("/bases/debian.raw"),
-            &scripts,
-            &None,
-            false,
-            Some(password.clone()),
-            &dev,
-        )
-        .unwrap();
+        let (plan, _) = provision_plan(&scripts, false, Some(password.clone()), &dev);
         let labels: Vec<String> = plan.root_actions.iter().map(|a| a.label()).collect();
         let profiles: Vec<&String> = plan
             .root_actions
@@ -965,28 +1024,10 @@ mod tests {
         assert_eq!(labels[check + 1], "script 'finalize-machine-id'");
         assert!(!plan.switch_user);
 
-        let repl = build_provision_plan(
-            "demo",
-            Path::new("/bases/debian.raw"),
-            &scripts,
-            &None,
-            true,
-            Some(password),
-            &dev,
-        )
-        .unwrap();
+        let (repl, _) = provision_plan(&scripts, true, Some(password), &dev);
         assert!(repl.switch_user);
 
-        let root = build_provision_plan(
-            "demo",
-            Path::new("/bases/debian.raw"),
-            &scripts,
-            &None,
-            true,
-            None,
-            &VmUser::root(),
-        )
-        .unwrap();
+        let (root, _) = provision_plan(&scripts, true, None, &VmUser::root());
         assert!(!root.switch_user);
         assert_eq!(
             kinds(&root.root_actions[root.numbered.clone()]),

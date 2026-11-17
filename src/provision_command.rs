@@ -159,6 +159,7 @@ pub(crate) fn run_provision(
     }
     provision_image(
         ctx.image_dirs,
+        ctx.cache_dir,
         &base_raw,
         &target_image_raw,
         replace,

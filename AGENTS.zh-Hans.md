@@ -23,14 +23,16 @@ Vibe 是一个 Rust 单文件程序，在 ARM Mac 上启动 Debian Linux 虚拟�
 - `src/main.rs`：常量、内置脚本表、`run_main`（构造 `CommandContext` 并分发）。
 - `src/cli.rs`：CLI 解析（`lexopt`）、`CliArgs`、`CliCommand`、`parse_cli_from`。测试在 `src/cli/tests.rs`。
 - `src/help.rs`：`help_text`、`REPO_URL`、分节渲染器（`render_section`，90 列上限）、`provisioning_scripts_banner`。
-- `src/run_command.rs`、`src/provision_command.rs`：`run_run` 与 `run_provision`，即 `run_main` 的两个命令体。
+- `src/run_command.rs`、`src/provision_command.rs`：`run_run` 与 `run_provision`，即 `run_main` 的两个命令体。`run_run` 写入 `src/guest/install_ssh_key.sh`；非 root 用户且存在 apt 共享时，还写入 `src/guest/mount_apt_cache.sh`。
 - `src/shares.rs`：缓存共享（`CacheShare`、`cache_share_specs`、`legacy_cache_notice`）、项目目录遮蔽（`project_masks_and_shares`）、`DirectoryShare`、`describe_vm_files`。
 - `src/signing.rs`：`ensure_signed`。
 - `src/vm_user.rs`：`VmUser`、`GuestPath`，客户机检查脚本 `src/guest/check_vm_user.sh` 和 `src/guest/ensure_vm_user.sh`（退出码 10-15 对应 `VmUserProblem`）。
-- `src/session_plan.rs`：`SessionPlan` 各阶段与 `expand_session`。共享暂存、bind 挂载、遮蔽、bindfs 挂载 apt 缓存、切换到 vm-user。
-- `src/session.rs`：`LoginAction`、`legacy_login_prefix`，并重新导出 `src/session/*`：`password.rs`（`RootPassword`）、`failure.rs`（`LoginFailure`）、`shell.rs`（脚本包装 `script_command`）、`login.rs`（`legacy_login`、`switch_user`）、`actions.rs`（登录线程）。
+- `src/guest_template.rs`：`replace_region`、`replace_region_if_present`、`shell_assign`、`sh_command`。
+- `src/session_dir.rs`：`SessionDir`（`stage_scripts` 写入 `scripts/NNN-<name>.sh`）、`GuestFile`。目录 `<cache>/sessions/<pid>-<nonce>/`（权限 0700），只读共享，不做 bind 挂载。
+- `src/session_plan.rs`：`SessionPlan` 各阶段与 `expand_session`。共享暂存、bind 挂载（仅暂存的共享不做 bind 挂载）、遮蔽、`src/guest/mount_apt_cache.sh`、`src/guest/install_bindfs.sh`、切换到 vm-user。
+- `src/session.rs`：`LoginAction`、`legacy_login_prefix`，并重新导出 `src/session/*`：`password.rs`（`RootPassword`）、`failure.rs`（`LoginFailure`）、`shell.rs`（`script_command` 渲染 `src/guest/script_wrapper.sh`）、`login.rs`（`legacy_login`、`switch_user`）、`actions.rs`（登录线程）。
 - `src/vm_run.rs`、`src/vm_lifecycle.rs`、`src/vm_config.rs`、`src/vm_io.rs`：启动并驱动虚拟机、无头运行、虚拟机配置、终端 I/O 与输入闸门。
-- `src/provision.rs`：`ensure_default_image`、`provision_image`、`build_provision_script`、`split_run_as_user`。
+- `src/provision.rs`：`ensure_default_image`、`provision_image`、`build_provision_script`、`split_run_as_user`。`build_provision_plan` 写入 `src/guest/install_bindfs.sh` 与 `src/guest/provision-env.sh`。客户机脚本 `src/guest/check_vm_user_home.sh`、`src/guest/clear_machine_id.sh`、`src/guest/repl_finalize.sh`。
 - `src/disk_prepare.rs`、`src/maintenance.rs`、`src/alpine.rs`、`src/seed.rs`、`src/guest/maint.sh`、`src/control.rs`：用 Alpine 维护虚拟机处理新的 Debian 基础镜像。
 - `src/image_probe.rs`、`src/gpt.rs`、`src/ext4ro.rs`（含 `src/ext4ro/`）、`src/cache.rs`：只读磁盘检查、文件锁、克隆。
 - `src/images.rs`、`src/image_dirs.rs`：镜像下载、命名、跨镜像目录查找。
@@ -48,6 +50,7 @@ Vibe 是一个 Rust 单文件程序，在 ARM Mac 上启动 Debian Linux 虚拟�
 - 先以 root 登录并挂载共享，再切换到非 root 的 `--vm-user`。相对 `GuestPath` 解析到该用户的 HOME 下。
 - `apt` 保持为 `CacheShare::global`。其他缓存为 `CacheShare::user`（`<cache>/user-<vm-user>/<name>`）。
 - 内置脚本用 `# vibe:run-as-user` 标记用户级部分的开始。自定义脚本从不拆分，以 root 运行。
+- 绝不把密钥写入会话目录。它只存放脚本和 SSH 公钥。
 - 依赖保持精简：`objc2` 系列、`lexopt`、`libc`、`regex`、`base64`。新增 crate 前先征询。
 - CLI 输出和文档不用 emoji。readme 由人撰写；改动保持简短并沿用其语气。
 
@@ -68,6 +71,7 @@ Vibe 是一个 Rust 单文件程序，在 ARM Mac 上启动 Debian Linux 虚拟�
 - 修改客户机初始化：编辑 `provisioning/base.sh`。已有的 `default.raw` 不会变化。
 - 修改代理规则：编辑 `src/proxy.rs` 以及辅助程序侧的 `helpers/gvisor-tap-vsock/pkg/services/{noproxy,netproxy,dns,forwarder}` 和 `pkg/virtualnetwork/proxy.go`。更新 `docs/network-proxy.md`。
 - 修改共享或遮蔽：更新 `docs/file-shares-between-vm.md`。
+- 修改由 Rust 填充的客户机脚本：编辑 `src/guest/*.sh`。模板头部有 Rust 替换的 `# region INJECT_<NAME>_CONFIG` 区块。
 - 修改启动、登录或 provision 流程：更新 `docs/how-vm-boot.md`。
 - 每个 `*.zh-Hans.md` 与对应英文文件保持同步。
 

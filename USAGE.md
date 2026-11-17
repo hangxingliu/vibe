@@ -79,7 +79,7 @@ By default everything in the VM runs as root. To give the agent an ordinary acco
     vibe provision --image dev --vm-user dev --root-password 'something-secret' @codex
     vibe --image dev --vm-user dev --root-password 'something-secret'
 
-Provisioning creates the account (`useradd`, its own group, bash, `/home/dev`), sets the root password, and installs the user-level tools of the built-in scripts (mise, rustup, coding agents) as `dev`. Your own provisioning scripts still run as root; they can use `runuser -u "$VIBE_VM_USER" -- ...`.
+Provisioning creates the account (`useradd`, its own group, bash, `/home/dev`), sets the root password, and installs the user-level tools of the built-in scripts (mise, rustup, coding agents) as `dev`. Your own provisioning scripts still run as root; they can use `runuser -u "$VIBE_VM_USER" -- ...`. A custom script can `source "$VIBE_PROVISION_INCLUDE"` and call `exec_retry`.
 `VIBE_ROOT_PASSWORD` can be used instead of `--root-password`.
 
 When running, Vibe logs in as root, mounts the shares below `/home/dev`, and then switches to `dev` with `su --login`. Login actions (`--send`, `--expect`, `--script`) run as `dev`.

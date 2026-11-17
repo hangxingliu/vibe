@@ -79,7 +79,7 @@ vibe provision [OPTIONS] [PROVISION-OPTIONS] [@built-in | path/to/script.sh ...]
     vibe provision --image dev --vm-user dev --root-password 'something-secret' @codex
     vibe --image dev --vm-user dev --root-password 'something-secret'
 
-配置过程会创建该账户（`useradd`、专属用户组、bash、`/home/dev`），设置 root 密码，并以 `dev` 身份安装内置脚本的用户级工具（mise、rustup、代码 Agent）。你自己的配置脚本仍然以 root 身份运行；它们可以使用 `runuser -u "$VIBE_VM_USER" -- ...`。
+配置过程会创建该账户（`useradd`、专属用户组、bash、`/home/dev`），设置 root 密码，并以 `dev` 身份安装内置脚本的用户级工具（mise、rustup、代码 Agent）。你自己的配置脚本仍然以 root 身份运行；它们可以使用 `runuser -u "$VIBE_VM_USER" -- ...`。自定义脚本可以 `source "$VIBE_PROVISION_INCLUDE"` 并调用 `exec_retry`。
 可以使用 `VIBE_ROOT_PASSWORD` 代替 `--root-password`。
 
 运行时，Vibe 以 root 身份登录，将共享挂载到 `/home/dev` 下，然后使用 `su --login` 切换到 `dev`。登录操作（`--send`、`--expect`、`--script`）以 `dev` 身份运行。

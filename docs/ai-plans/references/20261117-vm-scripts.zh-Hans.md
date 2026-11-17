@@ -143,7 +143,7 @@ seed ISO (build_seed)          不走 send_text；Alpine 维护 VM 自行运行
 | [`gemini.sh`](../../../provisioning/gemini.sh) | 无 | antigravity 安装脚本 |
 | [`grok.sh`](../../../provisioning/grok.sh) | 无 | `x.ai/cli/install.sh` |
 
-所有脚本自带 `retryable` / `exec_retry`（最多重试 3 次，间隔 10 秒）。
+provision 脚本通过 `source "$VIBE_PROVISION_INCLUDE"` 获得 `exec_retry`（最多重试 3 次，间隔 10 秒）。源文件是 `src/guest/provision_include.sh`。
 
 provision 前置导出的环境变量（`build_provision_plan` 写 `provision-env.sh`，root shell ` . ` 加载）：`DEBIAN_FRONTEND=noninteractive`、`VIBE_PROVISION_IMAGE`、`VIBE_PROVISION_BASE`、`VIBE_GIT_SHA`、`VIBE_BUILD_DATE`、`VIBE_PROVISION_SCRIPTS`、`VIBE_PROVISION_VM_USER`。
 

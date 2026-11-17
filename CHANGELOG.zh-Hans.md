@@ -109,6 +109,7 @@
   它们还会打印写入虚拟机的文件以及镜像目录查找顺序。这些操作均在虚拟机启动前发生。
 - 登录操作仍在运行时键入的按键会被丢弃。在此期间连按两次 Ctrl-C 可停止虚拟机。
 - 无法进入 root shell 的启动过程会报告失败的阶段。当镜像可能需要准备时，错误信息会建议运行 `vibe provision`。
+- provision 脚本可以 `source "$VIBE_PROVISION_INCLUDE"` 来调用 `exec_retry`。
 
 ### 变更
 
@@ -172,3 +173,7 @@
 - **破坏性变更：** 移除了 `--no-default-mounts`。
   请使用 `--no-mount-cwd`、`--no-mount-sys-cache` 和 `--no-mount-mise`。
   `.vibe` 屏蔽和 `node_modules` 共享无法被关闭。`--git` 仍可控制 `.git`。
+
+### 修复
+
+- 内置 provision 脚本在 `set -e` 下的网络重试从未进入第二次。`exec_retry` 现在会重试。

@@ -51,9 +51,9 @@ pub(crate) const RUN_AS_USER_MARKER: &str = "# vibe:run-as-user";
 
 /// The root part and, when the script has [`RUN_AS_USER_MARKER`], the user
 /// part of a built-in provisioning script. Each part carries its own header
-/// (`set` options, retry functions): sharing the lines before the marker
-/// would also repeat root commands in the user part. The user part only
-/// gets the script's `#!` line.
+/// (`set` options and a source of the provision include): sharing the lines
+/// before the marker would also repeat root commands in the user part. The
+/// user part only gets the script's `#!` line.
 fn split_run_as_user(content: &str) -> (String, Option<String>) {
     let mut offset = 0;
     for line in content.split_inclusive('\n') {
@@ -93,6 +93,8 @@ const CLEAR_MACHINE_ID_SCRIPT: &str = include_str!("guest/clear_machine_id.sh");
 const REPL_FINALIZE_SCRIPT: &str = include_str!("guest/repl_finalize.sh");
 /// `src/guest/provision-env.sh`.
 const PROVISION_ENV_SCRIPT: &str = include_str!("guest/provision-env.sh");
+/// `src/guest/provision_include.sh`, written as `scripts/include.sh`.
+const PROVISION_INCLUDE_SCRIPT: &str = include_str!("guest/provision_include.sh");
 
 fn keep_failed_work() -> bool {
     env::var("VIBE_KEEP_FAILED_WORK").ok().as_deref() == Some("1")
@@ -306,10 +308,12 @@ fn render_provision_env(
 /// the scripts run (numbered `[action N: ...]`), followed by the finalize
 /// and poweroff steps.
 ///
-/// `session` receives `install_bindfs.sh` and `provision-env.sh`.
+/// `session` receives `install_bindfs.sh`, `provision-env.sh`, and
+/// `scripts/include.sh` (the bytes of `src/guest/provision_include.sh`).
 /// The root shell sources `provision-env.sh`, which exports `DEBIAN_FRONTEND`
 /// and the `VIBE_PROVISION_*` variables. `install_bindfs.sh` runs in a child
-/// process and exports `DEBIAN_FRONTEND` itself.
+/// process and exports `DEBIAN_FRONTEND` itself. The script wrapper copies
+/// `scripts/include.sh` beside each staged script.
 #[allow(clippy::too_many_arguments)]
 fn build_provision_plan(
     image_name: &str,
@@ -362,6 +366,11 @@ fn build_provision_plan(
         .write("provision-env.sh", &env_script)
         .map_err(|err| {
             format!("[prepare] cannot write provision-env.sh into the session directory: {err}")
+        })?;
+    session
+        .write("scripts/include.sh", PROVISION_INCLUDE_SCRIPT)
+        .map_err(|err| {
+            format!("[prepare] cannot write scripts/include.sh into the session directory: {err}")
         })?;
     login_actions.push(Send(format!(" . {}", env_file.as_shell())));
 
@@ -619,6 +628,7 @@ mod tests {
     use crate::vm_user::VmUser;
     use crate::{BUILTIN_PROVISION_SCRIPTS, ProvisionScript};
     use std::borrow::Cow;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -954,6 +964,12 @@ printf '%s\\0' \"$VIBE_PROVISION_VM_USER\"
                 "{}",
                 script.name
             );
+            assert!(
+                user_part.contains("source \"${VIBE_PROVISION_INCLUDE"),
+                "{}",
+                script.name
+            );
+            assert!(!user_part.contains("retryable()"), "{}", script.name);
             assert!(!user_part.contains("apt "), "{}", script.name);
         }
 
@@ -1039,5 +1055,134 @@ printf '%s\\0' \"$VIBE_PROVISION_VM_USER\"
                 .iter()
                 .any(|a| a.label().contains("check-vm-user-home"))
         );
+    }
+
+    struct RetryRun {
+        status: i32,
+        stdout: String,
+        stderr: String,
+        sleeps: String,
+    }
+
+    /// Runs `body` under `set -euo pipefail` after sourcing the provision
+    /// include. A fake `sleep` on `PATH` records its arguments and returns.
+    fn run_with_exec_retry(setup: impl Fn(&std::path::Path), body: &str) -> RetryRun {
+        let dir = std::env::temp_dir().join(format!(
+            "vibe-exec-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("include.sh"), super::PROVISION_INCLUDE_SCRIPT).unwrap();
+        let sleep_log = dir.join("sleep.log");
+        let sleep_bin = dir.join("sleep");
+        std::fs::write(
+            &sleep_bin,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$VIBE_FAKE_SLEEP_LOG\"\n",
+        )
+        .unwrap();
+        let mut mode = std::fs::metadata(&sleep_bin).unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&sleep_bin, mode).unwrap();
+        setup(&dir);
+        let script = format!(
+            "set -euo pipefail\nsource '{}'\n{body}\nprintf 'continued\\n'\n",
+            dir.join("include.sh").display()
+        );
+        let path = std::env::var("PATH").unwrap_or_default();
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(&dir)
+            .env("PATH", format!("{}:{}", dir.display(), path))
+            .env("VIBE_FAKE_SLEEP_LOG", &sleep_log)
+            .output()
+            .unwrap();
+        let sleeps = std::fs::read_to_string(&sleep_log).unwrap_or_default();
+        let run = RetryRun {
+            status: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            sleeps,
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        run
+    }
+
+    #[test]
+    fn exec_retry_succeeds_on_the_third_attempt_and_the_script_continues() {
+        let run = run_with_exec_retry(
+            |dir| {
+                let flaky = dir.join("flaky");
+                std::fs::write(
+                    &flaky,
+                    "#!/bin/bash\nn=0\nif [ -f \"$1\" ]; then n=$(cat \"$1\"); fi\nn=$((n + 1))\nprintf '%s\\n' \"$n\" >\"$1\"\n[ \"$n\" -ge 3 ]\n",
+                )
+                .unwrap();
+                let mut mode = std::fs::metadata(&flaky).unwrap().permissions();
+                mode.set_mode(0o755);
+                std::fs::set_permissions(&flaky, mode).unwrap();
+            },
+            "exec_retry ./flaky ./count",
+        );
+        assert_eq!(
+            run.status, 0,
+            "stdout {}\nstderr {}",
+            run.stdout, run.stderr
+        );
+        assert!(run.stdout.contains("continued\n"), "{}", run.stdout);
+        assert!(
+            run.stderr
+                .contains("Warn:  waiting 10s and try again (error=1)"),
+            "{}",
+            run.stderr
+        );
+        assert!(
+            run.stderr
+                .contains("Warn:  waiting 10s and try again (error=2)"),
+            "{}",
+            run.stderr
+        );
+        assert!(!run.stderr.contains("error=3"), "{}", run.stderr);
+        assert_eq!(run.sleeps, "10\n10\n");
+    }
+
+    #[test]
+    fn exec_retry_exits_after_four_failures() {
+        let run = run_with_exec_retry(|_dir| {}, "exec_retry false");
+        assert_eq!(
+            run.status, 1,
+            "stdout {}\nstderr {}",
+            run.stdout, run.stderr
+        );
+        assert!(!run.stdout.contains("continued"), "{}", run.stdout);
+        assert!(
+            run.stderr
+                .contains("Warn:  waiting 10s and try again (error=1)"),
+            "{}",
+            run.stderr
+        );
+        assert!(
+            run.stderr
+                .contains("Warn:  waiting 10s and try again (error=2)"),
+            "{}",
+            run.stderr
+        );
+        assert!(
+            run.stderr
+                .contains("Warn:  waiting 10s and try again (error=3)"),
+            "{}",
+            run.stderr
+        );
+        assert!(
+            run.stderr
+                .contains("Error: too many errors and retry attempts, exiting ..."),
+            "{}",
+            run.stderr
+        );
+        assert_eq!(run.sleeps, "10\n10\n10\n");
     }
 }

@@ -49,30 +49,14 @@ echo 'Acquire::Retries "3";' | tee -a /etc/apt/apt.conf.d/99timeout
 # region INJECT_PROXY_CODE
 # endregion INJECT_PROXY_CODE
 
-retry_error=
-retryable() {
-  if [ -z "$retry_error" ]; then retry_error=0; return 0; fi
-  if [ "$1" == "0" ]; then retry_error=; return 1; fi
+# shellcheck source=/dev/null
+source "${VIBE_PROVISION_INCLUDE:?run this script with vibe provision}"
 
-  retry_error="$((retry_error+1))";
-  if [[ "$retry_error" -le 3 ]]; then
-    echo "Warn:  waiting 10s and try again (error=${retry_error}) ..." >&2;
-    sleep 10;
-    return 0;
-  fi
-  echo "Error: too many errors and retry attempts, exiting ..." >&2;
-  exit 1;
-}
-exec_retry() {
-  while retryable "$?"; do "${@}"; done
-}
-
-
-ip addr;
-pwd;
+ip addr
+pwd
 
 exec_retry \
-apt update;
+  apt update
 
 ##########################################################
 # Use debian fast-forward so we get newer package versions
@@ -81,14 +65,14 @@ apt update;
 # region
 
 exec_retry \
-apt install --no-install-recommends --update --yes ca-certificates gnupg debian-keyring wget
+  apt install --no-install-recommends --update --yes ca-certificates gnupg debian-keyring wget
 
 mkdir -p /usr/share/debian-fastforward/pgp-keys
 
 exec_retry \
-wget https://deb.fastforward.debian.net/debian-fastforward/project/pgp/fastforward-debian-13-trixie-signing-key.pub -O /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg
+  wget https://deb.fastforward.debian.net/debian-fastforward/project/pgp/fastforward-debian-13-trixie-signing-key.pub -O /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg
 exec_retry \
-wget https://deb.fastforward.debian.net/debian-fastforward/project/pgp/fastforward-debian-13-trixie-signing-key.pub.sig -O /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg.sig
+  wget https://deb.fastforward.debian.net/debian-fastforward/project/pgp/fastforward-debian-13-trixie-signing-key.pub.sig -O /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg.sig
 
 gpg --keyring /usr/share/keyrings/debian-keyring.gpg --keyring /usr/share/keyrings/debian-maintainers.gpg --verify /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg.sig
 rm -f /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg.sig
@@ -129,7 +113,7 @@ Pin-Priority: 990
 EOF'
 
 exec_retry \
-apt full-upgrade --update --yes
+  apt full-upgrade --update --yes
 
 ##########################################################
 # End of debian fast forward
@@ -149,17 +133,15 @@ apt_packages=(
   tmux
   openssh-server
   unzip
-);
+)
 
 exec_retry \
-apt install --no-install-recommends --yes "${apt_packages[@]}"
-
+  apt install --no-install-recommends --yes "${apt_packages[@]}"
 
 echo 'PasswordAuthentication no
 PermitRootLogin  yes' | tee /etc/ssh/sshd_config.d/99_custom.conf
 
 systemctl disable ssh
-
 
 # Expand disk partition
 growpart /dev/vda 1
@@ -174,23 +156,8 @@ hostnamectl set-hostname vibe
 # User-level tools, installed by the vm-user (root by default).
 set -euxo pipefail
 
-retry_error=
-retryable() {
-  if [ -z "$retry_error" ]; then retry_error=0; return 0; fi
-  if [ "$1" == "0" ]; then retry_error=; return 1; fi
-
-  retry_error="$((retry_error+1))";
-  if [[ "$retry_error" -le 3 ]]; then
-    echo "Warn:  waiting 10s and try again (error=${retry_error}) ..." >&2;
-    sleep 10;
-    return 0;
-  fi
-  echo "Error: too many errors and retry attempts, exiting ..." >&2;
-  exit 1;
-}
-exec_retry() {
-  while retryable "$?"; do "${@}"; done
-}
+# shellcheck source=/dev/null
+source "${VIBE_PROVISION_INCLUDE:?run this script with vibe provision}"
 
 base_user_done="${HOME}/.local/state/vibe/base-user.done"
 if [[ -e "${base_user_done}" || ! -e /run/vibe/base-first-run ]]; then
@@ -200,20 +167,16 @@ fi
 cd "${HOME}"
 mkdir -p .ssh
 
-
-export PATH="${HOME}/.cargo/bin:${HOME}/.local/bin:${PATH}";
-
+export PATH="${HOME}/.cargo/bin:${HOME}/.local/bin:${PATH}"
 
 # Install Mise
-while retryable "$?"; do
-curl https://mise.run | sh
-done
+exec_retry bash -o pipefail -c 'curl https://mise.run | sh'
 
 eval "$(mise activate bash)"
 
 mkdir -p .config/mise/
 
-cat > .config/mise/config.toml <<MISE
+cat >.config/mise/config.toml <<MISE
 [settings]
 # Always use the venv created by uv, if available in directory
 python.uv_venv_auto = true
@@ -241,9 +204,9 @@ MISE
 touch .config/mise/mise.lock
 
 exec_retry \
-mise install
+  mise install
 
 mkdir -p "$(dirname "${base_user_done}")"
 touch "${base_user_done}"
 
-true;
+true

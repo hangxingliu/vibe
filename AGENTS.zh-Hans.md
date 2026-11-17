@@ -32,7 +32,7 @@ Vibe 是一个 Rust 单文件程序，在 ARM Mac 上启动 Debian Linux 虚拟�
 - `src/session_plan.rs`：`SessionPlan` 各阶段与 `expand_session`。共享暂存、bind 挂载（仅暂存的共享不做 bind 挂载）、遮蔽、`src/guest/mount_apt_cache.sh`、`src/guest/install_bindfs.sh`、切换到 vm-user。
 - `src/session.rs`：`LoginAction`、`legacy_login_prefix`，并重新导出 `src/session/*`：`password.rs`（`RootPassword`）、`failure.rs`（`LoginFailure`）、`shell.rs`（`script_command` 渲染 `src/guest/script_wrapper.sh`）、`login.rs`（`legacy_login`、`switch_user`）、`actions.rs`（登录线程）。
 - `src/vm_run.rs`、`src/vm_lifecycle.rs`、`src/vm_config.rs`、`src/vm_io.rs`：启动并驱动虚拟机、无头运行、虚拟机配置、终端 I/O 与输入闸门。
-- `src/provision.rs`：`ensure_default_image`、`provision_image`、`build_provision_script`、`split_run_as_user`。`build_provision_plan` 写入 `src/guest/install_bindfs.sh` 与 `src/guest/provision-env.sh`。客户机脚本 `src/guest/check_vm_user_home.sh`、`src/guest/clear_machine_id.sh`、`src/guest/repl_finalize.sh`。
+- `src/provision.rs`：`ensure_default_image`、`provision_image`、`build_provision_script`、`split_run_as_user`。`build_provision_plan` 写入 `src/guest/install_bindfs.sh`、`src/guest/provision-env.sh`，以及 `scripts/include.sh`（源文件 `src/guest/provision_include.sh`）。客户机脚本 `src/guest/check_vm_user_home.sh`、`src/guest/clear_machine_id.sh`、`src/guest/repl_finalize.sh`。
 - `src/disk_prepare.rs`、`src/maintenance.rs`、`src/alpine.rs`、`src/seed.rs`、`src/guest/maint.sh`、`src/control.rs`：用 Alpine 维护虚拟机处理新的 Debian 基础镜像。
 - `src/image_probe.rs`、`src/gpt.rs`、`src/ext4ro.rs`（含 `src/ext4ro/`）、`src/cache.rs`：只读磁盘检查、文件锁、克隆。
 - `src/images.rs`、`src/image_dirs.rs`：镜像下载、命名、跨镜像目录查找。

@@ -3,28 +3,13 @@
 # vibe:run-as-user
 set -euxo pipefail
 
-retry_error=
-retryable() {
-  if [ -z "$retry_error" ]; then retry_error=0; return 0; fi
-  if [ "$1" == "0" ]; then retry_error=; return 1; fi
-
-  retry_error="$((retry_error+1))";
-  if [[ "$retry_error" -le 3 ]]; then
-    echo "Warn:  waiting 10s and try again (error=${retry_error}) ..." >&2;
-    sleep 10;
-    return 0;
-  fi
-  echo "Error: too many errors and retry attempts, exiting ..." >&2;
-  exit 1;
-}
-exec_retry() {
-  while retryable "$?"; do "${@}"; done
-}
+# shellcheck source=/dev/null
+source "${VIBE_PROVISION_INCLUDE:?run this script with vibe provision}"
 
 # Set this env var so claude doesn't complain about running as root.
-echo "export IS_SANDBOX=1" >> .bashrc
+echo "export IS_SANDBOX=1" >>.bashrc
 
 tool='    claude = "latest"'
-echo "$tool" >> .config/mise/config.toml
+echo "$tool" >>.config/mise/config.toml
 
 exec_retry mise install

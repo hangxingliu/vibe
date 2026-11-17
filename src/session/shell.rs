@@ -452,7 +452,8 @@ mod tests {
                 "eval \"$(cat)\"\n\
                  echo alive\n\
                  printf 'VARS=%s\\n' \"$(compgen -v __vibe_ || true)\"\n\
-                 printf 'FUNCS=%s\\n' \"$(declare -F __vibe_script_text || true)\"\n",
+                 printf 'FUNCS=%s\\n' \"$(declare -F | grep '__vibe_' || true)\"\n\
+                 printf 'SHELL_INCLUDE=%s\\n' \"${VIBE_PROVISION_INCLUDE-unset}\"\n",
             )
             .env("HOME", "/no-such-mise-home")
             .stdin(std::process::Stdio::piped())
@@ -482,6 +483,11 @@ mod tests {
         assert!(run.stdout.contains("\nalive\n"), "{}", run.stdout);
         assert!(run.stdout.contains("VARS=\n"), "{}", run.stdout);
         assert!(run.stdout.contains("FUNCS=\n"), "{}", run.stdout);
+        assert!(
+            run.stdout.contains("SHELL_INCLUDE=unset\n"),
+            "{}",
+            run.stdout
+        );
         assert!(!run.stdout.contains("VARS=__vibe"), "{}", run.stdout);
     }
 
@@ -598,6 +604,77 @@ mod tests {
             run.stderr.contains("cannot write the script"),
             "{}",
             run.stderr
+        );
+        assert_clean_shell(&run);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_wrapper_sources_include_from_the_script_directory() {
+        let dir = scratch_wrapper();
+        let scripts = dir.join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("include.sh"),
+            "#!/usr/bin/env bash\nvibe_include_marker() { printf 'include-ok\\n'; }\n",
+        )
+        .unwrap();
+        let source = scripts.join("probe.sh");
+        std::fs::write(
+            &source,
+            "#!/bin/bash\nsource \"$VIBE_PROVISION_INCLUDE\"\nvibe_include_marker\nprintf 'INCLUDE=%s\\n' \"$VIBE_PROVISION_INCLUDE\"\n",
+        )
+        .unwrap();
+        let base = dir.join("vibe-scripts");
+        let script = render_wrapper(
+            "script_inc",
+            &source.to_string_lossy(),
+            "",
+            &base.to_string_lossy(),
+        );
+        let run = eval_wrapper(&script);
+        let expected = script_dir(&dir).join("include.sh");
+        assert!(
+            run.stdout.contains("include-ok\n"),
+            "stdout {}\nstderr {}",
+            run.stdout,
+            run.stderr
+        );
+        assert!(
+            run.stdout
+                .contains(&format!("INCLUDE={}\n", expected.display())),
+            "stdout {}\nstderr {}",
+            run.stdout,
+            run.stderr
+        );
+        assert!(
+            run.stdout.contains("VIBE_SCRIPT_STATUS_script_inc\n0\n"),
+            "{}",
+            run.stdout
+        );
+        assert_clean_shell(&run);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_wrapper_leaves_include_unset_for_an_inline_script() {
+        let dir = scratch_wrapper();
+        let body = "#!/bin/bash\nif [ -n \"${VIBE_PROVISION_INCLUDE+x}\" ]; then printf 'INCLUDE=set\\n'; else printf 'INCLUDE=unset\\n'; fi\n";
+        let b64 = general_purpose::STANDARD.encode(body);
+        let base = dir.join("vibe-scripts");
+        let script = render_wrapper("script_inline", "", &b64, &base.to_string_lossy());
+        let run = eval_wrapper(&script);
+        assert!(
+            run.stdout.contains("INCLUDE=unset\n"),
+            "stdout {}\nstderr {}",
+            run.stdout,
+            run.stderr
+        );
+        assert!(!run.stdout.contains("INCLUDE=set\n"), "{}", run.stdout);
+        assert!(
+            run.stdout.contains("VIBE_SCRIPT_STATUS_script_inline\n0\n"),
+            "{}",
+            run.stdout
         );
         assert_clean_shell(&run);
         let _ = std::fs::remove_dir_all(&dir);

@@ -109,6 +109,7 @@ Version 1.0.0 lists everything this fork changes compared to it (upstream versio
   They also print the files written into the VM and the image directory lookup order. These happen before the VM starts.
 - Keystrokes typed while login actions are still running are discarded. Press Ctrl-C twice during that time to stop the VM.
 - A boot that never reaches a root shell reports the failed stage. When the image may need preparation, the error suggests `vibe provision`.
+- A provision script can `source "$VIBE_PROVISION_INCLUDE"` to call `exec_retry`.
 
 ### Changed
 
@@ -172,3 +173,7 @@ Version 1.0.0 lists everything this fork changes compared to it (upstream versio
 - **Breaking:** `--no-default-mounts` is removed.
   Use `--no-mount-cwd`, `--no-mount-sys-cache`, and `--no-mount-mise`.
   The `.vibe` mask and the `node_modules` share cannot be turned off. `--git` still controls `.git`.
+
+### Fixed
+
+- Network retries in built-in provision scripts never ran a second time under `set -e`. `exec_retry` now retries.

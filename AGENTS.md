@@ -4,10 +4,9 @@ Vibe is a single Rust binary that boots Debian Linux VMs on ARM Macs to sandbox 
 
 ## Commands
 
-- Build: `cargo build --locked` (CI release: `cargo build --release --locked`).
-- Test: `cargo test`.
-- Lint: `cargo fmt --check`, `cargo clippy`, `shellcheck` and `shfmt -d` on changed shell scripts. Tool versions live in `mise.toml`.
-- Help text: after changing it, copy `vibe --help` output into the help block of `USAGE.md`. Omit the dynamic "Cache directory" and "Image directories" tail.
+- Check: `./scripts/test.sh`. Format: `./scripts/format.sh`. Both need mise active (`mise.toml`).
+- CI release build: `cargo build --release --locked`.
+- Help text: after a change, copy `vibe --help` into the help block of `USAGE.md` and `USAGE.zh-Hans.md`. Omit the dynamic "Cache directory" and "Image directories" tail.
 
 ## Tests
 
@@ -23,7 +22,7 @@ Read the module before you change it. Each line names the entry symbols.
 - `src/main.rs`: constants, built-in script table, `run_main` (builds `CommandContext` and dispatches).
 - `src/cli.rs`: CLI parsing (`lexopt`), `CliArgs`, `CliCommand`, `parse_cli_from`. Tests in `src/cli/tests.rs`.
 - `src/help.rs`: `help_text`, `REPO_URL`, the section renderer (`render_section`, 90-column limit), `provisioning_scripts_banner`.
-- `src/run_command.rs`, `src/provision_command.rs`: `run_run` and `run_provision`, the two command bodies of `run_main`. `run_run` writes `src/guest/install_ssh_key.sh` and, for a non-root user with the apt share, `src/guest/mount_apt_cache.sh`.
+- `src/run_command.rs`, `src/provision_command.rs`: `run_run` and `run_provision`, the two command bodies of `run_main`. `run_run` renders `src/guest/install_ssh_key.sh` into the session directory when `--ssh-key` is set, and `src/guest/mount_apt_cache.sh` when a non-root user has the apt share.
 - `src/shares.rs`: cache shares (`CacheShare`, `cache_share_specs`, `legacy_cache_notice`), project masks (`project_masks_and_shares`), `DirectoryShare`, `describe_vm_files`.
 - `src/signing.rs`: `ensure_signed`.
 - `src/vm_user.rs`: `VmUser`, `GuestPath`, guest checks `src/guest/check_vm_user.sh` and `src/guest/ensure_vm_user.sh` (exit codes 10-15 map to `VmUserProblem`).
@@ -37,14 +36,14 @@ Read the module before you change it. Each line names the entry symbols.
 - `src/image_probe.rs`, `src/gpt.rs`, `src/ext4ro.rs` (with `src/ext4ro/`), `src/cache.rs`: read-only disk inspection, file locks, clones.
 - `src/images.rs`, `src/image_dirs.rs`: image download, names, lookup across image directories.
 - `src/networking.rs`, `src/proxy.rs`: network modes, `vibe-usernet` arguments, proxy resolution.
-- `src/vm_checks/`: VM checks (maintenance checks in `src/vm_checks/maintenance/`) for the `#[ignore]` integration tests in `tests/`. Not part of the CLI.
+- `src/vm_checks/` (maintenance checks in `src/vm_checks/maintenance/`): VM checks for the `#[ignore]` integration tests in `tests/`. Not part of the CLI.
 - `provisioning/*.sh`: built-in scripts, embedded by `build.rs`. `base.sh` always runs.
 - `helpers/vibe-usernet/`: Go network helper, built by `build.rs` on top of the `helpers/gvisor-tap-vsock` submodule.
 
 ## Invariants
 
 - Keep the run path read-only on disks. Only provision probes or modifies a disk (`ensure_bootable`). Running a disk never calls `gpt`, `ext4ro`, or `image_probe`.
-- Run Virtualization.framework code on the process main thread. `cargo test` threads are not; integration tests spawn the `vibe` binary with `VIBE_VM_CHECK`.
+- Virtualization.framework code must run on the process main thread. `cargo test` threads are not main threads; integration tests spawn the `vibe` binary with `VIBE_VM_CHECK`.
 - Never print the root password. `RootPassword` prints `***`. Never put it on a guest command line; type it with `SecretSend`. Action labels never include `--send` text.
 - Prefix errors with their stage: `[boot]`, `[login]`, `[action N: label]`, `[shutdown]`, `[prepare]`, `[verify]`, `[download]`, `[image-dirs]`, `[probe]`.
 - Login as root first, mount shares, then switch to a non-root `--vm-user`. Relative `GuestPath`s resolve below that user's HOME.
@@ -75,11 +74,17 @@ These tests are `#[ignore]` and need a Mac host. Run them with `cargo test -- --
 - Change boot, login, or provision flow: update `docs/how-vm-boot.md`.
 - Keep each `*.zh-Hans.md` file in sync with its English file.
 
+## After a task
+
+- Update the plan in `docs/ai-plans/` for the task you finished, and the project docs the change affects.
+- Do not edit a plan whose file name starts with `done-`.
+- A `done-` plan records the situation at that time. Leave it unchanged.
+
 ## Changelog
 
 `CHANGELOG.md` follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/), in English. The readme links to it and does not list fork differences.
 
-- Add every user-visible change to `## [Unreleased]` under `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security`. User-visible means CLI options, defaults, guest behavior, provisioning scripts, user-set environment variables, or supported images.
+- Add every user-visible change under `## [Unreleased]` or `## [X.Y.Z] - Unreleased`, in `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security`. User-visible means CLI options, defaults, guest behavior, provisioning scripts, user-set environment variables, or supported images.
 - Prefix breaking changes with `**Breaking:**` and name the replacement.
 - Skip refactors, tests, module layout, tooling, and internal or test-only environment variables.
 - On release: bump `version` in `Cargo.toml`, rename `[Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, and add an empty `## [Unreleased]` above it.

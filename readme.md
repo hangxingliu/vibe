@@ -85,6 +85,8 @@ If you're building from a checkout, use mise to get the Rust and Go compilers:
     mise install --locked
     cargo build --locked
 
+Checkout setup, tests, and image updates are in [docs/development-and-tests.md](docs/development-and-tests.md).
+
 
 ## Using Vibe
 

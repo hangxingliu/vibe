@@ -4,10 +4,9 @@ Vibe 是一个 Rust 单文件程序，在 ARM Mac 上启动 Debian Linux 虚拟�
 
 ## 命令
 
-- 构建：`cargo build --locked`（CI 发布用 `cargo build --release --locked`）。
-- 测试：`cargo test`。
-- 检查：`cargo fmt --check`、`cargo clippy`；改过的 shell 脚本跑 `shellcheck` 和 `shfmt -d`。工具版本见 `mise.toml`。
-- 帮助文本：修改后把 `vibe --help` 的输出复制到 `USAGE.md` 的帮助代码块。去掉末尾动态生成的 "Cache directory" 和 "Image directories" 部分。
+- 检查：`./scripts/test.sh`。格式化：`./scripts/format.sh`。两者都需要已激活的 mise（`mise.toml`）。
+- CI 发布构建：`cargo build --release --locked`。
+- 帮助文本：修改后把 `vibe --help` 复制到 `USAGE.md` 和 `USAGE.zh-Hans.md` 的帮助代码块。去掉末尾动态的 "Cache directory" 和 "Image directories" 部分。
 
 ## 测试
 
@@ -23,7 +22,7 @@ Vibe 是一个 Rust 单文件程序，在 ARM Mac 上启动 Debian Linux 虚拟�
 - `src/main.rs`：常量、内置脚本表、`run_main`（构造 `CommandContext` 并分发）。
 - `src/cli.rs`：CLI 解析（`lexopt`）、`CliArgs`、`CliCommand`、`parse_cli_from`。测试在 `src/cli/tests.rs`。
 - `src/help.rs`：`help_text`、`REPO_URL`、分节渲染器（`render_section`，90 列上限）、`provisioning_scripts_banner`。
-- `src/run_command.rs`、`src/provision_command.rs`：`run_run` 与 `run_provision`，即 `run_main` 的两个命令体。`run_run` 写入 `src/guest/install_ssh_key.sh`；非 root 用户且存在 apt 共享时，还写入 `src/guest/mount_apt_cache.sh`。
+- `src/run_command.rs`、`src/provision_command.rs`：`run_run` 与 `run_provision`，即 `run_main` 的两个命令体。设置了 `--ssh-key` 时，`run_run` 把渲染后的 `src/guest/install_ssh_key.sh` 写入会话目录；非 root 用户且有 apt 共享时，同样写入 `src/guest/mount_apt_cache.sh`。
 - `src/shares.rs`：缓存共享（`CacheShare`、`cache_share_specs`、`legacy_cache_notice`）、项目目录遮蔽（`project_masks_and_shares`）、`DirectoryShare`、`describe_vm_files`。
 - `src/signing.rs`：`ensure_signed`。
 - `src/vm_user.rs`：`VmUser`、`GuestPath`，客户机检查脚本 `src/guest/check_vm_user.sh` 和 `src/guest/ensure_vm_user.sh`（退出码 10-15 对应 `VmUserProblem`）。
@@ -75,11 +74,17 @@ Vibe 是一个 Rust 单文件程序，在 ARM Mac 上启动 Debian Linux 虚拟�
 - 修改启动、登录或 provision 流程：更新 `docs/how-vm-boot.md`。
 - 每个 `*.zh-Hans.md` 与对应英文文件保持同步。
 
+## 任务完成后
+
+- 更新 `docs/ai-plans/` 中该任务的计划文档，以及这次改动影响到的项目文档。
+- 不要改文件名以 `done-` 开头的计划文档。
+- 带 `done-` 的计划记录的是当时的情况。保持原样。
+
 ## 变更日志
 
 `CHANGELOG.md` 遵循 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/)，用英文编写。readme 链接到它，不列出与上游的差异。
 
-- 把每个用户可见的变更加到 `## [Unreleased]` 下的 `Added`、`Changed`、`Deprecated`、`Removed`、`Fixed` 或 `Security`。用户可见指 CLI 选项、默认值、客户机行为、provisioning 脚本、用户设置的环境变量或支持的镜像。
+- 把每个用户可见的变更加到 `## [Unreleased]` 或 `## [X.Y.Z] - Unreleased` 下的 `Added`、`Changed`、`Deprecated`、`Removed`、`Fixed` 或 `Security`。用户可见指 CLI 选项、默认值、客户机行为、provisioning 脚本、用户设置的环境变量或支持的镜像。
 - 破坏性变更加 `**Breaking:**` 前缀，并写明替代做法。
 - 跳过重构、测试、模块布局、工具配置，以及内部或仅测试用的环境变量。
 - 发布时：提升 `Cargo.toml` 的 `version`，把 `[Unreleased]` 改名为 `## [X.Y.Z] - YYYY-MM-DD`，并在其上方新增空的 `## [Unreleased]`。

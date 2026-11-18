@@ -2,7 +2,7 @@
 
 `vibe provision` copies a base disk, boots that copy, and runs shell scripts in the guest. It then publishes the copy as a named image. This page is the contract for the files in `provisioning/` and for a script path you pass yourself. Disk copy, Alpine preparation, and publish checks are in [How a VM boots](how-vm-boot.md).
 
-The scripts do not run on the host. The host logs in as root on the serial console and types each script into that shell.
+The scripts do not run on the host. The host logs in as root on the serial console. It writes each script into a read-only session share, and the root shell runs it from there.
 
 ## Which scripts run
 
@@ -36,9 +36,9 @@ When `default.raw` is missing, a plain `vibe` creates it by running every built-
 1. Legacy root login. When the guest prints `Password:`, the host types `--root-password` or `VIBE_ROOT_PASSWORD` with echo off. The password is never written into a script.
 2. After login, that password is applied with `chpasswd` when one was given, so the published image has it. A non-root `--vm-user` is created when missing (`useradd`, bash, its own group) and checked. Provisioning a non-root user requires a root password.
 3. VirtioFS shares are mounted. See [Shares](#shares) below.
-4. `bindfs` is installed when the image does not have it, so a later run can restrict the apt cache.
+4. `src/guest/install_bindfs.sh` runs from the session directory and installs `bindfs` when the image does not have it, so a later run can restrict the apt cache. In `vznat` mode the guest apt proxy is inside that script. The script runs in a child process and exports `DEBIAN_FRONTEND=noninteractive` itself.
 5. `src/bashrc.sh` is written to `/root/.profile` and sourced. A non-root user also gets that file as `~/.profile`, written by `runuser` so the user owns it. Provision always does this. A normal run writes it only with `--write-bashrc`.
-6. The host exports `VIBE_PROVISION_IMAGE`, `VIBE_PROVISION_BASE`, `VIBE_GIT_SHA`, `VIBE_BUILD_DATE`, `VIBE_PROVISION_SCRIPTS`, and `VIBE_PROVISION_VM_USER`.
+6. The root shell sources `provision-env.sh` from the session directory (template `src/guest/provision-env.sh`). It exports `DEBIAN_FRONTEND=noninteractive`, `VIBE_PROVISION_IMAGE`, `VIBE_PROVISION_BASE`, `VIBE_GIT_SHA`, `VIBE_BUILD_DATE`, `VIBE_PROVISION_SCRIPTS`, and `VIBE_PROVISION_VM_USER`.
 7. The scripts run. Failures in this range are `[action N: ...]`, starting at 1.
 8. A non-root provision then runs `check-vm-user-home` as root. Without `--repl`, the next script truncates `/etc/machine-id`. With `--repl`, that script installs a transient unit under `/run` that truncates the id at poweroff. The guest then prints `VIBE_PROVISION_SUCCESS`. Without `--repl`, the host types `systemctl poweroff`. These steps report as `[shutdown]`.
 
@@ -46,11 +46,17 @@ A non-root `--repl` switches to the vm-user after that success marker. `exit` re
 
 ## How one script is executed
 
-`script_command` (`src/session/shell.rs`) types a wrapper into the root shell. The script body is base64, so quotes in the script do not break the console line. The console shows the wrapper. Do not put secrets in a script. The root password is never part of that text.
+Before boot, the host writes each script to `<cache>/sessions/<pid>-<nonce>/scripts/NNN-<name>.sh`. `NNN` counts the script actions from `000`. `<name>` is the basename, with characters outside `[A-Za-z0-9._-]` replaced by `_`. A built-in script split for a non-root user gets `.root.sh` and `.user.sh`. The guest sees that directory read-only, and only root can reach it. A run `--script` with a non-root `--vm-user` runs in that user's shell, so it is not staged and its text stays inline as base64.
 
-The wrapper writes `/tmp/vibe-scripts-<uid>/<id>.sh` and runs it. The directory is mode `700` and is owned by the uid that runs the script. `<id>` is `script_` plus the index in the full login-action list. Scripts should keep their state in the home directory or in `/etc`, not in `/tmp`.
+`script_command` (`src/session/shell.rs`) renders `src/guest/script_wrapper.sh` and types one line into the root shell: ` eval "$(echo '<b64>' | base64 --decode)"`. The console shows only that line, not the wrapper or the script. Do not put secrets in a script: the host keeps a copy in the session directory. The root password is never part of that text.
 
-The script process has stdin on `/dev/null`. A program started by the script must not read the console. A pipe inside the script still has its own stdin. `curl | bash` is the pattern the built-ins use.
+The session directory is removed when the VM stops normally. After a failure, Vibe prints `Vibe kept the session scripts at <path>` and keeps the directory. Read the scripts there to see what ran. The next `SessionDir::create` removes a kept directory whose pid is gone.
+
+The wrapper copies the script to `/tmp/vibe-scripts-<uid>/<id>.sh` and runs it. The directory is mode `700` and is owned by the uid that runs the script. `<id>` is `script_` plus the index in the full login-action list. Scripts should keep their state in the home directory or in `/etc`, not in `/tmp`.
+
+When `scripts/include.sh` sits beside the staged script, the wrapper copies it to `/tmp/vibe-scripts-<uid>/include.sh`. The copy uses the same directory checks as the script. A failed copy prints `Vibe: cannot write include.sh into <dir>` and does not run the script. `vibe run` does not write `include.sh`.
+
+The script process has stdin on `/dev/null`. A program started by the script must not read the console. A pipe inside the script still has its own stdin. Built-ins retry a pipe with `exec_retry bash -o pipefail -c 'curl ... | sh'`.
 
 The host waits up to 24 hours for one script (`SCRIPT_ACTION_TIMEOUT`). The wrapper prints `VIBE_SCRIPT_STATUS_<id>` and the exit code. Exit 0 continues. Any other status stops the session. The image is not published. The work copy `<name>.tmp.<pid>` is deleted unless `VIBE_KEEP_FAILED_WORK=1`.
 
@@ -80,7 +86,7 @@ For a built-in with a non-root user, `split_run_as_user` builds two scripts:
 | Root | Bytes before the marker. | Root, and only when the part has a command. Blank lines and comments do not count. |
 | User | The original `#!` line, then the bytes after the marker. The marker line itself is in neither part. | The vm-user, through `runuser`. |
 
-The two parts are separate processes. They do not share functions or variables. Each built-in therefore repeats `set -euxo pipefail` and the retry helpers after the marker.
+The two parts are separate processes. They do not share functions or variables. Each built-in therefore repeats `set -euxo pipefail` and sources `include.sh` again after the marker.
 
 With the default `--vm-user root`, there is no split. The file runs once, as root, marker included. Both halves share that process. Tools land under `/root`.
 
@@ -92,7 +98,7 @@ After the scripts, a non-root provision runs `check-vm-user-home`. It lists path
 
 ## Environment
 
-These variables are exported in the root shell before the scripts. Child processes inherit them.
+These variables are exported in the root shell before the scripts, except `VIBE_PROVISION_INCLUDE`. Child processes inherit the exported ones.
 
 | Variable | When it is set | Value |
 | --- | --- | --- |
@@ -100,12 +106,16 @@ These variables are exported in the root shell before the scripts. Child process
 | `VIBE_VM_UID` | Non-root `--vm-user` only | Uid from the guest |
 | `VIBE_VM_GID` | Non-root `--vm-user` only | Gid from the guest |
 | `VIBE_VM_HOME` | Non-root `--vm-user` only | Home from `getent` |
+| `DEBIAN_FRONTEND` | Every provision | `noninteractive` |
 | `VIBE_PROVISION_VM_USER` | Every provision | `--vm-user`, including `root` |
 | `VIBE_PROVISION_IMAGE` | Every provision | Image name (file stem) |
 | `VIBE_PROVISION_BASE` | Every provision | Host path of the base raw |
 | `VIBE_GIT_SHA` | Every provision | Git SHA compiled into `vibe` |
 | `VIBE_BUILD_DATE` | Every provision | UTC build date compiled into `vibe` |
 | `VIBE_PROVISION_SCRIPTS` | Every provision | Script names, one per line, `base` first |
+| `VIBE_PROVISION_INCLUDE` | Every provision script | `/tmp/vibe-scripts-<uid>/include.sh` |
+
+The wrapper sets `VIBE_PROVISION_INCLUDE` on the script process only. The root shell does not keep it. A `--script` action on `vibe run` leaves the variable unset.
 
 A root provision does not set `VIBE_VM_USER` or `VIBE_VM_HOME`. `base.sh` defaults them with `${VIBE_VM_USER:-root}` and `${VIBE_VM_HOME:-/root}`. A custom script should do the same.
 
@@ -121,7 +131,7 @@ Provision mounts cache shares only. It does not mount the project directory. It 
 | cargo, yarn, m2, go | `~/.cargo`, `~/.yarn`, `~/.m2`, `~/go` | `<cache>/user-<vm-user>/<name>` | `--no-mount-sys-cache` |
 | mise | `~/.local/share/mise` | `<cache>/user-<vm-user>/mise-cache` | `--no-mount-mise` |
 
-`~` is the home of `--vm-user`. During provision the apt share is a normal bind mount. A later run as a non-root user mounts it through `bindfs` when the image has `bindfs`.
+`~` is the home of `--vm-user`. During provision the apt share is a normal bind mount. A later run as a non-root user mounts it through `src/guest/mount_apt_cache.sh` when the image has `bindfs`.
 
 `--no-mount-sys-cache` and `--no-mount-mise` write those tools into the image. Run that image with the same flag. Otherwise the share hides the copies inside the image.
 
@@ -129,7 +139,7 @@ Provision mounts cache shares only. It does not mount the project directory. It 
 
 In `nat` mode the `vibe-usernet` helper proxies guest TCP. `guest_proxy` is empty. Scripts receive no proxy variables.
 
-In `vznat` mode the host fills the `INJECT_PROXY_CODE` region of `base.sh` before the split. The replacement appends `Acquire::http::Proxy` and `Acquire::https::Proxy` to `/etc/apt/apt.conf.d/99timeout`, then exports `http_proxy`, `https_proxy`, `no_proxy`, and the upper-case names. That region is in the root part. The exports last for that one process. The apt file remains in the image, including credentials when the URL has them. Later scripts, and the user part of `base`, do not inherit those exports. `curl` and `mise` in those scripts do not read the apt file.
+In `vznat` mode the host fills the `INJECT_PROXY_CODE` region of `base.sh` before the split (`replace_region_if_present` in `src/guest_template.rs`). A file without that region is left unchanged. The replacement appends `Acquire::http::Proxy` and `Acquire::https::Proxy` to `/etc/apt/apt.conf.d/99timeout`, then exports `http_proxy`, `https_proxy`, `no_proxy`, and the upper-case names. That region is in the root part. The exports last for that one process. The apt file remains in the image, including credentials when the URL has them. Later scripts, and the user part of `base`, do not inherit those exports. `curl` and `mise` in those scripts do not read the apt file.
 
 Leave the region empty in the source file. Keep it after the lines that create `99timeout`. A `vznat` provision replaces the whole region.
 
@@ -143,8 +153,10 @@ Match the files already in `provisioning/`.
 - Put `# vibe:run-as-user` on its own line. Every built-in has this line.
 - Put `apt` and other system setup before the marker.
 - Put mise, rustup, and other per-user tools after the marker.
-- Start the user part with `set -euxo pipefail` and its own retry helpers. The test `builtin_scripts_install_user_tools_as_the_vm_user` requires that `set` line. It rejects the text `apt ` in the user part.
-- The retry helpers try the command, then retry up to three times with `sleep 10`, then `exit 1`. Use `exec_retry` for one command. Use `while retryable "$?"; do ...; done` for a pipeline. `pipefail` is on.
+- Start the user part with `set -euxo pipefail`, then `source "${VIBE_PROVISION_INCLUDE:?run this script with vibe provision}"`. The test `builtin_scripts_install_user_tools_as_the_vm_user` requires that `set` line. It rejects the text `apt ` in the user part.
+- Call `exec_retry cmd` for one external command. Call `exec_retry bash -o pipefail -c 'curl ... | sh'` for a pipeline. `exec_retry` retries up to three times, waits 10 seconds between tries, then exits 1.
+- The `||` inside `exec_retry` turns off `errexit` in a shell function it calls. Pass external commands only.
+- For a local run, use `source "$(dirname "$0")/include.sh"`. Put a copy of `src/guest/provision_include.sh` beside the script. `source ./include.sh` reads the working directory. A user script's working directory is `$VIBE_VM_HOME`.
 - Write the user's files as the user, under `$HOME` or the working directory (the user part starts in the user's home).
 - Do not read stdin.
 - Exit non-zero to fail the provision.

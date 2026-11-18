@@ -8,6 +8,7 @@ It describes the current behavior. The measurements behind it were taken on an A
 ### Host side
 
 - `run_run` (`src/run_command.rs`) collects `DirectoryShare` values: the project directory, `--mount` entries, the caches, `node_modules`, and a read-only `.git`.
+- `run_run` and `provision_image` also append `<cache>/sessions/<pid>-<nonce>/` (`DirectoryShare::staging_only`), mode 0700, read-only. `provision --repl` on an existing image does not.
 - Each share gets a tag `<basename>_<hash>` (`DirectoryShare::tag`, a djb2 hash of the host path).
 - `default_interactive_spec` (`src/vm_config.rs`) puts all shares into one VirtioFS device with the tag `shared`. The device holds a `VZMultipleDirectoryShare`. Each entry is a `VZSharedDirectory` with `readOnly` set from the share.
 - Read-only is enforced by the host. The guest cannot turn it off, not even as root.
@@ -18,8 +19,9 @@ The session plan (`src/session_plan.rs`) mounts everything as root, before any u
 
 1. `mkdir -p /mnt/root/virtiofs-shared && chmod -R 700 /mnt/root && mount -t virtiofs shared /mnt/root/virtiofs-shared`.
    This is the staging directory. `/mnt/root` is `0700` before the mount, so only root can reach it.
-2. For each share, `mount --bind /mnt/root/virtiofs-shared/<tag> <target>`.
+2. For each share that is not staging-only, `mount --bind /mnt/root/virtiofs-shared/<tag> <target>`.
    A relative guest path is below the HOME of the `--vm-user` (`/root` for root, `/home/<name>` otherwise). Missing directories below a non-root HOME are created with `install -d -o "$VIBE_VM_UID" -g "$VIBE_VM_GID"`, so the user owns them.
+   A staging-only share stays at `/mnt/root/virtiofs-shared/<tag>/`. Only root can read it, because `/mnt/root` is `0700`. The guest share table omits it.
 3. Masks: `mount -t tmpfs -o mode=0555,uid=0,gid=0 tmpfs <path>`. A mask is an empty directory owned by root that nobody else can write.
 4. For a non-root `--vm-user`, the apt cache is mounted with `bindfs` instead of a plain bind mount (see below).
 5. Only then does the session switch to the user with `su --login --pty`.
@@ -37,9 +39,20 @@ The session plan (`src/session_plan.rs`) mounts everything as root, before any u
 | `<cache>/user-<name>/{cargo,mise-cache,yarn,m2,go}` | `~/.cargo`, `~/.local/share/mise`, `~/.yarn`, `~/.m2`, `~/go` | read-write |
 | `<cache>/user-<name>/<agent>` (`--mount-agents-conf`) | the agent's configuration directory in `~` | read-write |
 | `~/.tmux` (`--mount-tmux-conf`) | `~/.tmux` | read-only |
+| `<cache>/sessions/<pid>-<nonce>/` | `/mnt/root/virtiofs-shared/<tag>/` (no bind mount; root only) | read-only |
 
 `<cache>` is `~/.cache/vibe`. `~` is the HOME of the `--vm-user`.
 `.env` and other files are not masked (see section 4).
+
+### The session share
+
+`<cache>/sessions/<pid>-<nonce>/` (`src/session_dir.rs`) carries the guest scripts of one run or provision.
+
+- The host writes every file before boot. The guest sees the share read-only.
+- It is not bind-mounted. It stays at `/mnt/root/virtiofs-shared/<tag>/`, so only root can read it.
+- Root reads each file with `cat` and runs it, or copies it for the vm-user. The vm-user never reads the share.
+- It holds no secrets. The root password is typed on the console and is never written there.
+- The host removes it after a normal stop. After a failure it stays. The next `SessionDir::create` removes it when that pid is gone.
 
 ### The apt cache for a non-root user
 
@@ -48,10 +61,12 @@ So a non-root session mounts it with:
 
     bindfs -o nonempty -u "$(id -u _apt)" -g 0 -p 0755,af-x <staging>/<apt tag> /var/cache/apt/
 
+That command is `src/guest/mount_apt_cache.sh`, run by root from the session directory. `bindfs` stdout goes to stderr, so the host does not wait on the background process. The script prints `apt-no-bindfs` only after a fallback `mount --bind` succeeds.
+
 - Files appear as `_apt:root`, directories `0755`, files `0644`. The user can read but not write, delete, `chmod`, or unmount.
 - `_apt` can write `archives/partial`, and root's `apt-get` works. Downloads land in the host cache.
 - `-o nonempty` is needed because `/var/cache/apt` in the image is not empty.
-- Provisioning installs `bindfs` (it also pulls in `fuse3` and `libfuse2t64`).
+- Provisioning installs `bindfs` from `src/guest/install_bindfs.sh` (it also pulls in `fuse3` and `libfuse2t64`).
 - When `bindfs` or `_apt` is missing, Vibe falls back to a writable bind mount and prints a warning. Provision a new image, or run with `--no-mount-sys-cache`.
 - When the `bindfs` process dies, `/var/cache/apt` becomes `Transport endpoint is not connected`. apt fails; it does not fall back to the writable share.
 
@@ -182,5 +197,5 @@ Other UIDs are entered with `setpriv --reuid --regid --clear-groups`, so no acco
 ## 6. Sources
 
 - Linux v6.12: `fs/fuse/virtio_fs.c` (`virtio_fs_parameters`, `virtio_fs_parse_param`, `virtio_fs_fill_super`), `fs/fuse/inode.c` (`fuse_show_options`), `fs/fuse/dir.c` (`fuse_permission`).
-- Vibe: `src/shares.rs` (`DirectoryShare`, `CacheShare`, `project_masks_and_shares`), `src/vm_config.rs` (VirtioFS device), `src/session_plan.rs` (staging, bind mounts, masks, `bindfs`).
+- Vibe: `src/shares.rs` (`DirectoryShare`, `CacheShare`, `project_masks_and_shares`), `src/session_dir.rs` (`SessionDir`), `src/vm_config.rs` (VirtioFS device), `src/session_plan.rs` (staging, bind mounts, masks, `bindfs`).
 - Boot sequence and the cache directory layout: [how-vm-boot.md](how-vm-boot.md).

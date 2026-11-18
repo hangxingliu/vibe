@@ -8,7 +8,7 @@
 原始仓库为 <https://github.com/lynaghk/vibe>。
 1.0.0 版本列出了此分支相较于原项目的所有更改（基于上游版本 0.1.0，截至提交 `0858d69`）。
 
-## [1.0.0] - 未发布
+## [1.0.0] - 2026.11.18
 
 ### 新增
 
@@ -153,11 +153,11 @@
   如果客户机未及时接受或拒绝密码，Vibe 会报告超时。这些密码错误不会建议运行 `vibe provision`。
   对于不要求密码的镜像，Vibe 不会输入所提供的密码。
 - VirtioFS 暂存目录为 `/mnt/root/virtiofs-shared`。该目录已从 `/mnt/shared` 迁出。`/mnt/root` 仅 root 可访问。
-- 来自 `--script` 和配置准备的脚本会写入 `/tmp/vibe-scripts-<uid>`（权限为 0700）。
-  它们已从 `/tmp/vibe-scripts` 迁出。
+- 客户机包装器把每个脚本复制到 `/tmp/vibe-scripts-<uid>`（权限 0700）。
 - 运行和配置准备会创建 `<cache>/sessions/<pid>-<nonce>/`（权限 0700），并以只读方式放到 VirtioFS 暂存挂载上。
   该共享不做 bind 挂载。宿主机文件日志和客户机共享表都不列出它。
-  虚拟机正常停止后删除该目录。不正常停止的情况下之后某次运行发现其 pid 已不存在也会删除这个目录。
+  虚拟机正常停止后删除该目录。不正常停止时目录保留。
+  下次 `SessionDir::create` 在该 pid 已不存在时删除它。
 - 非 root 运行在挂载 apt 共享时执行 `src/guest/mount_apt_cache.sh`。
   `bindfs` 的标准输出转到标准错误。只有 `mount --bind` 成功后才打印回退提示词。
 - 配置准备脚本和 `--script` 文件经只读会话共享进入虚拟机，不再在控制台键入。

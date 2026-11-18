@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The original repository is <https://github.com/lynaghk/vibe>.
 Version 1.0.0 lists everything this fork changes compared to it (upstream version 0.1.0, as of commit `0858d69`).
 
-## [1.0.0] - Unreleased
+## [1.0.0] - 2026.11.18
 
 ### Added
 
@@ -153,11 +153,11 @@ Version 1.0.0 lists everything this fork changes compared to it (upstream versio
   If the guest does not accept or reject the password in time, Vibe reports a timeout. These password errors do not suggest `vibe provision`.
   On an image that does not ask for a password, Vibe does not type a supplied password.
 - The VirtioFS staging directory is `/mnt/root/virtiofs-shared`. It moved there from `/mnt/shared`. `/mnt/root` is accessible only by root.
-- Scripts from `--script` and from provisioning are written to `/tmp/vibe-scripts-<uid>` (mode 0700).
-  They moved there from `/tmp/vibe-scripts`.
+- The guest wrapper copies each script to `/tmp/vibe-scripts-<uid>` (mode 0700).
 - Run and provision create `<cache>/sessions/<pid>-<nonce>/` (mode 0700) and share it read-only on the VirtioFS staging mount.
   The share is not bind-mounted. The host file log and the guest share table omit it.
-  The directory is removed when the VM stops normally. In case of an abnormal stop, a later run that finds the pid no longer exists will also remove this directory.
+  The directory is removed when the VM stops normally. After an abnormal stop it stays.
+  The next `SessionDir::create` removes it when that pid is gone.
 - A non-root run that mounts the apt share runs `src/guest/mount_apt_cache.sh`.
   `bindfs` stdout goes to stderr. The fallback notice is printed only after `mount --bind` succeeds.
 - Provision scripts and `--script` files reach the VM through the read-only session share. They are no longer typed on the console.

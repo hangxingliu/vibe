@@ -8,6 +8,7 @@
 ### 宿主机端
 
 - `run_run`（`src/run_command.rs`）收集 `DirectoryShare` 值：项目目录、`--mount` 条目、各缓存、`node_modules` 以及只读的 `.git`。
+- `run_run` 和 `provision_image` 还会追加 `<cache>/sessions/<pid>-<nonce>/`（`DirectoryShare::staging_only`），权限 0700，只读。对已有镜像执行 `provision --repl` 不会追加。
 - 每个共享都会获得一个标签 `<basename>_<hash>`（`DirectoryShare::tag`，宿主机路径的 djb2 哈希值）。
 - `default_interactive_spec`（`src/vm_config.rs`）将所有共享放入一个标签为 `shared` 的 VirtioFS 设备中。该设备包含一个 `VZMultipleDirectoryShare`。每个条目都是一个 `VZSharedDirectory`，其 `readOnly` 属性根据共享设置。
 - 只读限制由宿主机强制执行。客户机无法关闭它，即使是 root 用户也不行。
@@ -18,8 +19,9 @@
 
 1. `mkdir -p /mnt/root/virtiofs-shared && chmod -R 700 /mnt/root && mount -t virtiofs shared /mnt/root/virtiofs-shared`。
    这是暂存目录。挂载前 `/mnt/root` 的权限为 `0700`，因此只有 root 用户可以访问。
-2. 对于每个共享，执行 `mount --bind /mnt/root/virtiofs-shared/<tag> <target>`。
+2. 对于每个不是仅暂存的共享，执行 `mount --bind /mnt/root/virtiofs-shared/<tag> <target>`。
    客户机中的相对路径位于 `--vm-user` 的 HOME 目录下（root 为 `/root`，其他用户为 `/home/<name>`）。非 root 用户 HOME 目录下缺失的目录将通过 `install -d -o "$VIBE_VM_UID" -g "$VIBE_VM_GID"` 创建，确保归该用户所有。
+   仅暂存的共享留在 `/mnt/root/virtiofs-shared/<tag>/`。`/mnt/root` 为 `0700`，所以只有 root 能读。客户机共享表不列出它。
 3. 掩码：`mount -t tmpfs -o mode=0555,uid=0,gid=0 tmpfs <path>`。掩码是一个归 root 所有的空目录，其他任何人都无法写入。
 4. 对于非 root 的 `--vm-user`，apt 缓存使用 `bindfs` 挂载，而不是普通的 bind 挂载（见下文）。
 5. 只有在完成上述操作后，会话才会通过 `su --login --pty` 切换到目标用户。
@@ -37,9 +39,20 @@
 | `<cache>/user-<name>/{cargo,mise-cache,yarn,m2,go}` | `~/.cargo`、`~/.local/share/mise`、`~/.yarn`、`~/.m2`、`~/go` | 读写 |
 | `<cache>/user-<name>/<agent>`（`--mount-agents-conf`） | 该 agent 在 `~` 下的配置目录 | 读写 |
 | `~/.tmux`（`--mount-tmux-conf`） | `~/.tmux` | 只读 |
+| `<cache>/sessions/<pid>-<nonce>/` | `/mnt/root/virtiofs-shared/<tag>/`（不做 bind 挂载；仅 root） | 只读 |
 
 `<cache>` 为 `~/.cache/vibe`。`~` 为 `--vm-user` 的 HOME 目录。
 `.env` 和其他文件不予遮盖（见第 4 节）。
+
+### 会话共享
+
+`<cache>/sessions/<pid>-<nonce>/`（`src/session_dir.rs`）存放一次 run 或 provision 的客户机脚本。
+
+- 宿主机在启动前写好所有文件。客户机以只读方式看到该共享。
+- 它不做 bind 挂载，停留在 `/mnt/root/virtiofs-shared/<tag>/`，所以只有 root 能读。
+- root 用 `cat` 读取每个文件并运行，或替 vm-user 复制一份。vm-user 从不读取该共享。
+- 它不存放密钥。root 密码经控制台键入，从不写到这里。
+- 正常停止后宿主机删除它。失败后它保留。下次 `SessionDir::create` 在该 pid 已不存在时删除它。
 
 ### 非 root 用户的 apt 缓存
 
@@ -48,10 +61,12 @@ root 用户的 apt 会写入共享的 apt 缓存。普通用户绝不能修改�
 
     bindfs -o nonempty -u "$(id -u _apt)" -g 0 -p 0755,af-x <staging>/<apt tag> /var/cache/apt/
 
+这条命令是 `src/guest/mount_apt_cache.sh`，由 root 从会话目录运行。`bindfs` 的标准输出转到标准错误，这样宿主机不会等待这个后台进程。只有回退的 `mount --bind` 成功后，脚本才打印 `apt-no-bindfs`。
+
 - 文件所有者显示为 `_apt:root`，目录权限为 `0755`，文件权限为 `0644`。用户可读，但无法写入、删除、`chmod` 或卸载。
 - `_apt` 可以写入 `archives/partial`，且 root 的 `apt-get` 能够正常工作。下载的文件会保存在宿主机缓存中。
 - 需要 `-o nonempty` 参数，因为镜像中的 `/var/cache/apt` 不是空的。
-- 初始化配置会安装 `bindfs`（同时也会引入 `fuse3` 和 `libfuse2t64`）。
+- 初始化配置从 `src/guest/install_bindfs.sh` 安装 `bindfs`（同时也会引入 `fuse3` 和 `libfuse2t64`）。
 - 当缺少 `bindfs` 或 `_apt` 时，Vibe 会回退到可写的 bind 挂载并打印警告。请重新配置新镜像，或使用 `--no-mount-sys-cache` 运行。
 - 当 `bindfs` 进程终止时，`/var/cache/apt` 会变成 `Transport endpoint is not connected`（传输端点尚未连接）。apt 会失败，而不会回退到可写共享。
 
@@ -182,5 +197,5 @@ apt 以 `_apt` 身份下载到 `archives/partial`（`0700`），而 root 进程�
 ## 6. 参考资料
 
 - Linux v6.12：`fs/fuse/virtio_fs.c`（`virtio_fs_parameters`、`virtio_fs_parse_param`、`virtio_fs_fill_super`），`fs/fuse/inode.c`（`fuse_show_options`），`fs/fuse/dir.c`（`fuse_permission`）。
-- Vibe：`src/shares.rs`（`DirectoryShare`、`CacheShare`、`project_masks_and_shares`），`src/vm_config.rs`（VirtioFS 设备），`src/session_plan.rs`（暂存、bind 挂载、掩码、`bindfs`）。
+- Vibe：`src/shares.rs`（`DirectoryShare`、`CacheShare`、`project_masks_and_shares`），`src/session_dir.rs`（`SessionDir`），`src/vm_config.rs`（VirtioFS 设备），`src/session_plan.rs`（暂存、bind 挂载、掩码、`bindfs`）。
 - 启动顺序和缓存目录布局：[how-vm-boot.md](how-vm-boot.md)。

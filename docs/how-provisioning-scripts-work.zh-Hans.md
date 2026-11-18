@@ -2,7 +2,7 @@
 
 `vibe provision` 会复制一份基础磁盘，启动该副本，并在客体机（guest）中运行 Shell 脚本。随后，它将该副本发布为指定名称的镜像。本文档定义了 `provisioning/` 目录下的文件规范以及用户自行传入的脚本路径规范。关于磁盘复制、Alpine 准备工作以及发布检查的详细信息，请参阅[虚拟机启动原理](how-vm-boot.md)。
 
-这些脚本并不在宿主机上运行。宿主机通过串行控制台以 root 身份登录，并将每个脚本输入到该 Shell 中执行。
+这些脚本并不在宿主机上运行。宿主机通过串行控制台以 root 身份登录。它把每个脚本写入只读的会话共享，root Shell 从那里运行脚本。
 
 ## 执行哪些脚本
 
@@ -36,9 +36,9 @@ vibe provision [OPTIONS] [@name | path/to/script.sh ...]
 1. 传统的 root 登录。当客体机输出 `Password:` 时，宿主机在关闭回显的情况下输入 `--root-password` 或 `VIBE_ROOT_PASSWORD`。密码绝不会写入脚本中。
 2. 登录后，若提供了密码，则通过 `chpasswd` 应用该密码，以便发布的镜像保留此配置。若不存在非 root 的 `--vm-user`，则创建（使用 `useradd`、bash、独立的用户组）并进行校验。配置非 root 用户必须提供 root 密码。
 3. 挂载 VirtioFS 共享目录。详见后文的[共享目录](#shares)部分。
-4. 若镜像中缺少 `bindfs`，则进行安装，以便后续运行限制 apt 缓存。
+4. 从会话目录运行 `src/guest/install_bindfs.sh`。镜像中缺少 `bindfs` 时安装它，以便后续运行限制 apt 缓存。在 `vznat` 模式下，客户机的 apt 代理写在该脚本内。脚本在子进程中运行，自己导出 `DEBIAN_FRONTEND=noninteractive`。
 5. 将 `src/bashrc.sh` 写入 `/root/.profile` 并执行 source。非 root 用户也会在其 `~/.profile` 中获得该文件（由 `runuser` 写入以确保归属权属于该用户）。配置流程始终执行此操作，而常规运行仅在指定 `--write-bashrc` 时才会写入。
-6. 宿主机导出环境变量：`VIBE_PROVISION_IMAGE`、`VIBE_PROVISION_BASE`、`VIBE_GIT_SHA`、`VIBE_BUILD_DATE`、`VIBE_PROVISION_SCRIPTS` 以及 `VIBE_PROVISION_VM_USER`。
+6. root Shell 从会话目录 source `provision-env.sh`（模板为 `src/guest/provision-env.sh`）。它导出 `DEBIAN_FRONTEND=noninteractive`、`VIBE_PROVISION_IMAGE`、`VIBE_PROVISION_BASE`、`VIBE_GIT_SHA`、`VIBE_BUILD_DATE`、`VIBE_PROVISION_SCRIPTS` 以及 `VIBE_PROVISION_VM_USER`。
 7. 执行脚本。此阶段中的失败会标记为 `[action N: ...]`，编号从 1 开始。
 8. 随后，非 root 配置流程会以 root 身份运行 `check-vm-user-home`。若未指定 `--repl`，接下来的脚本将清空 `/etc/machine-id`。若指定了 `--repl`，该脚本会在 `/run` 下安装临时单元，以便在关机时清空该 ID。接着客体机输出 `VIBE_PROVISION_SUCCESS`。若未指定 `--repl`，宿主机输入 `systemctl poweroff`。这些步骤统一标记为 `[shutdown]`。
 
@@ -46,11 +46,17 @@ vibe provision [OPTIONS] [@name | path/to/script.sh ...]
 
 ## 单个脚本的执行方式
 
-`script_command`（`src/session/shell.rs`）会将一个封装器输入到 root Shell 中。脚本主体经过 base64 编码，因此脚本中的引号不会破坏控制台命令行。控制台会显示该封装器。切勿在脚本中放置敏感信息，root 密码绝不会包含在文本中。
+启动前，宿主机把每个脚本写到 `<cache>/sessions/<pid>-<nonce>/scripts/NNN-<name>.sh`。`NNN` 从 `000` 起为脚本动作计数。`<name>` 取 basename，`[A-Za-z0-9._-]` 以外的字符换成 `_`。为非 root 用户拆分的内置脚本用 `.root.sh` 与 `.user.sh`。客体机以只读方式看到该目录，且只有 root 能访问。非 root `--vm-user` 的 run `--script` 在该用户的 shell 中运行，所以不暂存，脚本内容仍以 base64 内嵌。
 
-封装器会将脚本写入 `/tmp/vibe-scripts-<uid>/<id>.sh` 并执行。该目录的权限为 `700`，所有者为运行脚本的 UID。`<id>` 为 `script_` 加上其在完整登录操作列表中的索引。脚本应将状态保存在用户主目录或 `/etc` 下，而非 `/tmp` 中。
+`script_command`（`src/session/shell.rs`）渲染 `src/guest/script_wrapper.sh`，只向 root Shell 输入一行：` eval "$(echo '<b64>' | base64 --decode)"`。控制台只显示这一行，不显示封装器和脚本。切勿在脚本中放置敏感信息：宿主机会在会话目录中保留一份副本。root 密码绝不会包含在文本中。
 
-脚本进程的 stdin 绑定至 `/dev/null`。脚本启动的程序绝不能读取控制台。脚本内部的管道仍保留各自的 stdin。内置脚本统一采用 `curl | bash` 模式。
+虚拟机正常停止后，会话目录被删除。失败后，Vibe 打印 `Vibe kept the session scripts at <path>` 并保留该目录。可在其中查看实际运行的脚本。下次 `SessionDir::create` 会删除 pid 已不存在的保留目录。
+
+封装器会将脚本复制到 `/tmp/vibe-scripts-<uid>/<id>.sh` 并执行。该目录的权限为 `700`，所有者为运行脚本的 UID。`<id>` 为 `script_` 加上其在完整登录操作列表中的索引。脚本应将状态保存在用户主目录或 `/etc` 下，而非 `/tmp` 中。
+
+当 `scripts/include.sh` 位于暂存脚本旁边时，封装器把它复制到 `/tmp/vibe-scripts-<uid>/include.sh`。复制使用与脚本相同的目录检查。复制失败时打印 `Vibe: cannot write include.sh into <dir>`，并且不运行脚本。`vibe run` 不写入 `include.sh`。
+
+脚本进程的 stdin 绑定至 `/dev/null`。脚本启动的程序绝不能读取控制台。脚本内部的管道仍保留各自的 stdin。内置脚本用 `exec_retry bash -o pipefail -c 'curl ... | sh'` 重试管道。
 
 宿主机对单个脚本的等待时间最长为 24 小时（`SCRIPT_ACTION_TIMEOUT`）。封装器会输出 `VIBE_SCRIPT_STATUS_<id>` 及退出码。退出码为 0 则继续执行；非 0 则终止会话，且不会发布镜像。除非设置了 `VIBE_KEEP_FAILED_WORK=1`，否则临时工作副本 `<name>.tmp.<pid>` 会被删除。
 
@@ -80,7 +86,7 @@ root 脚本直接执行（`"$__vibe_script"`），它继承 root Shell 的环境
 | Root 部分 | 标记行之前的字节内容。 | Root，且仅在该部分包含实际命令时执行（空行和注释不计入）。 |
 | 用户部分 | 原始 `#!` 行，后接标记行之后的字节内容。标记行本身不包含在任一部分中。 | vm-user，通过 `runuser` 执行。 |
 
-这两部分属于独立的进程，不共享函数或变量。因此，各内置脚本在标记行后都需要重新声明 `set -euxo pipefail` 和重试辅助函数。
+这两部分属于独立的进程，不共享函数或变量。因此，各内置脚本在标记行后都重新声明 `set -euxo pipefail`，并再次 source `include.sh`。
 
 若使用默认的 `--vm-user root`，则不进行拆分。文件作为一个整体以 root 身份运行一次（包含标记行），两部分共享同一进程，工具将安装在 `/root` 下。
 
@@ -92,7 +98,7 @@ root 脚本直接执行（`"$__vibe_script"`），它继承 root Shell 的环境
 
 ## 环境变量
 
-在执行脚本之前，root Shell 中会导出以下变量，子进程将自动继承：
+在执行脚本之前，root Shell 会导出下表中的变量，但 `VIBE_PROVISION_INCLUDE` 除外。子进程继承已导出的变量。
 
 | 变量 | 设置时机 | 值 |
 | --- | --- | --- |
@@ -100,12 +106,16 @@ root 脚本直接执行（`"$__vibe_script"`），它继承 root Shell 的环境
 | `VIBE_VM_UID` | 仅限非 root `--vm-user` | 客体机中的 UID |
 | `VIBE_VM_GID` | 仅限非 root `--vm-user` | 客体机中的 GID |
 | `VIBE_VM_HOME` | 仅限非 root `--vm-user` | 从 `getent` 获取的主目录 |
+| `DEBIAN_FRONTEND` | 每次配置均设置 | `noninteractive` |
 | `VIBE_PROVISION_VM_USER` | 每次配置均设置 | `--vm-user`（包含 `root`） |
 | `VIBE_PROVISION_IMAGE` | 每次配置均设置 | 镜像名称（文件主干名） |
 | `VIBE_PROVISION_BASE` | 每次配置均设置 | 基础 raw 文件的宿主机路径 |
 | `VIBE_GIT_SHA` | 每次配置均设置 | 编译进 `vibe` 的 Git SHA |
 | `VIBE_BUILD_DATE` | 每次配置均设置 | 编译进 `vibe` 的 UTC 构建日期 |
 | `VIBE_PROVISION_SCRIPTS` | 每次配置均设置 | 脚本名称列表，每行一个，`base` 居首 |
+| `VIBE_PROVISION_INCLUDE` | 每个 provision 脚本 | `/tmp/vibe-scripts-<uid>/include.sh` |
+
+封装器只在脚本进程上设置 `VIBE_PROVISION_INCLUDE`。root shell 不保留该变量。`vibe run` 的 `--script` 动作不设置该变量。
 
 以 root 身份配置时不会设置 `VIBE_VM_USER` 和 `VIBE_VM_HOME`。`base.sh` 会通过 `${VIBE_VM_USER:-root}` 与 `${VIBE_VM_HOME:-/root}` 设置默认值，自定义脚本也应采取相同处理方式。
 
@@ -121,7 +131,7 @@ root 脚本直接执行（`"$__vibe_script"`），它继承 root Shell 的环境
 | cargo, yarn, m2, go | `~/.cargo`, `~/.yarn`, `~/.m2`, `~/go` | `<cache>/user-<vm-user>/<name>` | `--no-mount-sys-cache` |
 | mise | `~/.local/share/mise` | `<cache>/user-<vm-user>/mise-cache` | `--no-mount-mise` |
 
-`~` 代表 `--vm-user` 的主目录。配置期间，apt 共享采用普通的 bind 挂载。后续以非 root 用户运行时，若镜像包含 `bindfs`，则会通过 `bindfs` 挂载。
+`~` 代表 `--vm-user` 的主目录。配置期间，apt 共享采用普通的 bind 挂载。后续以非 root 用户运行时，若镜像包含 `bindfs`，则通过 `src/guest/mount_apt_cache.sh` 挂载。
 
 使用 `--no-mount-sys-cache` 和 `--no-mount-mise` 会将这些工具直接写入镜像中。后续运行该镜像时需携带相同选项，否则挂载的共享目录会覆盖镜像内部的文件。
 
@@ -129,7 +139,7 @@ root 脚本直接执行（`"$__vibe_script"`），它继承 root Shell 的环境
 
 在 `nat` 模式下，`vibe-usernet` 辅助程序代理客体机的 TCP 连接。此时 `guest_proxy` 为空，脚本不会接收到任何代理环境变量。
 
-在 `vznat` 模式下，宿主机在拆分脚本前会填充 `base.sh` 中的 `INJECT_PROXY_CODE` 区域。替换内容会将 `Acquire::http::Proxy` 和 `Acquire::https::Proxy` 追加到 `/etc/apt/apt.conf.d/99timeout` 中，随后导出 `http_proxy`、`https_proxy`、`no_proxy` 及其大写形式。该区域位于 root 部分，导出的变量仅在当前进程中生效。apt 配置文件（包含 URL 中的凭证信息）会保存在镜像中。后续脚本以及 `base` 的用户部分不会继承这些环境变量。这些脚本中的 `curl` 和 `mise` 不会读取 apt 配置文件。
+在 `vznat` 模式下，宿主机在拆分脚本前会填充 `base.sh` 中的 `INJECT_PROXY_CODE` 区域（`src/guest_template.rs` 的 `replace_region_if_present`）。没有该区域的文件保持不变。替换内容会将 `Acquire::http::Proxy` 和 `Acquire::https::Proxy` 追加到 `/etc/apt/apt.conf.d/99timeout` 中，随后导出 `http_proxy`、`https_proxy`、`no_proxy` 及其大写形式。该区域位于 root 部分，导出的变量仅在当前进程中生效。apt 配置文件（包含 URL 中的凭证信息）会保存在镜像中。后续脚本以及 `base` 的用户部分不会继承这些环境变量。这些脚本中的 `curl` 和 `mise` 不会读取 apt 配置文件。
 
 源文件中的该区域应保持为空，且必须保留在创建 `99timeout` 的代码行之后。`vznat` 配置会替换整段区域。
 
@@ -143,8 +153,10 @@ root 脚本直接执行（`"$__vibe_script"`），它继承 root Shell 的环境
 - `# vibe:run-as-user` 必须独占一行。所有内置脚本均包含此行。
 - 将 `apt` 及其他系统级设置置于标记行之前。
 - 将 mise、rustup 及其他用户级工具置于标记行之后。
-- 用户部分需以 `set -euxo pipefail` 及其独立的重试辅助函数开头。测试项 `builtin_scripts_install_user_tools_as_the_vm_user` 依赖该 `set` 行，且禁止在用户部分出现 `apt ` 文本。
-- 重试逻辑：先执行命令，失败后最多重试 3 次，每次间隔 `sleep 10`，若仍失败则执行 `exit 1`。单条命令使用 `exec_retry`；管道命令使用 `while retryable "$?"; do ...; done`。确保已开启 `pipefail`。
+- 用户部分以 `set -euxo pipefail` 开头，然后执行 `source "${VIBE_PROVISION_INCLUDE:?run this script with vibe provision}"`。测试项 `builtin_scripts_install_user_tools_as_the_vm_user` 依赖该 `set` 行，且禁止在用户部分出现 `apt ` 文本。
+- 单条外部命令使用 `exec_retry cmd`。管道使用 `exec_retry bash -o pipefail -c 'curl ... | sh'`。`exec_retry` 最多重试 3 次，每次等待 10 秒，然后 `exit 1`。
+- `exec_retry` 内部的 `||` 会关闭它所调用的 shell 函数中的 `errexit`。只传入外部命令。
+- 本地运行时使用 `source "$(dirname "$0")/include.sh"`。把 `src/guest/provision_include.sh` 的副本放在脚本旁边。`source ./include.sh` 读取的是工作目录。用户脚本的工作目录是 `$VIBE_VM_HOME`。
 - 以对应用户的身份写入文件，路径位于 `$HOME` 或当前工作目录下（用户部分默认在用户主目录中启动）。
 - 禁止读取 stdin。
 - 发生错误时以非 0 状态退出，以标记配置失败。

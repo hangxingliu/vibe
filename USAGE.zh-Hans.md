@@ -305,16 +305,16 @@ Options may appear before or after `provision`.
 Full reference: USAGE.md (https://github.com/hangxingliu/vibe/blob/main/USAGE.md)
 
 Options (run and provision):
-  -h, --help              Print this help.
-  --version               Print the commit SHA, build date, and repository URL.
-  --image NAME            Run: template image (ignored once .vibe/instance.raw exists).
-                          Provision: image to create (default `default`).
-  --cpus COUNT            Virtual CPUs (default 2).
-  --ram MB                RAM in MB (default 2048; 4096 when provisioning).
-  --vm-user NAME          Guest account for the session (default root).
-  --root-password PW      Root password to log in (default $VIBE_ROOT_PASSWORD).
-  --[no-]mount-sys-cache  Mount the shared apt, cargo, yarn, m2, and go caches (on).
-  --[no-]mount-mise       Mount the shared mise data at ~/.local/share/mise (on).
+  -h, --help                 Print this help.
+  --version                  Print the commit SHA, build date, and repository URL.
+  --image NAME               Run: template image (ignored once .vibe/instance.raw exists).
+                             Provision: image to create (default `default`).
+  --cpus COUNT               Virtual CPUs (default 2).
+  --ram MB                   RAM in MB (default 2048; 4096 when provisioning).
+  --vm-user NAME             Guest account for the session (default root).
+  --root-password PW         Root password to log in (default $VIBE_ROOT_PASSWORD).
+  --[no-]mount-sys-cache     Mount the shared apt, cargo, yarn, m2, and go caches (on).
+  --[no-]mount-mise          Mount the shared mise data at ~/.local/share/mise (on).
 
 Run options:
   --[no-]mount-cwd           Share the current directory at ~/<project> (on).
@@ -328,35 +328,37 @@ Run options:
                              (mask .git with tmpfs).
 
 Network options (run and provision):
-  --network MODE       MODE: nat (default, bundled user-mode stack) or vznat.
-  -p, --publish SPEC   Forward a guest port to the host (repeatable).
-                       SPEC: [udp:][HOST_ADDR:]HOST_PORT:GUEST_PORT
-                       Example: -p 127.0.0.1:8022:22 -p udp:8080:80
-  --proxy URL          Proxy for VM traffic and image downloads
-                       (http, https, socks5, socks5h; default $https_proxy etc.).
-  --proxy-bypass LIST  Destinations reached directly (comma separated).
-  --[no-]proxy-udp     Proxy the VM's UDP (nat only; on for SOCKS5).
-  --[no-]proxy-dns     Proxy gateway DNS over TCP (nat only; on for SOCKS5).
-  --[no-]strict-proxy  Drop VM traffic the proxy cannot carry (nat only; off).
-  --no-proxy-vm        Do not proxy VM traffic; downloads still use the proxy.
-  --dns ADDR           Upstream DNS server for the gateway DNS (repeatable).
+  --network MODE             MODE: nat (default, bundled user-mode stack) or vznat.
+  -p, --publish SPEC         Forward a guest port to the host (repeatable).
+                             SPEC: [udp:][HOST_ADDR:]HOST_PORT:GUEST_PORT
+                             Example: -p 127.0.0.1:8022:22 -p udp:8080:80
+  --proxy URL                Proxy for VM traffic and image downloads
+                             (http, https, socks5, socks5h; default $https_proxy etc.).
+  --proxy-bypass LIST        Destinations reached directly (comma separated).
+  --[no-]proxy-udp           Proxy the VM's UDP (nat only; on for SOCKS5).
+  --[no-]proxy-dns           Proxy gateway DNS over TCP (nat only; on for SOCKS5).
+  --[no-]strict-proxy        Drop VM traffic the proxy cannot carry (nat only; off).
+  --no-proxy-vm              Do not proxy VM traffic; downloads still use the proxy.
+  --dns ADDR                 Upstream DNS server for the gateway DNS (repeatable).
 
 Login actions (run only; in order, in the vm-user's shell, repeatable):
-  --script PATH         Run a script in the VM; stop if it fails.
-  --send TEXT           Type TEXT and a newline.
-  --expect TEXT [SECS]  Wait for TEXT; shut down with an error after SECS (default 30).
-  --ssh-key FILE        Install a public key for the vm-user and start sshd.
+  --script PATH              Run a script in the VM; stop if it fails.
+  --send TEXT                Type TEXT and a newline.
+  --expect TEXT [SECS]       Wait for TEXT; shut down with an error after
+                             SECS (default 30).
+  --ssh-key FILE             Install a public key for the vm-user and start sshd.
 
 Provision options:
-  --base NAME|PATH  Base image (default Debian stable).
-  --replace         Replace an existing image with the same name.
-  --repl            Open a shell after the scripts run, or boot an existing image.
+  --base NAME|PATH           Base image (default Debian stable).
+  --replace                  Replace an existing image with the same name.
+  --repl                     Open a shell after the scripts run,
+                             or boot an existing image.
 
 Environment:
-  VIBE_ROOT_PASSWORD        Default for --root-password.
-  VIBE_EXTRA_IMAGE_DIR      Extra image directories, `:` separated.
-  VIBE_PREFERRED_IMAGE_DIR  Directory searched first; downloads and new images go here.
-  VIBE_KEEP_FAILED_WORK=1   Keep the work files of a failed provision.
+  VIBE_ROOT_PASSWORD         Default for --root-password.
+  VIBE_EXTRA_IMAGE_DIR       Extra image directories, `:` separated.
+  VIBE_PREFERRED_IMAGE_DIR   Directory searched first; downloads and new images go here.
+  VIBE_KEEP_FAILED_WORK=1    Keep the work files of a failed provision.
 
 Built-in provisioning scripts:
 

@@ -6,7 +6,7 @@ Vibe 是一个 Rust 单文件程序，在 ARM Mac 上启动 Debian Linux 虚拟�
 
 - 检查：`./scripts/test.sh`。格式化：`./scripts/format.sh`。两者都需要已激活的 mise（`mise.toml`）。
 - CI 发布构建：`cargo build --release --locked`。
-- 帮助文本：修改后把 `vibe --help` 复制到 `USAGE.md` 和 `USAGE.zh-Hans.md` 的帮助代码块。去掉末尾动态的 "Cache directory" 和 "Image directories" 部分。
+- 帮助文本：修改后先构建 `target/release/vibe`，再运行 `./scripts/update-usage-md.sh`
 
 ## 测试
 
@@ -21,7 +21,7 @@ Vibe 是一个 Rust 单文件程序，在 ARM Mac 上启动 Debian Linux 虚拟�
 
 - `src/main.rs`：常量、内置脚本表、`run_main`（构造 `CommandContext` 并分发）。
 - `src/cli.rs`：CLI 解析（`lexopt`）、`CliArgs`、`CliCommand`、`parse_cli_from`。测试在 `src/cli/tests.rs`。
-- `src/help.rs`：`help_text`、`REPO_URL`、分节渲染器（`render_section`，90 列上限）、`provisioning_scripts_banner`。
+- `src/help.rs`：`help_text`、`REPO_URL`、分节渲染器（`render_section`，各选项分节共用左列宽度，90 列上限，彩色终端上着色并加链接）、`provisioning_scripts_banner`。
 - `src/run_command.rs`、`src/provision_command.rs`：`run_run` 与 `run_provision`，即 `run_main` 的两个命令体。设置了 `--ssh-key` 时，`run_run` 把渲染后的 `src/guest/install_ssh_key.sh` 写入会话目录；非 root 用户且有 apt 共享时，同样写入 `src/guest/mount_apt_cache.sh`。
 - `src/shares.rs`：缓存共享（`CacheShare`、`cache_share_specs`、`legacy_cache_notice`）、项目目录遮蔽（`project_masks_and_shares`）、`DirectoryShare`、`describe_vm_files`。
 - `src/signing.rs`：`ensure_signed`。

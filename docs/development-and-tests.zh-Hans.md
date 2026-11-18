@@ -30,6 +30,12 @@ cargo build --release --locked
 
 `build.rs` 仅针对宿主机 `apple-darwin` 和目标架构 `aarch64-apple-darwin` 构建 `helpers/vibe-usernet`。该构建过程会设置 `CGO_ENABLED=1`、`GOOS=darwin` 和 `GOARCH=arm64`，然后嵌入该二进制文件。其他宿主机平台只会嵌入一个空桩（stub）。在这些平台上 `cargo check` 仍可正常运行。Release 构建需要在 `PATH` 中找到 `go`。Crate 和 Go 模块的下载会使用 shell 中的代理环境变量。
 
+## 更新用法帮助
+
+```bash
+./scripts/update-usage-md.sh
+```
+
 ## 测试与代码检查（Lint）
 
 在仓库根目录下运行代码检查。必须激活 mise。

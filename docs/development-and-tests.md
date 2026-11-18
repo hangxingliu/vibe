@@ -30,6 +30,12 @@ The binary is `target/release/vibe`. `./scripts/vibe_dev` runs `cargo run --rele
 
 `build.rs` builds `helpers/vibe-usernet` only for host `apple-darwin` and target `aarch64-apple-darwin`. That build sets `CGO_ENABLED=1`, `GOOS=darwin`, and `GOARCH=arm64`, then embeds the binary. Any other host embeds an empty stub. `cargo check` still works there. The release build needs `go` on `PATH`. Crate and module downloads use the shell proxy variables.
 
+## Refresh the usage help
+
+```bash
+./scripts/update-usage-md.sh
+```
+
 ## Test and lint
 
 Run the repo check from the repo root. mise must be active.

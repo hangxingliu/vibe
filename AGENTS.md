@@ -6,7 +6,7 @@ Vibe is a single Rust binary that boots Debian Linux VMs on ARM Macs to sandbox 
 
 - Check: `./scripts/test.sh`. Format: `./scripts/format.sh`. Both need mise active (`mise.toml`).
 - CI release build: `cargo build --release --locked`.
-- Help text: after a change, copy `vibe --help` into the help block of `USAGE.md` and `USAGE.zh-Hans.md`. Omit the dynamic "Cache directory" and "Image directories" tail.
+- Help text: after a change, build `target/release/vibe` and run `./scripts/update-usage-md.sh`
 
 ## Tests
 
@@ -21,7 +21,7 @@ Read the module before you change it. Each line names the entry symbols.
 
 - `src/main.rs`: constants, built-in script table, `run_main` (builds `CommandContext` and dispatches).
 - `src/cli.rs`: CLI parsing (`lexopt`), `CliArgs`, `CliCommand`, `parse_cli_from`. Tests in `src/cli/tests.rs`.
-- `src/help.rs`: `help_text`, `REPO_URL`, the section renderer (`render_section`, 90-column limit), `provisioning_scripts_banner`.
+- `src/help.rs`: `help_text`, `REPO_URL`, the section renderer (`render_section`, one shared option column, 90-column limit, color and links on a color terminal), `provisioning_scripts_banner`.
 - `src/run_command.rs`, `src/provision_command.rs`: `run_run` and `run_provision`, the two command bodies of `run_main`. `run_run` renders `src/guest/install_ssh_key.sh` into the session directory when `--ssh-key` is set, and `src/guest/mount_apt_cache.sh` when a non-root user has the apt share.
 - `src/shares.rs`: cache shares (`CacheShare`, `cache_share_specs`, `legacy_cache_notice`), project masks (`project_masks_and_shares`), `DirectoryShare`, `describe_vm_files`.
 - `src/signing.rs`: `ensure_signed`.

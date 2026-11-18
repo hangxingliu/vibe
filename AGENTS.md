@@ -7,23 +7,35 @@ Vibe is a single Rust binary that boots Debian Linux VMs on ARM Macs to sandbox 
 - Build: `cargo build --locked` (CI release: `cargo build --release --locked`).
 - Test: `cargo test`.
 - Lint: `cargo fmt --check`, `cargo clippy`, `shellcheck` and `shfmt -d` on changed shell scripts. Tool versions live in `mise.toml`.
-- Help text: after changing it, copy `vibe --help` output into the help block of `readme.md`. Omit the dynamic "Cache directory" and "Image directories" tail.
+- Help text: after changing it, copy `vibe --help` output into the help block of `USAGE.md`. Omit the dynamic "Cache directory" and "Image directories" tail.
+
+## Tests
+
+- After you finish the code work of a plan in `docs/ai-plans/`, delete tests that only checked a refactor or an intermediate step.
+- Keep tests that guard core behavior: parsing, state machines, disk reads, locks, downloads, proxy rules, and the invariants below.
+- Do not test constants, fixed strings, or simple functions that their comment already explains.
+- Do not test test-only helpers.
 
 ## Module map
 
 Read the module before you change it. Each line names the entry symbols.
 
-- `src/main.rs`: CLI parsing (`lexopt`), help text, `run_main` dispatch, cache shares (`CacheShare`, `cache_share_specs`, `legacy_cache_notice`), project masks (`project_masks_and_shares`), `describe_vm_files`, `ensure_signed`.
+- `src/main.rs`: constants, built-in script table, `run_main` (builds `CommandContext` and dispatches).
+- `src/cli.rs`: CLI parsing (`lexopt`), `CliArgs`, `CliCommand`, `parse_cli_from`. Tests in `src/cli/tests.rs`.
+- `src/help.rs`: `help_text`, `REPO_URL`, the section renderer (`render_section`, 90-column limit), `provisioning_scripts_banner`.
+- `src/run_command.rs`, `src/provision_command.rs`: `run_run` and `run_provision`, the two command bodies of `run_main`.
+- `src/shares.rs`: cache shares (`CacheShare`, `cache_share_specs`, `legacy_cache_notice`), project masks (`project_masks_and_shares`), `DirectoryShare`, `describe_vm_files`.
+- `src/signing.rs`: `ensure_signed`.
 - `src/vm_user.rs`: `VmUser`, `GuestPath`, guest checks `src/guest/check_vm_user.sh` and `src/guest/ensure_vm_user.sh` (exit codes 10-15 map to `VmUserProblem`).
 - `src/session_plan.rs`: `SessionPlan` phases and `expand_session`. Share staging, bind mounts, masks, bindfs apt cache, switch to the vm-user.
-- `src/session.rs`: `LoginAction`, login thread, `legacy_login_prefix`, `RootPassword`, `LoginFailure`, script wrappers (`script_command`).
+- `src/session.rs`: `LoginAction`, `legacy_login_prefix`, re-exports of `src/session/*`: `password.rs` (`RootPassword`), `failure.rs` (`LoginFailure`), `shell.rs` (script wrappers, `script_command`), `login.rs` (`legacy_login`, `switch_user`), `actions.rs` (login thread).
 - `src/vm_run.rs`, `src/vm_lifecycle.rs`, `src/vm_config.rs`, `src/vm_io.rs`: boot and drive a VM, headless runs, VM configuration, terminal I/O and input gate.
 - `src/provision.rs`: `ensure_default_image`, `provision_image`, `build_provision_script`, `split_run_as_user`.
 - `src/disk_prepare.rs`, `src/maintenance.rs`, `src/alpine.rs`, `src/seed.rs`, `src/guest/maint.sh`, `src/control.rs`: Alpine maintenance VM that prepares new Debian bases.
-- `src/image_probe.rs`, `src/gpt.rs`, `src/ext4ro.rs`, `src/cache.rs`: read-only disk inspection, file locks, clones.
+- `src/image_probe.rs`, `src/gpt.rs`, `src/ext4ro.rs` (with `src/ext4ro/`), `src/cache.rs`: read-only disk inspection, file locks, clones.
 - `src/images.rs`, `src/image_dirs.rs`: image download, names, lookup across image directories.
 - `src/networking.rs`, `src/proxy.rs`: network modes, `vibe-usernet` arguments, proxy resolution.
-- `src/vm_checks/`: VM checks for the `#[ignore]` integration tests in `tests/`. Not part of the CLI.
+- `src/vm_checks/`: VM checks (maintenance checks in `src/vm_checks/maintenance/`) for the `#[ignore]` integration tests in `tests/`. Not part of the CLI.
 - `provisioning/*.sh`: built-in scripts, embedded by `build.rs`. `base.sh` always runs.
 - `helpers/vibe-usernet/`: Go network helper, built by `build.rs` on top of the `helpers/gvisor-tap-vsock` submodule.
 
@@ -52,7 +64,7 @@ These tests are `#[ignore]` and need a Mac host. Run them with `cargo test -- --
 
 ## Common tasks
 
-- Add a default mount: add a `CacheShare` to `SYS_CACHE_SHARES` or `AGENT_CONF_SHARES` in `src/main.rs`. Use a relative guest path for per-user data.
+- Add a default mount: add a `CacheShare` to `SYS_CACHE_SHARES` or `AGENT_CONF_SHARES` in `src/shares.rs`. Use a relative guest path for per-user data.
 - Change guest provisioning: edit `provisioning/base.sh`. Existing `default.raw` images do not change.
 - Change proxy rules: edit `src/proxy.rs` and the helper side in `helpers/gvisor-tap-vsock/pkg/services/{noproxy,netproxy,dns,forwarder}` and `pkg/virtualnetwork/proxy.go`. Update `docs/network-proxy.md`.
 - Change shares or masks: update `docs/file-shares-between-vm.md`.

@@ -101,7 +101,7 @@
 - 内置配置脚本：`@copilot`、`@golang` 和 `@grok`。
 - `VIBE_EXTRA_IMAGE_DIR` 和 `VIBE_PREFERRED_IMAGE_DIR` 可用于添加更多镜像目录。
   常见用途之一是使用外接驱动器。
-  参见[将镜像保存在其他磁盘上](readme.md#keeping-images-on-another-disk)。
+  参见[将镜像保存在其他磁盘上](USAGE.md#keeping-images-on-another-disk)。
   `vibe` 和 `vibe provision` 会打印共享到虚拟机中的目录。
   它们还会打印写入虚拟机的文件以及镜像目录查找顺序。这些操作均在虚拟机启动前发生。
 - 登录操作仍在运行时键入的按键会被丢弃。在此期间连按两次 Ctrl-C 可停止虚拟机。
@@ -109,6 +109,8 @@
 
 ### 变更
 
+- `vibe --help` 更短，宽度不超过 90 列。完整的选项参考移到了 `USAGE.md`。
+- `vibe --version` 打印的仓库地址改为 `https://github.com/hangxingliu/vibe/`。
 - 支持最新的 Debian nocloud 基础镜像。这些镜像会要求设置 root 密码并运行首次开机向导。
   在执行脚本之前，`vibe provision` 会在一个无界面的 Alpine 维护虚拟机中对这种基础镜像进行一次性准备。
   运行现有磁盘绝不会检查或修改该磁盘。详见 [docs/alpine-os-purpose.md](docs/alpine-os-purpose.md)。

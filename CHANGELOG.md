@@ -101,7 +101,7 @@ Version 1.0.0 lists everything this fork changes compared to it (upstream versio
 - Built-in provisioning scripts: `@copilot`, `@golang`, and `@grok`.
 - `VIBE_EXTRA_IMAGE_DIR` and `VIBE_PREFERRED_IMAGE_DIR` add more image directories.
   One use is an external drive.
-  See [Keeping images on another disk](readme.md#keeping-images-on-another-disk).
+  See [Keeping images on another disk](USAGE.md#keeping-images-on-another-disk).
   `vibe` and `vibe provision` print the directories shared into the VM.
   They also print the files written into the VM and the image directory lookup order. These happen before the VM starts.
 - Keystrokes typed while login actions are still running are discarded. Press Ctrl-C twice during that time to stop the VM.
@@ -109,6 +109,8 @@ Version 1.0.0 lists everything this fork changes compared to it (upstream versio
 
 ### Changed
 
+- `vibe --help` is shorter and fits 90 columns. The full option reference moved to `USAGE.md`.
+- `vibe --version` prints `https://github.com/hangxingliu/vibe/` as the repository URL.
 - Newer Debian nocloud base images are supported. Those images ask for a root password and run a firstboot wizard.
   `vibe provision` prepares such a base once, in a headless Alpine maintenance VM, before the scripts.
   Running an existing disk never inspects or modifies that disk. See [docs/alpine-os-purpose.md](docs/alpine-os-purpose.md).

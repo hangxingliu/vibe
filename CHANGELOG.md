@@ -14,11 +14,16 @@ Version 1.0.0 lists everything this fork changes compared to it (upstream versio
 
 - `-p` / `--publish [udp:][HOST_ADDR:]HOST_PORT:GUEST_PORT` forwards guest TCP or UDP ports to the host (repeatable).
   Example: `-p 127.0.0.1:8080:80 -p udp:127.0.0.1:9002:9002`.
-- `--proxy <URL>` routes the VM's network connections through an HTTP or SOCKS5 proxy.
-  With the default `nat` network mode, outbound TCP is proxied transparently by `vibe-usernet`; loopback, link-local, and private destinations are dialed directly.
-  With other network modes, the proxy is configured through environment variables and `apt` settings inside the VM.
-- `--proxy-udp` also routes outbound UDP through the SOCKS5 proxy given with `--proxy`.
-- `--dns <ADDR>` sets custom upstream DNS servers for the VM (repeatable). With a `socks5://` proxy, queries to non-local upstreams are tunnelled through it.
+- `--proxy <URL>` routes the VM's network connections and the host-side image downloads through an HTTP or SOCKS5 proxy (`http://`, `https://`, `socks5://`, `socks5h://`; a URL without a scheme gets `http://`).
+  With the default `nat` network mode, outbound TCP is proxied transparently by `vibe-usernet` and never falls back to a direct connection.
+  With `vznat`, the proxy is exported to the guest as `http_proxy`/`https_proxy` and `vibe provision` saves it in the new image's `apt` configuration (SOCKS5 proxies as `socks5h://`, which is what apt supports).
+- `--proxy-bypass <LIST>` sets the destinations reached directly (IPs, CIDRs, `192.168.*`-style prefixes, `localhost`, `*`, `host:port`). It replaces the built-in list of loopback, link-local, and private ranges. Domain names only apply to host downloads. Traffic to the host through the gateway is always direct.
+- `--[no-]proxy-udp` routes the VM's outbound UDP through a SOCKS5 proxy (on by default for SOCKS5 proxies).
+- `--[no-]proxy-dns` sends the gateway DNS to its upstreams through a SOCKS5 proxy over TCP (on by default for SOCKS5 proxies); upstreams in the bypass list are queried directly. Upstreams that fail through the proxy answer `SERVFAIL`.
+- `--[no-]strict-proxy` drops VM traffic that cannot go through the proxy: unproxied UDP, gateway DNS, and ICMP only reach the bypass list. When no gateway DNS upstream is in the bypass list, queries are answered with `REFUSED`.
+- `--no-proxy-vm` keeps the proxy away from the VM's traffic; host downloads still use it.
+- A startup summary shows the VM's proxy, where it came from, how TCP, UDP, DNS (per upstream), and ICMP are handled, and the bypass list. See [docs/network-proxy.zh-Hans.md](docs/network-proxy.zh-Hans.md).
+- `--dns <ADDR>` sets custom upstream DNS servers for the VM (repeatable).
 - `--ssh-key <PUBLIC_KEY_FILE>` installs a public key in the VM and starts its SSH server.
 - `--git <rw | ro | no>` controls access to the project's `.git` directory. The default `ro` shares it read-only; `no` hides it behind a tmpfs mount.
 - Project directories (the current directory and `--mount` shares) get `.env` files and `.vibe` subfolders masked with tmpfs, and their `node_modules` directories are kept in a dedicated guest cache instead of on the host.
@@ -35,7 +40,12 @@ Version 1.0.0 lists everything this fork changes compared to it (upstream versio
 ### Changed
 
 - Newer Debian nocloud base images (which ask for a root password and run a firstboot wizard) are now supported. `vibe provision` prepares the base once in a headless Alpine maintenance VM before running scripts. Running an existing disk never inspects or modifies it.
-- `--proxy`, `--proxy-udp`, `--dns`, `--network`, and `-p`/`--publish` work with `vibe provision` and may be placed before or after `provision`.
+- The proxy options, `--dns`, `--network`, and `-p`/`--publish` work with `vibe provision` and may be placed before or after `provision`.
+- **Breaking:** Without `--proxy`, the proxy in `https_proxy`, `HTTPS_PROXY`, `http_proxy`, or `HTTP_PROXY` is used for the VM's traffic, for host downloads, and (with `vznat`) saved by `vibe provision` into the new image. `no_proxy`/`NO_PROXY` becomes the bypass list. Use `--no-proxy-vm` to keep the VM unproxied.
+- **Breaking:** `no_proxy`/`NO_PROXY` (or `--proxy-bypass`) replaces the built-in bypass list instead of being ignored, so ranges such as `10.0.0.0/8` that used to be reached directly go through the proxy when they are not listed. Add them to `no_proxy` or `--proxy-bypass` to keep them direct.
+- **Breaking:** With a SOCKS5 proxy, UDP is proxied by default; use `--no-proxy-udp` for the old behavior.
+- **Breaking:** Host-side downloads always pass `--proxy` to curl, so `ALL_PROXY` is no longer used. Set `--proxy` or `https_proxy` instead.
+- With `vznat`, the guest's `no_proxy`/`NO_PROXY` is the bypass list (it was always `127.0.0.1,localhost,192.168.*`), and `vibe provision` also saves a proxy that comes from the environment into the new image.
 - The provisioning VM uses 4096 MB of RAM by default (was 2048 MB).
 - Vibe's own agent configuration directories are kept in the cache directory and no longer mix with the host's configuration (credential isolation).
 - Every boot writes a `.bash_logout` that powers off the VM on `exit`, and `vibe` exits promptly when the guest powers off.

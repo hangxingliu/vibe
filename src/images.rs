@@ -98,7 +98,9 @@ pub(crate) fn ensure_base_image(
         .map(|meta| meta.len());
     if archive_needs_download(base_compressed.exists(), compressed_len) {
         println!("Downloading base image...");
+        let proxy_args = download_proxy_args().map_err(|err| format!("[download] {err}"))?;
         let status = Command::new("curl")
+            .args(&proxy_args)
             .args([
                 "--continue-at",
                 "-",
@@ -137,6 +139,20 @@ pub(crate) fn ensure_base_image(
     Ok(())
 }
 
+/// The curl proxy arguments for a download, after printing which proxy is
+/// used. curl always gets `--proxy`, so it never picks a proxy on its own.
+fn download_proxy_args() -> Result<Vec<String>, String> {
+    let proxy = crate::proxy::download_proxy()?;
+    for line in proxy.describe().lines() {
+        if line.starts_with("warning: ") {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+    Ok(proxy.curl_args())
+}
+
 /// Why [`fetch_verified`] failed. `stage` is `download` or `checksum`.
 #[derive(Debug)]
 pub(crate) struct FetchError {
@@ -169,7 +185,12 @@ pub(crate) fn fetch_verified(
         })?;
     }
     let part = part_path(archive_dest);
+    let proxy_args = download_proxy_args().map_err(|message| FetchError {
+        stage: "download",
+        message,
+    })?;
     let status = Command::new("curl")
+        .args(&proxy_args)
         .args([
             "--continue-at",
             "-",

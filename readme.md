@@ -102,9 +102,9 @@ When you first run `vibe`, a Debian Linux base image is downloaded and [all of t
 As a thoughtful person who reads the README, you'll probably appreciate the ability to create custom template images by running:
 
     vibe provision --image my-template @rust @codex my-custom-script.sh
-    vibe provision --proxy socks5://127.0.0.1:1080 --proxy-udp @rust
+    vibe provision --proxy socks5://127.0.0.1:1080 @rust
 
-(Omitting `--image` provisions the default template. `--proxy`, `--proxy-udp`, `--dns`, `--network`, and `-p`/`--publish` can be placed before or after `provision`.)
+(Omitting `--image` provisions the default template. The proxy options, `--dns`, `--network`, and `-p`/`--publish` can be placed before or after `provision`.)
 Scripts are run in order, and those prefixed with `@` are resolved against the built-in scripts shipped with Vibe.
 
 In `my-custom-script.sh` I set up my tmux keybindings, favorite shell customizations, etc.
@@ -160,16 +160,31 @@ Options:
                                                             `vznat` uses Apple's VZNATNetworkDeviceAttachment.
   -p, --publish [udp:][HOST_ADDR:]HOST_PORT:GUEST_PORT      Forward a guest port to the host (repeatable).
                                                             Example: -p 127.0.0.1:8022:22 -p udp:8080:80
-  --proxy <URL>                                             Set proxy. Configures apt during provisioning and exports proxy environment variables at login.
-                                                            When using the `nat` network mode, all outbound TCP connections from the VM are also
-                                                            routed through this proxy (HTTP CONNECT or SOCKS5).
-                                                            Loopback, link-local, and private destinations are dialed directly.
-  --proxy-udp                                               Also route outbound UDP through the SOCKS5 proxy set via --proxy.
-                                                            Requires --proxy to be a socks5:// URL. Has no effect with http:// proxies.
-  --dns <ADDR>                                              Custom upstream DNS server for the VM (repeatable; e.g. --dns 8.8.8.8 --dns 1.1.1.1).
-                                                            Overrides the system resolver. When --proxy is a socks5:// URL, DNS queries
-                                                            to non-local upstreams are tunnelled through the proxy. Local upstreams are
-                                                            queried directly. http:// proxies do not carry DNS.
+  --proxy <URL>                                             Proxy for VM traffic and host-side image downloads (http://, https://, socks5://, socks5h://;
+                                                            a URL without a scheme gets http://). Without --proxy, https_proxy, HTTPS_PROXY,
+                                                            http_proxy, and HTTP_PROXY are used, in that order (ALL_PROXY is not read).
+                                                            `nat`: the VM's outbound TCP goes through the proxy and never falls back to direct.
+                                                            `vznat`: the proxy is only exported to the guest as http_proxy/https_proxy (vibe cannot
+                                                            enforce it), and `provision` saves it into the new image's apt configuration.
+                                                            A startup summary shows which proxy is used and where it came from.
+  --proxy-bypass <LIST>                                     Destinations reached directly (comma separated; default: no_proxy, then NO_PROXY, then a
+                                                            built-in list of loopback, link-local, and private ranges). Replaces the built-in list.
+                                                            Accepts IPs, CIDRs, IPv4 prefixes (`192.168.*`), localhost, `*`, and `host:port`.
+                                                            Domain names only apply to host downloads. Traffic to the host via the gateway
+                                                            192.168.5.2 is always direct.
+  --[no-]proxy-udp                                          Route the VM's outbound UDP through the proxy (`nat` only). Default: on for SOCKS5,
+                                                            off for HTTP proxies (which cannot carry UDP; --proxy-udp is then an error).
+  --[no-]proxy-dns                                          Send the gateway DNS (queries to 192.168.5.2) to its upstreams through the proxy, over
+                                                            TCP (`nat` only). Default: on for SOCKS5, off for HTTP proxies. Upstreams in the bypass
+                                                            list are queried directly. DNS sent straight to another server (`dig @8.8.8.8`) is
+                                                            ordinary UDP/TCP traffic and follows --proxy-udp and --strict-proxy instead.
+  --[no-]strict-proxy                                       Drop VM traffic that cannot go through the proxy (`nat` only; default off). UDP and
+                                                            gateway DNS that are not proxied only reach the bypass list; ICMP (ping) only reaches
+                                                            the bypass list. Without it, such UDP, DNS, and ICMP go directly.
+  --no-proxy-vm                                             Do not proxy VM traffic. --proxy and the proxy variables still apply to downloads.
+  --dns <ADDR>                                              Upstream DNS server for the VM's gateway DNS (repeatable; e.g. --dns 8.8.8.8 --dns 1.1.1.1).
+                                                            Default: the host's /etc/resolv.conf nameservers when DNS is proxied or strict, the
+                                                            host system resolver otherwise. Proxied DNS sends these upstreams through the proxy too.
   
   --git <rw | ro | no>                                      How the .git directory is treated (default `ro`).
                                                             rw: share host .git as read-write.
@@ -255,6 +270,26 @@ So:
 - Running with `--no-mount-sys-cache` or `--no-mount-mise` hides the tools that provisioning put into the shared directories (Vibe prints a note).
 - Provisioning with `--no-mount-sys-cache` or `--no-mount-mise` installs those tools into the image itself. Run that image with the same options to use them; otherwise the shared directories are mounted over them and hide them.
 - The default image is shared by all projects, so `vibe` only creates it with the shared directories mounted. If `default.raw` does not exist yet, `vibe --no-mount-mise` fails and asks you to run `vibe provision` (with or without these options) first.
+
+## Proxies
+
+If your shell has `https_proxy`/`http_proxy` (or the upper-case forms) set, Vibe uses that proxy without being asked: for the VM's traffic and for downloading base images on the host.
+`no_proxy`/`NO_PROXY` becomes the list of destinations that are reached directly.
+`--proxy` and `--proxy-bypass` override the environment, and `--no-proxy-vm` keeps the proxy away from the VM (downloads still use it).
+
+Every run starts with a short summary of what goes through the proxy and what does not, for example:
+
+    VM network (nat):
+      Proxy:  socks5://***@192.168.1.88:2083 (from --proxy)
+      Strict: off
+      TCP:    proxied
+      UDP:    proxied
+      DNS:    proxied (DNS-over-TCP); upstreams in the bypass list are queried directly
+      ICMP:   direct (not proxied)
+      Bypass: 127.0.0.1,localhost,192.168.* (from no_proxy); gateway 192.168.5.2 -> host is always direct
+
+With a SOCKS5 proxy, UDP and the VM's DNS go through the proxy too. HTTP proxies only carry TCP, so Vibe warns that UDP and DNS go directly; add `--strict-proxy` to drop that traffic instead.
+See [docs/network-proxy.zh-Hans.md](docs/network-proxy.zh-Hans.md) for how each option affects each kind of traffic.
 
 ## Keeping images on another disk
 

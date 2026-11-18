@@ -43,6 +43,12 @@ fn main() {
                 println!("cargo:rerun-if-changed={}", path.display());
             }
         }
+        // The helper is built from the gvisor-tap-vsock submodule through a
+        // `replace` directive; a directory is checked recursively.
+        let gvisor_dir = manifest_dir.join("helpers/gvisor-tap-vsock");
+        for path in ["pkg", "go.mod", "go.sum"] {
+            println!("cargo:rerun-if-changed={}", gvisor_dir.join(path).display());
+        }
         println!("cargo:rerun-if-env-changed=TARGET");
     } else {
         let stub_path = out_dir.join("stub-vibe-usernet");

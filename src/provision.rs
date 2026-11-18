@@ -13,6 +13,7 @@ use crate::image_dirs::ImageDirs;
 use crate::image_probe::{self, MachineIdFact};
 use crate::images::{ensure_base_image, locate_debian_base};
 use crate::networking::PreparedNetworkBackend;
+use crate::proxy::{APT_PROXY_FILE, GuestProxy};
 use crate::session::{
     DEFAULT_EXPECT_TIMEOUT,
     LoginAction::{self, *},
@@ -182,7 +183,7 @@ pub(crate) fn ensure_default_image(
     default_raw: &Path,
     cache_dir: &Path,
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
-    guest_proxy: &Option<String>,
+    guest_proxy: &Option<GuestProxy>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // An existing default image is not probed or prepared again.
     if default_raw.exists() {
@@ -209,6 +210,9 @@ pub(crate) fn ensure_default_image(
         println!("  @{}", s.name);
     }
     println!("If you want a lighter default image, see `vibe provision`");
+    if guest_proxy.is_some() {
+        println!("{}", GuestProxy::image_note());
+    }
 
     let directory_shares = create_cache_shares(cache_dir, &cache_share_specs(true, true, false))?;
     provision_image(
@@ -228,17 +232,24 @@ pub(crate) fn ensure_default_image(
     )
 }
 
-fn build_provision_script(script: &ProvisionScript, guest_proxy: &Option<String>) -> LoginAction {
+/// `guest_proxy` is only set in `vznat` mode. It is then saved in the apt
+/// configuration of the new image and exported for the provisioning scripts,
+/// whether it came from `--proxy` or the environment.
+fn build_provision_script(
+    script: &ProvisionScript,
+    guest_proxy: &Option<GuestProxy>,
+) -> LoginAction {
     let mut content = script.content.to_string();
     if script.name == "base"
-        && let Some(proxy_url) = guest_proxy
+        && let Some(guest) = guest_proxy
     {
+        let apt_url = shell_single_quote(&guest.apt_url);
         let proxy_code = format!(
-            "echo 'Acquire::http::Proxy \"{proxy_url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n\
-             echo 'Acquire::https::Proxy \"{proxy_url}\";' | tee -a /etc/apt/apt.conf.d/99timeout;\n\
+            "echo 'Acquire::http::Proxy \"{apt_url}\";' | tee -a {APT_PROXY_FILE};\n\
+             echo 'Acquire::https::Proxy \"{apt_url}\";' | tee -a {APT_PROXY_FILE};\n\
              \n\
              {exports}\n",
-            exports = generate_http_proxy_env_export_cmds(proxy_url)
+            exports = generate_http_proxy_env_export_cmds(&guest.url, &guest.no_proxy)
         );
 
         let re = regex::Regex::new(
@@ -274,7 +285,7 @@ pub(crate) fn provision_image(
     stage: &str,
     notes: &[&str],
     prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
-    guest_proxy: &Option<String>,
+    guest_proxy: &Option<GuestProxy>,
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -457,11 +468,63 @@ Type `exit` or run `systemctl poweroff` when you are done.",
 #[cfg(test)]
 mod tests {
     use super::{
-        CLEAR_MACHINE_ID_SCRIPT, REPL_FINALIZE_SCRIPT, failed_work_message, incomplete_run_error,
-        machine_id_label,
+        CLEAR_MACHINE_ID_SCRIPT, REPL_FINALIZE_SCRIPT, build_provision_script, failed_work_message,
+        incomplete_run_error, machine_id_label,
     };
+    use crate::ProvisionScript;
     use crate::image_probe::MachineIdFact;
+    use crate::proxy::GuestProxy;
+    use crate::session::LoginAction;
+    use std::borrow::Cow;
     use std::path::Path;
+
+    fn script_content(name: &'static str, guest_proxy: &Option<GuestProxy>) -> String {
+        let script = ProvisionScript {
+            name: Cow::Borrowed(name),
+            description: Cow::Borrowed(""),
+            content: Cow::Borrowed(
+                "set -e\n# region INJECT_PROXY_CODE\n# endregion INJECT_PROXY_CODE\napt-get update\n",
+            ),
+        };
+        match build_provision_script(&script, guest_proxy) {
+            LoginAction::Script { content, .. } => content,
+            _ => panic!("expected a script action"),
+        }
+    }
+
+    #[test]
+    fn guest_proxy_is_saved_to_apt_and_exported() {
+        let guest = Some(GuestProxy {
+            url: "socks5://u:p'w@10.0.0.1:1080".to_string(),
+            apt_url: "socks5h://u:p'w@10.0.0.1:1080".to_string(),
+            no_proxy: "example.com,10.*".to_string(),
+        });
+        let content = script_content("base", &guest);
+        assert!(content.contains(
+            "echo 'Acquire::http::Proxy \"socks5h://u:p'\\''w@10.0.0.1:1080\";' | tee -a /etc/apt/apt.conf.d/99timeout;"
+        ));
+        assert!(content.contains("Acquire::https::Proxy"));
+        assert!(content.contains("export https_proxy='socks5://u:p'\\''w@10.0.0.1:1080';"));
+        assert!(
+            content.contains(
+                "export no_proxy='example.com,10.*'; export NO_PROXY='example.com,10.*';"
+            )
+        );
+        assert!(content.ends_with("# endregion INJECT_PROXY_CODE\napt-get update\n"));
+    }
+
+    #[test]
+    fn no_guest_proxy_or_other_scripts_write_nothing() {
+        let unchanged =
+            "set -e\n# region INJECT_PROXY_CODE\n# endregion INJECT_PROXY_CODE\napt-get update\n";
+        assert_eq!(script_content("base", &None), unchanged);
+        let guest = Some(GuestProxy {
+            url: "http://h:1".to_string(),
+            apt_url: "http://h:1".to_string(),
+            no_proxy: String::new(),
+        });
+        assert_eq!(script_content("rust", &guest), unchanged);
+    }
 
     #[test]
     fn incomplete_runs_name_the_pending_action_or_shutdown() {

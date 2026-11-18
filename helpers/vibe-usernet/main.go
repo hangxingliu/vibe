@@ -10,12 +10,15 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/containers/gvisor-tap-vsock/pkg/services/dns"
+	"github.com/containers/gvisor-tap-vsock/pkg/services/noproxy"
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
 	"github.com/containers/gvisor-tap-vsock/pkg/virtualnetwork"
 )
@@ -30,6 +33,10 @@ const (
 	gatewayMAC   = "5a:94:ef:e4:0c:dd"
 	defaultMTU   = 1500
 	readyMessage = "ready"
+
+	// dnsUpstreamsPrefix starts the line, printed before readyMessage, that
+	// describes the gateway's DNS upstreams.
+	dnsUpstreamsPrefix = "dns-upstreams"
 )
 
 type stringSlice []string
@@ -47,61 +54,112 @@ func main() {
 	}
 }
 
-func run() error {
-	fd := flag.Int("fd", defaultFD, "connected VZ datagram file descriptor")
-	parentLivenessFD := flag.Int("parent-liveness-fd", defaultParentLivenessFD, "parent liveness file descriptor")
-	guestMAC := flag.String("mac", "", "guest MAC address")
-	var publish stringSlice
-	flag.Var(&publish, "p", "publish port: [udp:][host_addr:]host_port:guest_port")
-	proxy := flag.String("proxy", "", "Proxy URL (e.g., http://127.0.0.1:1080 or socks5://127.0.0.1:1080). Loopback and private (RFC1918) destinations always bypass the proxy.")
-	proxyUDP := flag.Bool("proxy-udp", false, "Proxy UDP requests (only supported for socks5://)")
-	var dnsUpstreams stringSlice
-	flag.Var(&dnsUpstreams, "dns", "Upstream DNS server address (e.g. 8.8.8.8 or 1.1.1.1:53); repeatable. Overrides system resolver. DNS queries are routed through --proxy when set.")
-	flag.Parse()
+// config is the parsed command line.
+type config struct {
+	fd               int
+	parentLivenessFD int
+	guestMAC         string
+	forwards         map[string]string
+	proxy            string
+	proxyBypass      *string
+	proxyUDP         bool
+	proxyDNS         bool
+	strictProxy      bool
+	dnsUpstreams     []string
+}
 
-	if flag.NArg() != 0 {
-		return fmt.Errorf("unexpected arguments: %s", strings.Join(flag.Args(), " "))
+func parseConfig(args []string) (config, error) {
+	fs := flag.NewFlagSet("vibe-usernet", flag.ContinueOnError)
+	fd := fs.Int("fd", defaultFD, "connected VZ datagram file descriptor")
+	parentLivenessFD := fs.Int("parent-liveness-fd", defaultParentLivenessFD, "parent liveness file descriptor")
+	guestMAC := fs.String("mac", "", "guest MAC address")
+	var publish stringSlice
+	fs.Var(&publish, "p", "publish port: [udp:][host_addr:]host_port:guest_port")
+	proxy := fs.String("proxy", "", "Proxy URL for outbound guest traffic (http://, https://, or socks5://). Destinations in the bypass list and the gateway's NAT target are reached directly.")
+	proxyBypass := fs.String("proxy-bypass", "", "Comma-separated bypass list replacing the built-in one: *, CIDR, CIDR:port (IPv4), [CIDR]:port. An empty value bypasses nothing. Requires --proxy.")
+	proxyUDP := fs.Bool("proxy-udp", false, "Send UDP through the proxy (socks5:// only). Default: true for socks5://, false otherwise. Requires --proxy.")
+	proxyDNS := fs.Bool("proxy-dns", false, "Send the gateway's DNS queries through the proxy as DNS-over-TCP (socks5:// only). Default: true for socks5://, false otherwise. Requires --proxy.")
+	strictProxy := fs.Bool("strict-proxy", false, "Drop UDP, ICMP, and DNS that the proxy cannot carry, except for destinations in the bypass list. Requires --proxy.")
+	var dnsUpstreams stringSlice
+	fs.Var(&dnsUpstreams, "dns", "Upstream DNS server address (e.g. 8.8.8.8 or 1.1.1.1:53); repeatable. Replaces the host's nameservers for gateway DNS. With --proxy-dns, upstreams outside the bypass list are queried through the proxy.")
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+
+	if fs.NArg() != 0 {
+		return config{}, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
 	}
 	if _, err := net.ParseMAC(*guestMAC); err != nil {
-		return fmt.Errorf("invalid --mac: %w", err)
+		return config{}, fmt.Errorf("invalid --mac: %w", err)
 	}
-	if *proxyUDP && *proxy == "" {
-		return fmt.Errorf("--proxy-udp requires --proxy to be set")
+
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	cfg := config{
+		fd:               *fd,
+		parentLivenessFD: *parentLivenessFD,
+		guestMAC:         *guestMAC,
+		forwards:         make(map[string]string),
+		proxy:            *proxy,
+		dnsUpstreams:     []string(dnsUpstreams),
 	}
-	if *proxyUDP && *proxy != "" {
-		if !strings.HasPrefix(strings.ToLower(*proxy), "socks5://") {
-			return fmt.Errorf("--proxy-udp is only supported with socks5:// proxies; got %q", *proxy)
+
+	if *proxy == "" {
+		for _, name := range []string{"proxy-bypass", "proxy-udp", "proxy-dns", "strict-proxy"} {
+			if set[name] {
+				return config{}, fmt.Errorf("--%s requires --proxy", name)
+			}
+		}
+	} else {
+		u, err := url.Parse(*proxy)
+		if err != nil || u.Host == "" {
+			return config{}, fmt.Errorf("invalid --proxy URL")
+		}
+		scheme := strings.ToLower(u.Scheme)
+		socks := scheme == "socks5"
+		if !socks && scheme != "http" && scheme != "https" {
+			return config{}, fmt.Errorf("unsupported --proxy scheme %q; use http://, https://, or socks5://", u.Scheme)
+		}
+		cfg.proxyUDP = socks
+		if set["proxy-udp"] {
+			cfg.proxyUDP = *proxyUDP
+		}
+		cfg.proxyDNS = socks
+		if set["proxy-dns"] {
+			cfg.proxyDNS = *proxyDNS
+		}
+		cfg.strictProxy = *strictProxy
+		if cfg.proxyUDP && !socks {
+			return config{}, fmt.Errorf("--proxy-udp is only supported with socks5:// proxies")
+		}
+		if cfg.proxyDNS && !socks {
+			return config{}, fmt.Errorf("--proxy-dns is only supported with socks5:// proxies")
+		}
+		if set["proxy-bypass"] {
+			if _, err := noproxy.Parse(*proxyBypass); err != nil {
+				return config{}, fmt.Errorf("invalid --proxy-bypass: %w", err)
+			}
+			bypass := *proxyBypass
+			cfg.proxyBypass = &bypass
 		}
 	}
 
-	forwards := make(map[string]string)
 	for _, spec := range publish {
 		local, remote, err := parsePublish(spec)
 		if err != nil {
-			return err
+			return config{}, err
 		}
-		if _, exists := forwards[local]; exists {
-			return fmt.Errorf("duplicate publish for %s", local)
+		if _, exists := cfg.forwards[local]; exists {
+			return config{}, fmt.Errorf("duplicate publish for %s", local)
 		}
-		forwards[local] = remote
+		cfg.forwards[local] = remote
 	}
+	return cfg, nil
+}
 
-	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stopSignals()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	if *parentLivenessFD >= 0 {
-		watchParentLiveness(ctx, cancel, *parentLivenessFD)
-	}
-
-	conn, err := fileConn(*fd, "vibe-usernet")
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	vn, err := virtualnetwork.New(&types.Configuration{
+func (cfg config) networkConfiguration() *types.Configuration {
+	return &types.Configuration{
 		Debug:             false,
 		MTU:               defaultMTU,
 		Subnet:            subnet,
@@ -109,17 +167,63 @@ func run() error {
 		GatewayMacAddress: gatewayMAC,
 		DHCPStaticLeases: map[string]string{
 			gatewayIP: gatewayMAC,
-			guestIP:   *guestMAC,
+			guestIP:   cfg.guestMAC,
 		},
-		Forwards:          forwards,
+		Forwards:          cfg.forwards,
 		DNS:               []types.Zone{},
 		DNSSearchDomains:  searchDomains(),
 		NAT:               map[string]string{gatewayIP: "127.0.0.1"},
 		GatewayVirtualIPs: []string{gatewayIP},
-		Proxy:             *proxy,
-		ProxyUDP:          *proxyUDP,
-		DNSUpstreams:      []string(dnsUpstreams),
-	})
+		Proxy:             cfg.proxy,
+		ProxyBypass:       cfg.proxyBypass,
+		ProxyUDP:          cfg.proxyUDP,
+		NoProxyDNS:        !cfg.proxyDNS,
+		StrictProxy:       cfg.strictProxy,
+		DNSUpstreams:      cfg.dnsUpstreams,
+	}
+}
+
+// dnsUpstreamsLine describes the gateway's DNS upstreams for the parent
+// process, as "dns-upstreams <mode> <description>".
+func dnsUpstreamsLine(configuration *types.Configuration) (string, error) {
+	_, upstream, err := virtualnetwork.ProxySettings(configuration)
+	if err != nil {
+		return "", err
+	}
+	plan, err := dns.PlanUpstreams(upstream)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s %s %s", dnsUpstreamsPrefix, plan.Mode, plan.Describe()), nil
+}
+
+func run() error {
+	cfg, err := parseConfig(os.Args[1:])
+	if err != nil {
+		return err
+	}
+
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if cfg.parentLivenessFD >= 0 {
+		watchParentLiveness(ctx, cancel, cfg.parentLivenessFD)
+	}
+
+	conn, err := fileConn(cfg.fd, "vibe-usernet")
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	configuration := cfg.networkConfiguration()
+	vn, err := virtualnetwork.New(configuration)
+	if err != nil {
+		return err
+	}
+	dnsLine, err := dnsUpstreamsLine(configuration)
 	if err != nil {
 		return err
 	}
@@ -129,6 +233,7 @@ func run() error {
 		errCh <- vn.AcceptVfkit(ctx, &udpFileConn{Conn: conn})
 	}()
 
+	fmt.Fprintln(os.Stdout, dnsLine)
 	fmt.Fprintln(os.Stdout, readyMessage)
 
 	select {

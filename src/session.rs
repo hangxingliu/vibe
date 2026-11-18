@@ -275,10 +275,11 @@ pub(crate) fn write_file_into_vm(
     Ok(command)
 }
 
-pub(crate) fn generate_http_proxy_env_export_cmds(proxy_url: &str) -> String {
+pub(crate) fn generate_http_proxy_env_export_cmds(proxy_url: &str, no_proxy: &str) -> String {
     let url = shell_single_quote(proxy_url);
+    let no_proxy = shell_single_quote(no_proxy);
     format!(
-        "export http_proxy='{url}'; export HTTP_PROXY='{url}'; export https_proxy='{url}'; export HTTPS_PROXY='{url}'; export no_proxy='127.0.0.1,localhost,192.168.*'; export NO_PROXY='127.0.0.1,localhost,192.168.*';"
+        "export http_proxy='{url}'; export HTTP_PROXY='{url}'; export https_proxy='{url}'; export HTTPS_PROXY='{url}'; export no_proxy='{no_proxy}'; export NO_PROXY='{no_proxy}';"
     )
 }
 

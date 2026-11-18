@@ -18,6 +18,7 @@ use images::*;
 mod networking;
 use networking::*;
 mod provision;
+mod proxy;
 use provision::*;
 mod session;
 use session::*;
@@ -269,16 +270,31 @@ Options:
                                                             `vznat` uses Apple's VZNATNetworkDeviceAttachment.
   -p, --publish [udp:][HOST_ADDR:]HOST_PORT:GUEST_PORT      Forward a guest port to the host (repeatable).
                                                             Example: -p 127.0.0.1:8022:22 -p udp:8080:80
-  --proxy <URL>                                             Set proxy. Configures apt during provisioning and exports proxy environment variables at login.
-                                                            When using the `nat` network mode, all outbound TCP connections from the VM are also
-                                                            routed through this proxy (HTTP CONNECT or SOCKS5).
-                                                            Loopback, link-local, and private destinations are dialed directly.
-  --proxy-udp                                               Also route outbound UDP through the SOCKS5 proxy set via --proxy.
-                                                            Requires --proxy to be a socks5:// URL. Has no effect with http:// proxies.
-  --dns <ADDR>                                              Custom upstream DNS server for the VM (repeatable; e.g. --dns 8.8.8.8 --dns 1.1.1.1).
-                                                            Overrides the system resolver. When --proxy is a socks5:// URL, DNS queries
-                                                            to non-local upstreams are tunnelled through the proxy. Local upstreams are
-                                                            queried directly. http:// proxies do not carry DNS.
+  --proxy <URL>                                             Proxy for VM traffic and host-side image downloads (http://, https://, socks5://, socks5h://;
+                                                            a URL without a scheme gets http://). Without --proxy, https_proxy, HTTPS_PROXY,
+                                                            http_proxy, and HTTP_PROXY are used, in that order (ALL_PROXY is not read).
+                                                            `nat`: the VM's outbound TCP goes through the proxy and never falls back to direct.
+                                                            `vznat`: the proxy is only exported to the guest as http_proxy/https_proxy (vibe cannot
+                                                            enforce it), and `provision` saves it into the new image's apt configuration.
+                                                            A startup summary shows which proxy is used and where it came from.
+  --proxy-bypass <LIST>                                     Destinations reached directly (comma separated; default: no_proxy, then NO_PROXY, then a
+                                                            built-in list of loopback, link-local, and private ranges). Replaces the built-in list.
+                                                            Accepts IPs, CIDRs, IPv4 prefixes (`192.168.*`), localhost, `*`, and `host:port`.
+                                                            Domain names only apply to host downloads. Traffic to the host via the gateway
+                                                            192.168.5.2 is always direct.
+  --[no-]proxy-udp                                          Route the VM's outbound UDP through the proxy (`nat` only). Default: on for SOCKS5,
+                                                            off for HTTP proxies (which cannot carry UDP; --proxy-udp is then an error).
+  --[no-]proxy-dns                                          Send the gateway DNS (queries to 192.168.5.2) to its upstreams through the proxy, over
+                                                            TCP (`nat` only). Default: on for SOCKS5, off for HTTP proxies. Upstreams in the bypass
+                                                            list are queried directly. DNS sent straight to another server (`dig @8.8.8.8`) is
+                                                            ordinary UDP/TCP traffic and follows --proxy-udp and --strict-proxy instead.
+  --[no-]strict-proxy                                       Drop VM traffic that cannot go through the proxy (`nat` only; default off). UDP and
+                                                            gateway DNS that are not proxied only reach the bypass list; ICMP (ping) only reaches
+                                                            the bypass list. Without it, such UDP, DNS, and ICMP go directly.
+  --no-proxy-vm                                             Do not proxy VM traffic. --proxy and the proxy variables still apply to downloads.
+  --dns <ADDR>                                              Upstream DNS server for the VM's gateway DNS (repeatable; e.g. --dns 8.8.8.8 --dns 1.1.1.1).
+                                                            Default: the host's /etc/resolv.conf nameservers when DNS is proxied or strict, the
+                                                            host system resolver otherwise. Proxied DNS sends these upstreams through the proxy too.
   
   --git <rw | ro | no>                                      How the .git directory is treated (default `ro`).
                                                             rw: share host .git as read-write.
@@ -349,16 +365,34 @@ Cache directory:
 
     let usernet_helper_path = cache_dir.join("vibe-usernet");
     let publish = args.publish.clone();
-    let proxy = args.proxy.clone();
-    let proxy_udp = args.proxy_udp;
 
-    // Do not inject proxy settings into the VM guest if we are using Nat mode,
-    // because the usernet helper handles proxying transparently for the VM.
-    let guest_proxy = if args.network_mode == NetworkMode::Nat {
-        None
-    } else {
-        args.proxy.clone()
-    };
+    let host_proxy_env = proxy::HostProxyEnv::from_env();
+    proxy::set_download_proxy(proxy::DownloadProxy::resolve(
+        args.proxy.as_deref(),
+        args.proxy_bypass.as_deref(),
+        &host_proxy_env,
+    ));
+    let proxy_plan = proxy::resolve_vm_proxy(
+        &proxy::VmProxyArgs {
+            proxy: args.proxy.as_deref(),
+            proxy_bypass: args.proxy_bypass.as_deref(),
+            proxy_udp: args.proxy_udp,
+            proxy_dns: args.proxy_dns,
+            strict_proxy: args.strict_proxy,
+            no_proxy_vm: args.no_proxy_vm,
+        },
+        &args.network_mode,
+        &host_proxy_env,
+    )?;
+    println!(
+        "{}",
+        proxy_plan.describe(matches!(args.command, CliCommand::Provision { .. }))
+    );
+    let vm_proxy = proxy_plan.vm;
+    // In `nat` mode the usernet helper applies the proxy, so nothing is
+    // written into the guest. In `vznat` mode the guest gets the proxy
+    // variables (and provisioning saves the proxy in the apt configuration).
+    let guest_proxy = proxy_plan.guest;
 
     let prepare_network_backend = |log_dir: Option<&Path>| {
         args.network_mode
@@ -366,8 +400,7 @@ Cache directory:
                 &usernet_helper_path,
                 log_dir,
                 &publish,
-                proxy.as_deref(),
-                proxy_udp,
+                vm_proxy.as_ref(),
                 &args.dns,
             )
             .unwrap()
@@ -660,10 +693,10 @@ Cache directory:
             }
 
             // Set proxy environment variables for interactive use
-            if let Some(url) = &guest_proxy {
+            if let Some(guest) = &guest_proxy {
                 login_actions.push(Send(format!(
                     " {}",
-                    generate_http_proxy_env_export_cmds(url)
+                    generate_http_proxy_env_export_cmds(&guest.url, &guest.no_proxy)
                 )));
             }
 
@@ -735,8 +768,14 @@ struct CliArgs {
     network_mode: NetworkMode,
     cpu_count: usize,
     ram_bytes: u64,
+    /// `--proxy`, normalized (scheme added; `socks5h://` kept for curl).
     proxy: Option<String>,
-    proxy_udp: bool,
+    proxy_bypass: Option<String>,
+    /// `Some` when `--proxy-udp` or `--no-proxy-udp` was given (last wins).
+    proxy_udp: Option<bool>,
+    proxy_dns: Option<bool>,
+    strict_proxy: Option<bool>,
+    no_proxy_vm: bool,
     dns: Vec<String>,
     ssh_key: Option<PathBuf>,
     publish: Vec<String>,
@@ -884,7 +923,11 @@ where
     // applies to whichever command is selected; an omitted one keeps that default.
     let mut ram_explicit = false;
     let mut proxy = None;
-    let mut proxy_udp = false;
+    let mut proxy_bypass = None;
+    let mut proxy_udp = None;
+    let mut proxy_dns = None;
+    let mut strict_proxy = None;
+    let mut no_proxy_vm = false;
     let mut dns: Vec<String> = Vec::new();
     let mut ssh_key = None;
     let mut publish = Vec::new();
@@ -966,9 +1009,16 @@ where
             Long("proxy") => {
                 proxy = Some(os_to_string(parser.value()?, "--proxy")?);
             }
-            Long("proxy-udp") => {
-                proxy_udp = true;
+            Long("proxy-bypass") => {
+                proxy_bypass = Some(os_to_string(parser.value()?, "--proxy-bypass")?);
             }
+            Long("proxy-udp") => proxy_udp = Some(true),
+            Long("no-proxy-udp") => proxy_udp = Some(false),
+            Long("proxy-dns") => proxy_dns = Some(true),
+            Long("no-proxy-dns") => proxy_dns = Some(false),
+            Long("strict-proxy") => strict_proxy = Some(true),
+            Long("no-strict-proxy") => strict_proxy = Some(false),
+            Long("no-proxy-vm") => no_proxy_vm = true,
             Long("dns") => {
                 dns.push(os_to_string(parser.value()?, "--dns")?);
             }
@@ -1054,19 +1104,19 @@ where
         }
     }
 
-    // Validate proxy_udp requires a socks5 proxy
-    if proxy_udp {
-        match &proxy {
-            None => return Err("--proxy-udp requires --proxy to be set".into()),
-            Some(url) if !url.to_lowercase().starts_with("socks5://") => {
-                return Err(format!(
-                    "--proxy-udp is only supported with socks5:// proxies; got {url:?}"
-                )
-                .into());
-            }
-            _ => {}
-        }
-    }
+    // Checks that do not depend on the proxy environment variables; the
+    // rest happen in `proxy::resolve_vm_proxy`.
+    let proxy = proxy::check_cli_proxy_args(
+        &proxy::VmProxyArgs {
+            proxy: proxy.as_deref(),
+            proxy_bypass: proxy_bypass.as_deref(),
+            proxy_udp,
+            proxy_dns,
+            strict_proxy,
+            no_proxy_vm,
+        },
+        &network_mode,
+    )?;
 
     // Apply the provisioning default only when the user did not pass `--ram`.
     if parsing_provision && !ram_explicit {
@@ -1110,7 +1160,11 @@ where
         cpu_count,
         ram_bytes,
         proxy,
+        proxy_bypass,
         proxy_udp,
+        proxy_dns,
+        strict_proxy,
+        no_proxy_vm,
         dns,
         ssh_key,
         publish,
@@ -1372,8 +1426,8 @@ mod tests {
     #[test]
     fn provision_accepts_proxy_after_the_subcommand() {
         let args = parse(&["provision", "--proxy", "192.168.1.88:3003"]).unwrap();
-        assert_eq!(args.proxy.as_deref(), Some("192.168.1.88:3003"));
-        assert!(!args.proxy_udp);
+        assert_eq!(args.proxy.as_deref(), Some("http://192.168.1.88:3003"));
+        assert_eq!(args.proxy_udp, None);
         assert!(args.dns.is_empty());
         assert_eq!(args.network_mode, NetworkMode::Nat);
         assert_eq!(
@@ -1396,7 +1450,9 @@ mod tests {
             "provision",
             "--proxy",
             "socks5://127.0.0.1:1080",
-            "--proxy-udp",
+            "--no-proxy-udp",
+            "--proxy-bypass",
+            "example.com",
             "--dns",
             "1.1.1.1",
             "--dns",
@@ -1424,7 +1480,9 @@ mod tests {
         let before = parse(&[
             "--proxy",
             "socks5://127.0.0.1:1080",
-            "--proxy-udp",
+            "--no-proxy-udp",
+            "--proxy-bypass",
+            "example.com",
             "--dns",
             "1.1.1.1",
             "--dns",
@@ -1453,7 +1511,8 @@ mod tests {
 
         for args in [&after, &before] {
             assert_eq!(args.proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
-            assert!(args.proxy_udp);
+            assert_eq!(args.proxy_udp, Some(false));
+            assert_eq!(args.proxy_bypass.as_deref(), Some("example.com"));
             assert_eq!(args.dns, ["1.1.1.1", "8.8.8.8"]);
             assert_eq!(args.network_mode, NetworkMode::VzNat);
             assert_eq!(args.publish, ["127.0.0.1:8022:22", "udp:8080:80"]);
@@ -1765,6 +1824,53 @@ mod tests {
     }
 
     #[test]
+    fn proxy_switches_keep_the_last_value() {
+        let args = parse(&[
+            "--proxy-udp",
+            "--no-proxy-udp",
+            "--no-proxy-dns",
+            "--proxy-dns",
+            "--strict-proxy",
+            "--no-strict-proxy",
+        ])
+        .unwrap();
+        assert_eq!(args.proxy_udp, Some(false));
+        assert_eq!(args.proxy_dns, Some(true));
+        assert_eq!(args.strict_proxy, Some(false));
+        assert!(!args.no_proxy_vm);
+
+        let args = parse(&["provision", "--no-proxy-vm", "--proxy-bypass", ""]).unwrap();
+        assert!(args.no_proxy_vm);
+        assert_eq!(args.proxy_bypass.as_deref(), Some(""));
+        assert_eq!(args.proxy, None);
+    }
+
+    #[test]
+    fn proxy_options_are_checked_at_parse_time() {
+        // A proxy may come from the environment, so these parse.
+        assert!(parse(&["--proxy-udp", "--strict-proxy"]).is_ok());
+        assert!(parse(&["--no-proxy-vm", "--no-proxy-udp", "--no-strict-proxy"]).is_ok());
+
+        assert!(
+            parse_err(&["--no-proxy-vm", "--strict-proxy"])
+                .contains("--strict-proxy cannot be used with --no-proxy-vm")
+        );
+        assert!(
+            parse_err(&["provision", "--network", "vznat", "--proxy-dns"])
+                .contains("--proxy-dns cannot be used with --network vznat")
+        );
+        assert!(parse_err(&["--proxy", "socks4://127.0.0.1:1080"]).contains("socks4"));
+        assert!(parse_err(&["--proxy", "ftp://127.0.0.1:21"]).contains("ftp"));
+        assert_eq!(
+            parse(&["--proxy", "socks5h://127.0.0.1:1080"])
+                .unwrap()
+                .proxy
+                .as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
+    }
+
+    #[test]
     fn provision_only_options_are_rejected_for_run() {
         assert!(parse_err(&["--repl"]).contains("--repl is only valid with provision"));
         assert!(parse_err(&["--replace"]).contains("--replace is only valid with provision"));
@@ -1784,11 +1890,6 @@ mod tests {
             "--proxy-udp",
         ]);
         assert!(bad_udp.contains("--proxy-udp is only supported with socks5:// proxies"));
-
-        assert!(
-            parse_err(&["provision", "--proxy-udp"])
-                .contains("--proxy-udp requires --proxy to be set")
-        );
         assert!(parse_err(&["provision", "--cpus", "0"]).contains("--cpus must be >= 1"));
         assert!(parse_err(&["provision", "--ram", "0"]).contains("--ram must be >= 1"));
         assert!(
